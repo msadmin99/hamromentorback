@@ -1,0 +1,22 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', 'asia-south1-docker.pkg.dev/hamromentor-app/hamromentor-repo/backend:$COMMIT_SHA', '.']
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'asia-south1-docker.pkg.dev/hamromentor-app/hamromentor-repo/backend:$COMMIT_SHA']
+  - name: 'gcr.io/google-cloud-sdk/slim'
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - hamromentor-backend
+      - --image=asia-south1-docker.pkg.dev/hamromentor-app/hamromentor-repo/backend:$COMMIT_SHA
+      - --region=asia-south1
+      - --platform=managed
+      - --allow-unauthenticated
+      - --add-cloudsql-instances=hamromentor-app:asia-south1:hamromentor-db
+      - --set-env-vars=DB_NAME=hamromentor,DB_USER=hamromentor_app,DB_HOST=/cloudsql/hamromentor-app:asia-south1:hamromentor-db,DJANGO_DEBUG=False
+      - --set-secrets=DB_PASSWORD=db-password:latest,DJANGO_SECRET_KEY=django-secret-key:latest
+images:
+  - 'asia-south1-docker.pkg.dev/hamromentor-app/hamromentor-repo/backend:$COMMIT_SHA'
+options:
+  logging: CLOUD_LOGGING_ONLY
