@@ -3,7 +3,7 @@ steps:
     args: ['build', '-t', 'asia-south1-docker.pkg.dev/hamromentor-app/hamromentor-repo/backend:$COMMIT_SHA', '.']
   - name: 'gcr.io/cloud-builders/docker'
     args: ['push', 'asia-south1-docker.pkg.dev/hamromentor-app/hamromentor-repo/backend:$COMMIT_SHA']
-  - name: 'us-docker.pkg.dev/google.com/cloudsdktool/cloud-sdk:slim'
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk:slim'
     entrypoint: gcloud
     args:
       - run
