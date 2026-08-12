@@ -143,17 +143,30 @@ class QuestionViewSet(viewsets.ModelViewSet):
           MediaAsset from POST /api/media/upload/ (validated, optimized,
           responsive variants). The Admin question form uploads via that
           endpoint first, polls until ready, then attaches the id here.
+        - Clearing: `clear_image`/`clear_explanation_image`/`clear_option_image_{i}`
+          (any truthy value) removes both the legacy field and the asset FK —
+          used when an admin removes a previously-set image without replacing it.
         """
         from media_library.models import MediaAsset
 
+        def truthy(value):
+            return str(value).lower() in ('1', 'true', 'yes')
+
         question = self.get_object()
-        if 'image' in request.FILES:
+        if truthy(request.data.get('clear_image')):
+            question.image = None
+            question.image_asset = None
+        elif 'image' in request.FILES:
             question.image = request.FILES['image']
-        if 'explanation_image' in request.FILES:
-            question.explanation_image = request.FILES['explanation_image']
-        if request.data.get('image_asset_id'):
+        elif request.data.get('image_asset_id'):
             question.image_asset = MediaAsset.objects.filter(id=request.data['image_asset_id']).first()
-        if request.data.get('explanation_image_asset_id'):
+
+        if truthy(request.data.get('clear_explanation_image')):
+            question.explanation_image = None
+            question.explanation_image_asset = None
+        elif 'explanation_image' in request.FILES:
+            question.explanation_image = request.FILES['explanation_image']
+        elif request.data.get('explanation_image_asset_id'):
             question.explanation_image_asset = MediaAsset.objects.filter(id=request.data['explanation_image_asset_id']).first()
         question.save()
 
@@ -161,11 +174,16 @@ class QuestionViewSet(viewsets.ModelViewSet):
         for i, opt in enumerate(options):
             file_key = f'option_image_{i}'
             asset_key = f'option_image_asset_id_{i}'
+            clear_key = f'clear_option_image_{i}'
             changed = False
-            if file_key in request.FILES:
+            if truthy(request.data.get(clear_key)):
+                opt.image = None
+                opt.image_asset = None
+                changed = True
+            elif file_key in request.FILES:
                 opt.image = request.FILES[file_key]
                 changed = True
-            if request.data.get(asset_key):
+            elif request.data.get(asset_key):
                 opt.image_asset = MediaAsset.objects.filter(id=request.data[asset_key]).first()
                 changed = True
             if changed:
