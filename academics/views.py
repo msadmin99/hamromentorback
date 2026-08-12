@@ -131,20 +131,44 @@ class QuestionViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['patch'], permission_classes=[IsAdminUser])
     def upload_images(self, request, pk=None):
-        """One multipart call for every image a question can carry: its own
-        image, the explanation image, and up to 4 option images (option_image_0..3)."""
+        """One call for every image a question can carry: its own image, the
+        explanation image, and up to 4 option images (option_image_0..3).
+
+        Two ways to set an image, both supported here:
+        - Legacy: multipart file under `image`/`explanation_image`/`option_image_{i}`
+          — stored directly on the plain ImageField, unoptimized (kept for
+          back-compat with any existing caller).
+        - New (preferred): `image_asset_id`/`explanation_image_asset_id`/
+          `option_image_asset_id_{i}` — the id of an already-processed
+          MediaAsset from POST /api/media/upload/ (validated, optimized,
+          responsive variants). The Admin question form uploads via that
+          endpoint first, polls until ready, then attaches the id here.
+        """
+        from media_library.models import MediaAsset
+
         question = self.get_object()
         if 'image' in request.FILES:
             question.image = request.FILES['image']
         if 'explanation_image' in request.FILES:
             question.explanation_image = request.FILES['explanation_image']
+        if request.data.get('image_asset_id'):
+            question.image_asset = MediaAsset.objects.filter(id=request.data['image_asset_id']).first()
+        if request.data.get('explanation_image_asset_id'):
+            question.explanation_image_asset = MediaAsset.objects.filter(id=request.data['explanation_image_asset_id']).first()
         question.save()
 
         options = list(question.options.order_by('order'))
         for i, opt in enumerate(options):
-            key = f'option_image_{i}'
-            if key in request.FILES:
-                opt.image = request.FILES[key]
+            file_key = f'option_image_{i}'
+            asset_key = f'option_image_asset_id_{i}'
+            changed = False
+            if file_key in request.FILES:
+                opt.image = request.FILES[file_key]
+                changed = True
+            if request.data.get(asset_key):
+                opt.image_asset = MediaAsset.objects.filter(id=request.data[asset_key]).first()
+                changed = True
+            if changed:
                 opt.save()
 
         return Response(QuestionAdminSerializer(question, context={'request': request}).data)

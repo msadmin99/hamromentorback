@@ -1,6 +1,7 @@
 from rest_framework import serializers
 
 from courses.models import Course
+from media_library.serializers import resolve_image_data
 
 from .models import Chapter, Option, Question, QuestionAttempt, Subject, Topic
 
@@ -104,15 +105,25 @@ class SubjectDetailSerializer(SubjectListSerializer):
 
 
 class OptionSerializer(serializers.ModelSerializer):
+    image_data = serializers.SerializerMethodField()
+
     class Meta:
         model = Option
-        fields = ['id', 'text', 'image', 'latex', 'order', 'pick_percentage']
+        fields = ['id', 'text', 'image', 'image_data', 'latex', 'order', 'pick_percentage']
+
+    def get_image_data(self, obj):
+        return resolve_image_data(obj.image_asset, obj.image)
 
 
 class OptionAdminSerializer(serializers.ModelSerializer):
+    image_data = serializers.SerializerMethodField()
+
     class Meta:
         model = Option
-        fields = ['id', 'text', 'image', 'latex', 'order', 'pick_percentage', 'is_correct']
+        fields = ['id', 'text', 'image', 'image_asset', 'image_data', 'latex', 'order', 'pick_percentage', 'is_correct']
+
+    def get_image_data(self, obj):
+        return resolve_image_data(obj.image_asset, obj.image)
 
 
 class QuestionSerializer(serializers.ModelSerializer):
@@ -120,24 +131,31 @@ class QuestionSerializer(serializers.ModelSerializer):
     options = OptionSerializer(many=True, read_only=True)
     subject_name = serializers.CharField(source='subject.name', read_only=True)
     chapter_name = serializers.CharField(source='chapter.name', read_only=True)
+    image_data = serializers.SerializerMethodField()
 
     class Meta:
         model = Question
         fields = [
-            'id', 'public_id', 'text', 'image', 'latex', 'marks', 'negative_marks',
+            'id', 'public_id', 'text', 'image', 'image_data', 'latex', 'marks', 'negative_marks',
             'year', 'subject', 'subject_name', 'chapter', 'chapter_name', 'topic', 'options',
         ]
+
+    def get_image_data(self, obj):
+        return resolve_image_data(obj.image_asset, obj.image)
 
 
 class QuestionAdminSerializer(serializers.ModelSerializer):
     options = OptionAdminSerializer(many=True)
     created_by_name = serializers.SerializerMethodField()
+    image_data = serializers.SerializerMethodField()
+    explanation_image_data = serializers.SerializerMethodField()
 
     class Meta:
         model = Question
         fields = [
-            'id', 'public_id', 'text', 'image', 'latex',
-            'explanation', 'explanation_image', 'explanation_latex', 'explanation_video_url', 'references',
+            'id', 'public_id', 'text', 'image', 'image_asset', 'image_data', 'latex',
+            'explanation', 'explanation_image', 'explanation_image_asset', 'explanation_image_data',
+            'explanation_latex', 'explanation_video_url', 'references',
             'marks', 'negative_marks', 'remarks', 'year', 'past_exam_years',
             'subject', 'chapter', 'topic', 'courses', 'options', 'created_by_name',
         ]
@@ -147,6 +165,12 @@ class QuestionAdminSerializer(serializers.ModelSerializer):
         if not obj.created_by_id:
             return ''
         return obj.created_by.first_name or obj.created_by.email
+
+    def get_image_data(self, obj):
+        return resolve_image_data(obj.image_asset, obj.image)
+
+    def get_explanation_image_data(self, obj):
+        return resolve_image_data(obj.explanation_image_asset, obj.explanation_image)
 
     def create(self, validated_data):
         options_data = validated_data.pop('options')
@@ -186,14 +210,23 @@ class QuestionResultSerializer(serializers.ModelSerializer):
     subject_name = serializers.CharField(source='subject.name', read_only=True)
     selected_option_id = serializers.SerializerMethodField()
     is_correct = serializers.SerializerMethodField()
+    image_data = serializers.SerializerMethodField()
+    explanation_image_data = serializers.SerializerMethodField()
 
     class Meta:
         model = Question
         fields = [
-            'id', 'public_id', 'text', 'image', 'latex',
-            'explanation', 'explanation_image', 'explanation_latex', 'explanation_video_url', 'references',
+            'id', 'public_id', 'text', 'image', 'image_data', 'latex',
+            'explanation', 'explanation_image', 'explanation_image_data', 'explanation_latex',
+            'explanation_video_url', 'references',
             'subject_name', 'options', 'selected_option_id', 'is_correct',
         ]
+
+    def get_image_data(self, obj):
+        return resolve_image_data(obj.image_asset, obj.image)
+
+    def get_explanation_image_data(self, obj):
+        return resolve_image_data(obj.explanation_image_asset, obj.explanation_image)
 
     def get_selected_option_id(self, obj):
         attempt = self.context.get('attempt_map', {}).get(obj.id)

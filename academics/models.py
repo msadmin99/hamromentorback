@@ -100,10 +100,19 @@ class Question(models.Model):
 
     text = models.TextField()
     image = models.ImageField(upload_to='questions/', null=True, blank=True)
+    image_asset = models.ForeignKey(
+        'media_library.MediaAsset', on_delete=models.SET_NULL, null=True, blank=True, related_name='+',
+        help_text='Optimized/responsive replacement for `image`, via media_library. Falls back to `image` '
+                   'when unset — existing questions are unaffected.',
+    )
     latex = models.TextField(blank=True, help_text='Optional LaTeX, e.g. \\int_0^1 x^2\\,dx')
 
     explanation = models.TextField(blank=True)
     explanation_image = models.ImageField(upload_to='explanations/', null=True, blank=True)
+    explanation_image_asset = models.ForeignKey(
+        'media_library.MediaAsset', on_delete=models.SET_NULL, null=True, blank=True, related_name='+',
+        help_text='Optimized/responsive replacement for `explanation_image`. See `image_asset`.',
+    )
     explanation_latex = models.TextField(blank=True)
     explanation_video_url = models.URLField(blank=True)
     references = models.JSONField(
@@ -189,6 +198,10 @@ class Option(models.Model):
     question = models.ForeignKey(Question, on_delete=models.CASCADE, related_name='options')
     text = models.CharField(max_length=500, blank=True)
     image = models.ImageField(upload_to='options/', null=True, blank=True)
+    image_asset = models.ForeignKey(
+        'media_library.MediaAsset', on_delete=models.SET_NULL, null=True, blank=True, related_name='+',
+        help_text='Optimized/responsive replacement for `image`. See Question.image_asset.',
+    )
     latex = models.TextField(blank=True)
     is_correct = models.BooleanField(default=False)
     order = models.PositiveIntegerField(default=0)

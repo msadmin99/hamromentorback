@@ -48,6 +48,24 @@ DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'Dr. Gutka <no-reply@h
 # (e.g. "view your invoice"). Not the API URL.
 FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:3000')
 
+# media_library — image upload/optimization/storage (see media_library app).
+# All blank/False in local dev, where MediaUploadView isn't expected to be
+# exercised; production (Cloud Run) sets every one of these via env vars.
+GCP_PROJECT_ID = os.environ.get('GCP_PROJECT_ID', '')
+GCP_REGION = os.environ.get('GCP_REGION', 'us-central1')
+MEDIA_GCS_PRIVATE_BUCKET = os.environ.get('MEDIA_GCS_PRIVATE_BUCKET', '')
+MEDIA_GCS_PUBLIC_BUCKET = os.environ.get('MEDIA_GCS_PUBLIC_BUCKET', '')
+CLOUD_TASKS_QUEUE = os.environ.get('CLOUD_TASKS_QUEUE', 'image-processing')
+# The Backend's own public URL — Cloud Tasks calls back into this service's
+# /api/media/process/ endpoint.
+BACKEND_INTERNAL_URL = os.environ.get('BACKEND_INTERNAL_URL', 'http://localhost:8000')
+# Shared-secret auth for the Cloud Tasks handler, matching this project's
+# existing X-Cron-Secret convention (see courses/views.py, billing/views.py).
+MEDIA_PROCESSING_SECRET = os.environ.get('MEDIA_PROCESSING_SECRET', 'dev-media-secret-change-me')
+# False in local dev (no Cloud Tasks queue to enqueue to) — processes
+# inline/synchronously instead. True in production.
+IMAGE_PROCESSING_ASYNC = os.environ.get('IMAGE_PROCESSING_ASYNC', 'False') == 'True'
+
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.environ.get('DJANGO_DEBUG', 'True') == 'True'
 
@@ -73,6 +91,7 @@ INSTALLED_APPS = [
     'courses',
     'billing',
     'marketplace',
+    'media_library',
 ]
 
 MIDDLEWARE = [

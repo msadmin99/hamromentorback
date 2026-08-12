@@ -13,6 +13,7 @@ urlpatterns = [
     path('api/', include('courses.urls')),
     path('api/', include('billing.urls')),
     path('api/', include('marketplace.urls')),
+    path('api/media/', include('media_library.urls')),
 ]
 
 if settings.DEBUG:

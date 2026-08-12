@@ -4,10 +4,13 @@ django-cors-headers==4.9.0
 djangorestframework==3.16.1
 djangorestframework_simplejwt==5.5.1
 et_xmlfile==2.0.0
+google-cloud-storage==2.19.0
+google-cloud-tasks==2.19.3
 gunicorn==23.0.0
 lxml==6.1.1
 openpyxl==3.1.5
 pillow==11.3.0
+pillow-avif-plugin==1.5.2
 PyJWT==2.13.0
 PyMySQL==1.1.1
 python-docx==1.2.0
