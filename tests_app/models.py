@@ -85,6 +85,11 @@ class Test(models.Model):
     )
 
     academic_year = models.CharField(max_length=20, blank=True, help_text='e.g. 2025-26')
+    university = models.CharField(
+        max_length=100, blank=True,
+        help_text='Conducting institution for Past Year Questions, e.g. IOM, MOE, BPKIHS, KU — the top-level '
+                   'grouping on the student Past Year Questions page (Year is the level below it).',
+    )
     scheduled_start = models.DateTimeField(null=True, blank=True)
     scheduled_end = models.DateTimeField(null=True, blank=True)
 

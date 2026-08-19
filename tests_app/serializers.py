@@ -32,7 +32,7 @@ class TestListSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'title', 'description', 'difficulty', 'exam_type', 'subject', 'subject_name', 'duration_minutes',
             'question_count', 'total_marks', 'is_pro', 'is_new', 'price', 'max_attempts',
-            'academic_year', 'scheduled_start', 'scheduled_end', 'status', 'best_score',
+            'academic_year', 'university', 'scheduled_start', 'scheduled_end', 'status', 'best_score',
             'courses_detail', 'card_status', 'attempts_used', 'created_by_name', 'created_at',
             'is_draft', 'exam_template_id', 'exam_code', 'version_number',
         ]
@@ -138,7 +138,7 @@ class TestAdminSerializer(serializers.ModelSerializer):
             'id', 'title', 'description', 'difficulty', 'exam_type', 'subject', 'courses', 'duration_minutes',
             'questions_per_page',
             'negative_marking', 'shuffle_questions', 'shuffle_options', 'max_attempts', 'solutions_visibility',
-            'is_pro', 'is_new', 'price', 'access_password', 'free_preview_questions', 'academic_year',
+            'is_pro', 'is_new', 'price', 'access_password', 'free_preview_questions', 'academic_year', 'university',
             'scheduled_start', 'scheduled_end', 'is_draft', 'question_ids', 'questions', 'question_count', 'total_marks',
             'created_by_name', 'exam_template', 'exam_code', 'version_number',
         ]

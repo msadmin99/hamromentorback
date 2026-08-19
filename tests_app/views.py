@@ -138,6 +138,7 @@ class TestViewSet(viewsets.ModelViewSet):
         exam_type = self.request.query_params.get('exam_type') or self.request.query_params.get('group')
         subject = self.request.query_params.get('subject')
         year = self.request.query_params.get('year')
+        university = self.request.query_params.get('university')
         course_id = self.request.query_params.get('course')
         if exam_type:
             qs = qs.filter(exam_type__in=exam_type.split(','))
@@ -145,6 +146,8 @@ class TestViewSet(viewsets.ModelViewSet):
             qs = qs.filter(subject__slug=subject)
         if year:
             qs = qs.filter(academic_year=year)
+        if university:
+            qs = qs.filter(university=university)
 
         user = self.request.user
         if not (user.is_authenticated and user.is_staff):
@@ -157,9 +160,25 @@ class TestViewSet(viewsets.ModelViewSet):
         return qs.distinct()
 
     @action(detail=False, methods=['get'])
+    def universities(self, request):
+        """Distinct conducting institutions (IOM, MOE, BPKIHS, KU, ...) available for Past Year
+        Question sets — the top-level grouping on the student Past Year Questions page,
+        optionally scoped to a course."""
+        # .order_by() clears Test's default ordering (['-scheduled_start', '-created_at']) —
+        # without it, Django has to include those fields in the SELECT to satisfy the implicit
+        # ORDER BY on a .distinct() query, so DISTINCT ends up operating over
+        # (university, scheduled_start, created_at) instead of just university, and silently
+        # stops deduplicating the moment two rows share a university but differ in timestamp.
+        qs = self.get_queryset().filter(exam_type='pyq').exclude(university='').order_by()
+        universities = sorted(qs.values_list('university', flat=True).distinct())
+        return Response(universities)
+
+    @action(detail=False, methods=['get'])
     def years(self, request):
-        """Distinct academic years available for Past Year Question sets, optionally scoped to a course."""
-        qs = self.get_queryset().filter(exam_type='pyq').exclude(academic_year='')
+        """Distinct academic years available for Past Year Question sets, optionally scoped to a
+        course and/or a university (?university=IOM) — the level below University on the student
+        Past Year Questions page."""
+        qs = self.get_queryset().filter(exam_type='pyq').exclude(academic_year='').order_by()
         years = sorted(qs.values_list('academic_year', flat=True).distinct(), reverse=True)
         return Response(years)
 
