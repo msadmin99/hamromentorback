@@ -290,6 +290,29 @@ class ImportRowDetailView(APIView):
             'dedup_action': row.dedup_action, 'data': row.raw_data,
         })
 
+    def delete(self, request, batch_id, row_id):
+        """Removes one invalid/unwanted row from the batch before import —
+        e.g. a row that can't be fixed, or a genuine duplicate the admin
+        doesn't want to bring in at all. Only allowed pre-import: once a
+        batch has started importing, its rows are what the run/rollback
+        history refers to."""
+        try:
+            row = ImportRow.objects.get(pk=row_id, batch_id=batch_id)
+        except ImportRow.DoesNotExist:
+            return Response({'detail': 'Row not found.'}, status=404)
+
+        batch = row.batch
+        if batch.status != 'ready':
+            return Response(
+                {'detail': f'Batch is currently "{batch.status}" — rows can only be removed before import starts.'},
+                status=400,
+            )
+
+        row.delete()
+        batch.total_rows = max(0, batch.total_rows - 1)
+        batch.save(update_fields=['total_rows'])
+        return Response(_batch_summary(batch))
+
 
 def _run_import(batch_id):
     close_old_connections()

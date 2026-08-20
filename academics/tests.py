@@ -3,7 +3,7 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from rest_framework import status
 from rest_framework.test import APITestCase
 
-from academics.models import Option, Question, Subject
+from academics.models import ImportBatch, ImportRow, Option, Question, Subject
 from core.models import DeletionAuditLog
 from tests_app.models import Test, TestAttempt, TestQuestion
 
@@ -93,3 +93,73 @@ class QuestionDeleteTests(APITestCase):
 def default_storage_exists(name):
     from django.core.files.storage import default_storage
     return default_storage.exists(name)
+
+
+class ImportRowDeleteTests(APITestCase):
+    def setUp(self):
+        self.staff = User.objects.create_user(
+            username='staff1', email='staff1@example.com', password='pw12345', is_staff=True, admin_role='admin',
+        )
+        self.client.force_authenticate(user=self.staff)
+        self.batch = ImportBatch.objects.create(
+            uploaded_by=self.staff, file_name='questions.xlsx', file_format='xlsx', status='ready', total_rows=2,
+        )
+        self.bad_row = ImportRow.objects.create(
+            batch=self.batch, row_number=1, status='error',
+            raw_data={'text_html': '<p>Q1</p>', 'options': [{'text_html': 'A', 'is_correct': True}]},
+            errors=['Only 1 option(s) found — at least 2 are required.'],
+        )
+        self.good_row = ImportRow.objects.create(
+            batch=self.batch, row_number=2, status='valid',
+            raw_data={
+                'text_html': '<p>Q2</p>',
+                'options': [{'text_html': 'A', 'is_correct': True}, {'text_html': 'B', 'is_correct': False}],
+            },
+        )
+
+    def test_delete_removes_row_and_decrements_total(self):
+        resp = self.client.delete(f'/api/import-batches/{self.batch.id}/rows/{self.bad_row.id}/')
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(ImportRow.objects.filter(id=self.bad_row.id).exists())
+        self.assertEqual(resp.data['total_rows'], 1)
+        self.batch.refresh_from_db()
+        self.assertEqual(self.batch.total_rows, 1)
+
+    def test_delete_of_unknown_row_returns_404(self):
+        resp = self.client.delete(f'/api/import-batches/{self.batch.id}/rows/999999/')
+        self.assertEqual(resp.status_code, 404)
+
+    def test_delete_blocked_once_import_has_started(self):
+        self.batch.status = 'importing'
+        self.batch.save(update_fields=['status'])
+
+        resp = self.client.delete(f'/api/import-batches/{self.batch.id}/rows/{self.good_row.id}/')
+
+        self.assertEqual(resp.status_code, 400)
+        self.assertTrue(ImportRow.objects.filter(id=self.good_row.id).exists())
+
+    def test_delete_requires_staff(self):
+        student = User.objects.create_user(username='student1', email='student1@example.com', password='pw12345')
+        self.client.force_authenticate(user=student)
+
+        resp = self.client.delete(f'/api/import-batches/{self.batch.id}/rows/{self.good_row.id}/')
+
+        self.assertIn(resp.status_code, (401, 403))
+        self.assertTrue(ImportRow.objects.filter(id=self.good_row.id).exists())
+
+    def test_patch_can_fix_an_error_row_to_valid(self):
+        """Regression coverage for the Preview & Validate editability fix:
+        correcting the underlying data (adding a 2nd option) must flip the
+        row's status from error to valid via re-validation, same as the
+        Admin's new inline editor relies on."""
+        fixed_data = {
+            'text_html': '<p>Q1</p>',
+            'options': [{'text_html': 'A', 'is_correct': True}, {'text_html': 'B', 'is_correct': False}],
+            'explanation_html': '<p>Because A is right.</p>',
+        }
+        resp = self.client.patch(f'/api/import-batches/{self.batch.id}/rows/{self.bad_row.id}/', {'data': fixed_data}, format='json')
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data['status'], 'valid')
+        self.assertEqual(resp.data['errors'], [])
