@@ -113,6 +113,30 @@ class TeacherCourseViewSet(viewsets.ModelViewSet):
             qs = qs.filter(status=status_filter)
         return qs
 
+    def destroy(self, request, *args, **kwargs):
+        """Permanent delete — blocked if any student is enrolled, since
+        CourseEnrollment.course is CASCADE and would otherwise silently
+        destroy paying students' access grants. Set status to a rejected/
+        archived state instead of deleting a course students have access to."""
+        from core.deletion_audit import record_deletion
+
+        course = self.get_object()
+        label = course.title
+
+        if course.enrollments.exists():
+            msg = 'Students are enrolled in this course and it cannot be deleted — reject or archive it instead.'
+            record_deletion(request, 'TeacherCourse', course.id, label, result='failure', failure_reason=msg)
+            return Response({'detail': msg}, status=400)
+
+        try:
+            response = super().destroy(request, *args, **kwargs)
+        except Exception as exc:
+            record_deletion(request, 'TeacherCourse', course.id, label, result='failure', failure_reason=str(exc)[:500])
+            return Response({'detail': 'Deletion failed. No partial deletion should remain.'}, status=500)
+
+        record_deletion(request, 'TeacherCourse', course.id, label, result='success')
+        return response
+
     @action(detail=True, methods=['post'])
     def submit(self, request, pk=None):
         course = self.get_object()

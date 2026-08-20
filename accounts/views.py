@@ -150,6 +150,38 @@ class AdminAccountViewSet(viewsets.ModelViewSet):
     serializer_class = AdminAccountSerializer
     permission_classes = [IsSuperAdmin]
 
+    def destroy(self, request, *args, **kwargs):
+        """Permanent delete — blocked if this account owns marketplace
+        courses (TeacherCourse.teacher is CASCADE: deleting the account
+        would silently destroy the course catalog and every enrolled
+        student's access) or has payment history (Purchase.user is
+        CASCADE — financial records must not be destroyed this way, see
+        item 13). Deactivate the account (is_active=False, already
+        supported by the existing PATCH endpoint) instead."""
+        from core.deletion_audit import record_deletion
+
+        account = self.get_object()
+        label = account.email
+
+        if account.taught_courses.exists():
+            msg = 'This account owns marketplace course(s) — deleting it would destroy those courses and enrolled students’ access. Transfer ownership or remove the courses first.'
+            record_deletion(request, 'AdminAccount', account.id, label, result='failure', failure_reason=msg)
+            return Response({'detail': msg}, status=status.HTTP_400_BAD_REQUEST)
+
+        if account.purchases.exists():
+            msg = 'This account has payment/purchase history and cannot be permanently deleted — deactivate it instead to preserve financial records.'
+            record_deletion(request, 'AdminAccount', account.id, label, result='failure', failure_reason=msg)
+            return Response({'detail': msg}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            response = super().destroy(request, *args, **kwargs)
+        except Exception as exc:
+            record_deletion(request, 'AdminAccount', account.id, label, result='failure', failure_reason=str(exc)[:500])
+            return Response({'detail': 'Deletion failed. No partial deletion should remain.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        record_deletion(request, 'AdminAccount', account.id, label, result='success')
+        return response
+
 
 class TeacherListView(APIView):
     """Lightweight, any-staff-readable list of Teacher-role accounts — used to

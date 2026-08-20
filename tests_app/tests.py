@@ -1,3 +1,97 @@
-from django.test import TestCase
+from django.contrib.auth import get_user_model
+from django.utils import timezone
+from rest_framework import status
+from rest_framework.test import APITestCase
 
-# Create your tests here.
+from core.models import DeletionAuditLog
+from tests_app.models import ExamSession, ExamTemplate, Test, TestAttempt
+
+User = get_user_model()
+
+
+class TestDeleteTests(APITestCase):
+    def setUp(self):
+        self.staff = User.objects.create_user(
+            username='staff1', email='staff1@example.com', password='pw12345', is_staff=True, admin_role='admin',
+        )
+        self.student = User.objects.create_user(username='student1', email='student1@example.com', password='pw12345')
+        self.client.force_authenticate(user=self.staff)
+
+    def test_blocked_when_test_has_student_attempts(self):
+        test = Test.objects.create(title='Mock Test 1', exam_type='mock')
+        TestAttempt.objects.create(user=self.student, test=test, status='submitted')
+
+        resp = self.client.delete(f'/api/tests/{test.id}/')
+
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertTrue(Test.objects.filter(id=test.id).exists())
+        entry = DeletionAuditLog.objects.get(resource_type='Test', resource_id=str(test.id))
+        self.assertEqual(entry.result, 'failure')
+
+    def test_blocked_when_version_has_a_session_even_without_attempts(self):
+        """Regression test for the PROTECT edge case found during the audit:
+        a Test version with a session (but zero attempts, and not the sole
+        version under its template) used to reach super().destroy() and hit
+        an unhandled ProtectedError -> 500. It must now return a clean 400."""
+        template = ExamTemplate.objects.create(title='CEE Mock #1', exam_type='mock')
+        version_one = Test.objects.create(title='CEE Mock #1 v1', exam_type='mock', exam_template=template, version_number=1)
+        version_two = Test.objects.create(title='CEE Mock #1 v2', exam_type='mock', exam_template=template, version_number=2)
+        now = timezone.now()
+        ExamSession.objects.create(
+            exam_template=template, exam_version=version_two,
+            session_name='Session 1', start_datetime=now, end_datetime=now,
+        )
+
+        # version_one has no session of its own and is not the sole version,
+        # so the *old* buggy guard would have let this reach super().destroy()
+        # unguarded. Only version_two (which has the session) should be blocked.
+        resp_v1 = self.client.delete(f'/api/tests/{version_one.id}/')
+        self.assertEqual(resp_v1.status_code, status.HTTP_204_NO_CONTENT)
+
+        resp_v2 = self.client.delete(f'/api/tests/{version_two.id}/')
+        self.assertEqual(resp_v2.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertTrue(Test.objects.filter(id=version_two.id).exists())
+
+    def test_permanent_delete_succeeds_for_unused_test(self):
+        test = Test.objects.create(title='Draft Mock', exam_type='mock')
+
+        resp = self.client.delete(f'/api/tests/{test.id}/')
+
+        self.assertEqual(resp.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(Test.objects.filter(id=test.id).exists())
+        entry = DeletionAuditLog.objects.get(resource_type='Test')
+        self.assertEqual(entry.result, 'success')
+
+
+class ExamSessionDeleteTests(APITestCase):
+    def setUp(self):
+        self.staff = User.objects.create_user(
+            username='staff1', email='staff1@example.com', password='pw12345', is_staff=True, admin_role='admin',
+        )
+        self.student = User.objects.create_user(username='student1', email='student1@example.com', password='pw12345')
+        self.client.force_authenticate(user=self.staff)
+        self.template = ExamTemplate.objects.create(title='CEE Mock #1', exam_type='mock')
+        self.version = Test.objects.create(title='CEE Mock #1 v1', exam_type='mock', exam_template=self.template)
+        now = timezone.now()
+        self.session = ExamSession.objects.create(
+            exam_template=self.template, exam_version=self.version,
+            session_name='Session 1', start_datetime=now, end_datetime=now,
+        )
+
+    def test_blocked_when_session_has_attempts(self):
+        TestAttempt.objects.create(user=self.student, test=self.version, session=self.session, status='submitted')
+
+        resp = self.client.delete(f'/api/exam-sessions/{self.session.id}/')
+
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertTrue(ExamSession.objects.filter(id=self.session.id).exists())
+        entry = DeletionAuditLog.objects.get(resource_type='ExamSession', resource_id=str(self.session.id))
+        self.assertEqual(entry.result, 'failure')
+
+    def test_permanent_delete_succeeds_for_session_with_no_attempts(self):
+        resp = self.client.delete(f'/api/exam-sessions/{self.session.id}/')
+
+        self.assertEqual(resp.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(ExamSession.objects.filter(id=self.session.id).exists())
+        entry = DeletionAuditLog.objects.get(resource_type='ExamSession')
+        self.assertEqual(entry.result, 'success')

@@ -1,6 +1,51 @@
+from django.conf import settings
 from django.db import models
 
 from academics.models import Question
+
+
+class DeletionAuditLog(models.Model):
+    """Minimal security record of a permanent-delete attempt — who, what,
+    when, and whether it succeeded. Deliberately does NOT store the deleted
+    content itself (only a short human-readable label for context), per the
+    "don't unnecessarily retain deleted private content" requirement this
+    was built against. Written by deletion_audit.record_deletion(), called
+    from every guarded destroy() — see academics/courses/marketplace/
+    accounts views.py and media_library/views.py."""
+    RESULT_CHOICES = [('success', 'Success'), ('failure', 'Failure')]
+
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='+',
+    )
+    # Snapshot so the log stays meaningful even after the actor's own
+    # account is later deleted (actor FK goes null, this doesn't).
+    actor_email = models.CharField(max_length=255, blank=True)
+
+    resource_type = models.CharField(max_length=50, help_text='e.g. "Question", "Course", "MediaAsset"')
+    resource_id = models.CharField(max_length=64, help_text='Stringified — some resources use UUID PKs, others int.')
+    resource_label = models.CharField(
+        max_length=255, blank=True,
+        help_text='Short human-readable identifier (e.g. a title or public_id) for audit-trail readability — '
+                   'never the full deleted content.',
+    )
+
+    result = models.CharField(max_length=10, choices=RESULT_CHOICES)
+    failure_reason = models.CharField(max_length=500, blank=True)
+
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    user_agent = models.CharField(max_length=300, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['resource_type', 'resource_id']),
+            models.Index(fields=['created_at']),
+        ]
+
+    def __str__(self):
+        return f'{self.result}: {self.resource_type} #{self.resource_id} by {self.actor_email or "unknown"}'
 
 
 class Banner(models.Model):

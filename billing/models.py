@@ -116,7 +116,13 @@ class Coupon(models.Model):
     code = models.CharField(max_length=50, unique=True)
     name = models.CharField(max_length=150, blank=True)
     course = models.ForeignKey(
-        'courses.Course', on_delete=models.CASCADE, null=True, blank=True, related_name='coupons',
+        # SET_NULL (not CASCADE): the field is nullable specifically to mean
+        # "applies across every course" (see help_text) — deleting the scoped
+        # Course should fall back to that same unscoped state, not destroy
+        # the coupon itself. CASCADE here was a copy-paste bug found during
+        # the permanent-deletion-system audit — past purchases that used
+        # this coupon are already SET_NULL-protected either way.
+        'courses.Course', on_delete=models.SET_NULL, null=True, blank=True, related_name='coupons',
         help_text='Blank = applies across every course.',
     )
     discount_type = models.CharField(max_length=20, choices=DISCOUNT_TYPE_CHOICES, default='percentage')

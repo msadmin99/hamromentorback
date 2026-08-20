@@ -112,6 +112,50 @@ class QuestionViewSet(viewsets.ModelViewSet):
             qs = qs.filter(created_by=user)
         return qs.distinct()
 
+    def destroy(self, request, *args, **kwargs):
+        """Permanent delete — blocked if the question has practice-attempt
+        history or is used in an exam students have already attempted
+        (mirrors TestViewSet's own attempt-guard). On success, also cleans
+        up every associated image (both the newer MediaAsset pipeline and
+        any legacy ImageField) and writes a DeletionAuditLog entry either
+        way."""
+        from core.deletion_audit import delete_file_field, record_deletion
+        from media_library.service import delete_media_asset
+
+        question = self.get_object()
+        label = question.public_id
+
+        if question.attempts.exists():
+            msg = 'This question has practice-attempt history and cannot be deleted — consider unpublishing it instead.'
+            record_deletion(request, 'Question', question.id, label, result='failure', failure_reason=msg)
+            return Response({'detail': msg}, status=status.HTTP_400_BAD_REQUEST)
+
+        tests_in_use = question.testquestion_set.filter(test__attempts__isnull=False).select_related('test').distinct()
+        if tests_in_use.exists():
+            titles = ', '.join(tq.test.title for tq in tests_in_use[:3])
+            msg = f'This question is used in an exam with student attempts ({titles}) and cannot be deleted.'
+            record_deletion(request, 'Question', question.id, label, result='failure', failure_reason=msg)
+            return Response({'detail': msg}, status=status.HTTP_400_BAD_REQUEST)
+
+        options = list(question.options.all())
+        media_assets = [question.image_asset, question.explanation_image_asset] + [o.image_asset for o in options]
+
+        try:
+            for asset in media_assets:
+                if asset:
+                    delete_media_asset(asset)
+            delete_file_field(question.image)
+            delete_file_field(question.explanation_image)
+            for opt in options:
+                delete_file_field(opt.image)
+            response = super().destroy(request, *args, **kwargs)
+        except Exception as exc:
+            record_deletion(request, 'Question', question.id, label, result='failure', failure_reason=str(exc)[:500])
+            return Response({'detail': 'Deletion failed. No partial deletion should remain.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        record_deletion(request, 'Question', question.id, label, result='success')
+        return response
+
     @action(detail=False, methods=['get'], permission_classes=[IsAdminUser])
     def summary(self, request):
         """Question Bank Summary page: total count + a by-course breakdown.

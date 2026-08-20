@@ -110,18 +110,33 @@ class TestViewSet(viewsets.ModelViewSet):
     permission_classes = [IsStaffOrReadOnly]
 
     def destroy(self, request, *args, **kwargs):
+        from core.deletion_audit import record_deletion
+
         test = self.get_object()
+        label = test.title
+
         if test.attempts.exists():
-            return Response(
-                {'detail': 'This exam has student attempts and cannot be deleted — archive it instead.'},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        if test.exam_template_id and test.exam_template.versions.count() == 1 and test.sessions.exists():
-            return Response(
-                {'detail': 'This exam version has scheduled sessions and cannot be deleted — cancel its sessions first.'},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        return super().destroy(request, *args, **kwargs)
+            msg = 'This exam has student attempts and cannot be deleted — archive it instead.'
+            record_deletion(request, 'Test', test.id, label, result='failure', failure_reason=msg)
+            return Response({'detail': msg}, status=status.HTTP_400_BAD_REQUEST)
+        # ExamSession.exam_version is on_delete=PROTECT — ANY session pointing at
+        # this Test row blocks the delete at the DB level regardless of how many
+        # other versions its exam_template has (a prior version of this check only
+        # blocked when this was the *sole* version, which let a ProtectedError
+        # reach super().destroy() unhandled — a 500 instead of this clean 400).
+        if test.sessions.exists():
+            msg = 'This exam version has scheduled sessions and cannot be deleted — cancel its sessions first.'
+            record_deletion(request, 'Test', test.id, label, result='failure', failure_reason=msg)
+            return Response({'detail': msg}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            response = super().destroy(request, *args, **kwargs)
+        except Exception as exc:
+            record_deletion(request, 'Test', test.id, label, result='failure', failure_reason=str(exc)[:500])
+            return Response({'detail': 'Deletion failed. No partial deletion should remain.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        record_deletion(request, 'Test', test.id, label, result='success')
+        return response
 
     def get_serializer_class(self):
         user = self.request.user
@@ -287,13 +302,24 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
         serializer.save()
 
     def destroy(self, request, *args, **kwargs):
+        from core.deletion_audit import record_deletion
+
         session = self.get_object()
+        label = session.session_name or f'session #{session.id}'
+
         if session.attempts.exists():
-            return Response(
-                {'detail': 'This session has attempts and cannot be deleted — cancel it instead.'},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        return super().destroy(request, *args, **kwargs)
+            msg = 'This session has attempts and cannot be deleted — cancel it instead.'
+            record_deletion(request, 'ExamSession', session.id, label, result='failure', failure_reason=msg)
+            return Response({'detail': msg}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            response = super().destroy(request, *args, **kwargs)
+        except Exception as exc:
+            record_deletion(request, 'ExamSession', session.id, label, result='failure', failure_reason=str(exc)[:500])
+            return Response({'detail': 'Deletion failed. No partial deletion should remain.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        record_deletion(request, 'ExamSession', session.id, label, result='success')
+        return response
 
     @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
     def start(self, request, pk=None):

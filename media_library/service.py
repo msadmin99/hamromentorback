@@ -9,10 +9,10 @@ import uuid
 from django.conf import settings
 from django.core.exceptions import ValidationError
 
-from .gcs_storage import upload_bytes
+from .gcs_storage import delete_object, upload_bytes
 from .models import MediaAsset
 from .permissions_util import DEFAULT_VISIBILITY
-from .tasks import enqueue_processing_task
+from .tasks import _ext, enqueue_processing_task
 from .validators import compute_content_hash, validate_image_upload
 
 
@@ -73,3 +73,35 @@ def create_media_asset_from_file(
     asset.processing_status = 'processing'
     asset.save(update_fields=['processing_status'])
     return asset
+
+
+def delete_media_asset(asset):
+    """
+    Permanently deletes a MediaAsset: removes it from the database and, IF
+    no other MediaAsset row shares the same storage_key (content-hash
+    dedup means several rows can legitimately point at the exact same GCS
+    objects — see create_media_asset_from_file above), also deletes the
+    original and every variant from GCS.
+
+    Deliberately best-effort on the GCS side: a storage delete failure
+    (network hiccup, already-gone object) is swallowed rather than raising,
+    since the DB row is the source of truth for "does this asset exist" —
+    an orphaned GCS object costs a few KB of storage; a delete that half-
+    fails and leaves the DB row dangling is the worse outcome.
+    """
+    shared = MediaAsset.objects.filter(storage_key=asset.storage_key).exclude(pk=asset.pk).exists()
+
+    if not shared:
+        try:
+            delete_object(asset.bucket, f'{asset.storage_key}original.{_ext(asset.format)}')
+        except Exception:
+            pass
+        for object_key in (asset.variants or {}).values():
+            try:
+                target_bucket = settings.MEDIA_GCS_PUBLIC_BUCKET if object_key.startswith('public/') else settings.MEDIA_GCS_PRIVATE_BUCKET
+                delete_object(target_bucket, object_key)
+            except Exception:
+                pass
+
+    asset.delete()
+    return not shared  # True if GCS objects were actually removed, False if skipped (shared)

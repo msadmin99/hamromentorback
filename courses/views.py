@@ -34,6 +34,31 @@ class CourseViewSet(viewsets.ModelViewSet):
             qs = qs.filter(is_active=True)
         return qs
 
+    def destroy(self, request, *args, **kwargs):
+        """Permanent delete — blocked if students are enrolled or hold a
+        subscription against this course, since Course.enrollments/
+        .subscriptions are both CASCADE and would otherwise silently
+        destroy paying students' access records. Deactivate (is_active=
+        False) instead of deleting a course that's still in use."""
+        from core.deletion_audit import record_deletion
+
+        course = self.get_object()
+        label = course.name
+
+        if course.enrollments.exists() or course.subscriptions.exists():
+            msg = 'This course has active enrollments or subscriptions and cannot be deleted — set it inactive instead.'
+            record_deletion(request, 'Course', course.id, label, result='failure', failure_reason=msg)
+            return Response({'detail': msg}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            response = super().destroy(request, *args, **kwargs)
+        except Exception as exc:
+            record_deletion(request, 'Course', course.id, label, result='failure', failure_reason=str(exc)[:500])
+            return Response({'detail': 'Deletion failed. No partial deletion should remain.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        record_deletion(request, 'Course', course.id, label, result='success')
+        return response
+
 
 class CoursePackageViewSet(viewsets.ModelViewSet):
     queryset = CoursePackage.objects.all()

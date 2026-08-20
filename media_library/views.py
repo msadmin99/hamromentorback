@@ -11,7 +11,7 @@ from rest_framework.views import APIView
 from .models import MediaAsset
 from .permissions_util import allowed_image_types_for, get_owner_role
 from .serializers import MediaAssetSerializer
-from .service import create_media_asset_from_file
+from .service import create_media_asset_from_file, delete_media_asset
 
 
 class MediaUploadView(APIView):
@@ -63,7 +63,12 @@ class MediaUploadView(APIView):
 
 
 class MediaAssetDetailView(APIView):
-    """GET /api/media/<uuid>/ — poll for processing status/URLs."""
+    """GET /api/media/<uuid>/ — poll for processing status/URLs.
+    DELETE /api/media/<uuid>/ — permanent delete (dedup-aware GCS cleanup,
+    audit-logged). Staff-only: an asset may still be referenced by a
+    Question/Option another admin owns, so this isn't opened up to any
+    authenticated uploader — only staff, matching this app's existing
+    IsAdminUser convention for destructive actions."""
     permission_classes = [IsAuthenticated]
 
     def get(self, request, pk):
@@ -72,6 +77,27 @@ class MediaAssetDetailView(APIView):
         except MediaAsset.DoesNotExist:
             return Response(status=status.HTTP_404_NOT_FOUND)
         return Response(MediaAssetSerializer(asset).data)
+
+    def delete(self, request, pk):
+        from core.deletion_audit import record_deletion
+
+        if not (request.user.is_authenticated and request.user.is_staff):
+            return Response({'detail': 'Staff only.'}, status=status.HTTP_403_FORBIDDEN)
+
+        try:
+            asset = MediaAsset.objects.get(id=pk)
+        except MediaAsset.DoesNotExist:
+            return Response({'detail': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        label = f'{asset.image_type} ({asset.original_filename})'
+        try:
+            delete_media_asset(asset)
+        except Exception as exc:
+            record_deletion(request, 'MediaAsset', pk, label, result='failure', failure_reason=str(exc)[:500])
+            return Response({'detail': 'Deletion failed. No partial deletion should remain.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        record_deletion(request, 'MediaAsset', pk, label, result='success')
+        return Response({'detail': 'Deletion successful. The selected data has been permanently removed from the live system.'})
 
 
 class MediaProcessingHandlerView(APIView):
