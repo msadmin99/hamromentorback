@@ -462,8 +462,22 @@ class ImportBatchCreateTestView(APIView):
         except ImportBatch.DoesNotExist:
             return Response({'detail': 'Batch not found.'}, status=404)
 
-        if batch.import_mode != 'create_test':
-            return Response({'detail': 'This batch is not an Import & Create Test batch.'}, status=400)
+        # import_mode is recorded once, at upload time, from the Admin's
+        # "Import Type" selector. A 'ready' batch has never been run —
+        # nothing has been written for it yet — so status is the real
+        # safety invariant and it's safe to proceed on the admin's evident
+        # intent (they're calling this endpoint) even if import_mode was
+        # somehow recorded as 'question_bank' at upload (a since-fixed
+        # frontend race let the selector change while a file was still
+        # uploading). A 'failed' batch is different: it can only be safely
+        # retried here if it failed *inside this same synchronous,
+        # transactional flow* (nothing partially committed, see
+        # _create_questions_for_test's docstring) — a 'question_bank'-mode
+        # batch that failed mid-run via the separate background /confirm/
+        # flow may have already committed some rows' Questions, and
+        # reprocessing those here would create duplicates.
+        if batch.status == 'failed' and batch.import_mode != 'create_test':
+            return Response({'detail': f'Batch is currently "{batch.status}" — cannot create a test.'}, status=400)
         if batch.status not in ('ready', 'failed'):
             return Response({'detail': f'Batch is currently "{batch.status}" — cannot create a test.'}, status=400)
         if not (batch.subject_id and batch.chapter_id and batch.topic_id):
@@ -487,12 +501,14 @@ class ImportBatchCreateTestView(APIView):
 
                 batch.created_test = test
                 batch.status = 'completed'
+                batch.import_mode = 'create_test'
                 batch.created_count = len(question_ids)
                 batch.skipped_count = skipped_count
                 batch.duplicate_count = duplicate_count
                 batch.completed_at = timezone.now()
                 batch.save(update_fields=[
-                    'created_test', 'status', 'created_count', 'skipped_count', 'duplicate_count', 'completed_at',
+                    'created_test', 'status', 'import_mode', 'created_count', 'skipped_count',
+                    'duplicate_count', 'completed_at',
                 ])
         except RowImportError as exc:
             row = batch.rows.filter(row_number=exc.row_number).first()

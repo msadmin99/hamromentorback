@@ -3,7 +3,7 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from rest_framework import status
 from rest_framework.test import APITestCase
 
-from academics.models import ImportBatch, ImportRow, Option, Question, Subject
+from academics.models import Chapter, ImportBatch, ImportRow, Option, Question, Subject, Topic
 from core.models import DeletionAuditLog
 from tests_app.models import Test, TestAttempt, TestQuestion
 
@@ -163,3 +163,64 @@ class ImportRowDeleteTests(APITestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.data['status'], 'valid')
         self.assertEqual(resp.data['errors'], [])
+
+
+class ImportBatchCreateTestModeMismatchTests(APITestCase):
+    """Covers the bug where a batch could reach 'ready' with import_mode
+    recorded as 'question_bank' despite the admin actually walking through
+    the full Import & Create Test wizard (Test Configuration, Distribution
+    Preview) — caused by the "Import Type" selector staying interactive
+    while the file was still uploading. The fix: a 'ready' batch (nothing
+    written yet) is safe to create-test on regardless of import_mode."""
+
+    def setUp(self):
+        self.staff = User.objects.create_user(
+            username='staff1', email='staff1@example.com', password='pw12345', is_staff=True, admin_role='admin',
+        )
+        self.client.force_authenticate(user=self.staff)
+        self.subject = Subject.objects.create(name='Physics')
+        self.chapter = Chapter.objects.create(subject=self.subject, name='Mechanics')
+        self.topic = Topic.objects.create(chapter=self.chapter, name='Kinematics')
+        self.batch = ImportBatch.objects.create(
+            uploaded_by=self.staff, file_name='q.xlsx', file_format='xlsx',
+            status='ready', total_rows=1, import_mode='question_bank',
+            subject=self.subject, chapter=self.chapter, topic=self.topic,
+        )
+        ImportRow.objects.create(
+            batch=self.batch, row_number=1, status='valid',
+            raw_data={
+                'text_html': '<p>Q1</p>',
+                'options': [{'text_html': 'A', 'is_correct': True}, {'text_html': 'B', 'is_correct': False}],
+                'explanation_html': '<p>Because.</p>',
+            },
+        )
+
+    def test_create_test_succeeds_on_ready_batch_despite_mismatched_import_mode(self):
+        resp = self.client.post(
+            f'/api/import-batches/{self.batch.id}/create-test/',
+            {'title': 'Mock Test 1', 'exam_type': 'mock', 'duration_minutes': 30},
+            format='json',
+        )
+
+        self.assertEqual(resp.status_code, 200)
+        self.batch.refresh_from_db()
+        self.assertEqual(self.batch.status, 'completed')
+        self.assertEqual(self.batch.import_mode, 'create_test')
+        self.assertIsNotNone(self.batch.created_test_id)
+
+    def test_create_test_still_blocked_on_a_failed_question_bank_batch(self):
+        """A 'failed' batch is only safe to retry here if it failed inside
+        this same synchronous flow (a real create_test batch) — a
+        'question_bank' batch that failed via the separate background
+        /confirm/ run may have already committed some rows, so it must
+        stay blocked rather than risk reprocessing them into duplicates."""
+        self.batch.status = 'failed'
+        self.batch.save(update_fields=['status'])
+
+        resp = self.client.post(
+            f'/api/import-batches/{self.batch.id}/create-test/',
+            {'title': 'Mock Test 1', 'exam_type': 'mock', 'duration_minutes': 30},
+            format='json',
+        )
+
+        self.assertEqual(resp.status_code, 400)
