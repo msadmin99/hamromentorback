@@ -76,6 +76,18 @@ def has_daily_test_access(user, test):
     return _quota_subscription(user, 'daily_test') is not None
 
 
+def has_pyq_access(user, test):
+    """Past Year Questions is membership-gated like QBank (a plain active
+    subscription, no per-attempt quota) — but per-test, not per-subject:
+    admins mark specific PYQ tests is_pro=True, so older/free years can stay
+    open while new ones require a membership."""
+    if not test.is_pro:
+        return True
+    if not user or not user.is_authenticated:
+        return False
+    return _active_subscriptions(user, 'pyq').exists()
+
+
 def consume_quota(user, product_type):
     sub = _quota_subscription(user, product_type)
     if sub and sub.mock_test_quota is not None:

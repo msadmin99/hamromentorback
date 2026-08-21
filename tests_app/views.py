@@ -12,7 +12,14 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from academics.models import Option
-from billing.access import consume_quota, get_grand_test_access, has_daily_test_access, has_mock_test_access, is_preview_only
+from billing.access import (
+    consume_quota,
+    get_grand_test_access,
+    has_daily_test_access,
+    has_mock_test_access,
+    has_pyq_access,
+    is_preview_only,
+)
 from hamromentor.permissions import IsStaffOrReadOnly
 
 from . import performance
@@ -79,6 +86,11 @@ def _start_attempt(request, test, session=None):
     ):
         return Response(
             {'detail': 'This Daily Test requires an active subscription.', 'code': 'purchase_required'},
+            status=status.HTTP_402_PAYMENT_REQUIRED,
+        )
+    elif test.exam_type == 'pyq' and test.is_pro and not has_pyq_access(request.user, test):
+        return Response(
+            {'detail': 'This Past Year Questions test requires an active membership.', 'code': 'purchase_required'},
             status=status.HTTP_402_PAYMENT_REQUIRED,
         )
 

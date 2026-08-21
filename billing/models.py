@@ -15,6 +15,7 @@ class SubscriptionPlan(models.Model):
         ('daily_test', 'Daily Test'),
         ('mock_test', 'Mock Test'),
         ('video', 'Video Lectures'),
+        ('pyq', 'Past Year Questions'),
     ]
     DURATION_UNIT_CHOICES = [
         ('day', 'Day(s)'),
@@ -211,8 +212,24 @@ class Coupon(models.Model):
 class PaymentMethod(models.Model):
     """Admin-configurable payment channel shown on the QR Payment Page —
     same list/slug shape as marketplace.CourseCategory / videos_app.VideoCategory."""
+    PROVIDER_CHOICES = [
+        ('fonepay', 'Fonepay'),
+        ('khalti', 'Khalti'),
+        ('esewa', 'eSewa'),
+        ('connectips', 'connectIPS'),
+        ('bank_qr', 'Bank QR'),
+        ('other', 'Other'),
+    ]
+
     name = models.CharField(max_length=100, unique=True)
     slug = models.SlugField(unique=True, blank=True)
+    provider_type = models.CharField(
+        max_length=15, choices=PROVIDER_CHOICES, default='other',
+        help_text='Which QR/payment network this is — drives future automatic-verification routing (see billing.payment_providers). Purely informational today.',
+    )
+    merchant_name = models.CharField(max_length=150, blank=True, help_text="The merchant/account holder's name shown on the QR receipt.")
+    merchant_id = models.CharField(max_length=100, blank=True, help_text='Merchant/account ID for this channel, if applicable.')
+    account_info = models.TextField(blank=True, help_text='Bank/account number or other identifying info shown alongside the QR, if needed.')
     qr_code_image = models.ImageField(upload_to='payment_method_qr/', null=True, blank=True)
     instructions = models.TextField(blank=True, help_text='"How to Pay" steps shown on the QR Payment Page.')
     is_active = models.BooleanField(default=True)
@@ -238,17 +255,26 @@ class PaymentMethod(models.Model):
 
 
 class Purchase(models.Model):
-    KIND_CHOICES = [('subscription', 'Subscription'), ('grand_test', 'Grand Test')]
+    KIND_CHOICES = [
+        ('subscription', 'Subscription'),
+        ('grand_test', 'Grand Test'),
+        ('teacher_course', 'Teacher Course'),
+    ]
     STATUS_CHOICES = [
-        ('unpaid', 'Unpaid'),
+        ('unpaid', 'Unpaid'),  # = "Awaiting Payment": order created, no proof submitted yet
         ('pending', 'Pending Verification'),
         ('resubmission_requested', 'Resubmission Requested'),
         ('approved', 'Approved'),
         ('rejected', 'Rejected'),
+        ('expired', 'Expired'),
+        ('cancelled', 'Cancelled'),
     ]
     # Statuses that still count as "in flight or won" for coupon/referral usage
     # counting — an abandoned unpaid cart or an in-review resubmission shouldn't
     # let a student re-trigger a first-purchase-only coupon or referral discount.
+    # expired/cancelled deliberately excluded: a student whose QR window lapsed
+    # (or who cancelled) should still be able to try again and get the same
+    # first-purchase/referral treatment, not be penalized for an abandoned order.
     OPEN_STATUSES = ('unpaid', 'pending', 'resubmission_requested', 'approved')
 
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='purchases')
@@ -257,7 +283,11 @@ class Purchase(models.Model):
     grand_test = models.ForeignKey(
         'tests_app.Test', on_delete=models.SET_NULL, null=True, blank=True, related_name='purchases',
     )
+    teacher_course = models.ForeignKey(
+        'marketplace.TeacherCourse', on_delete=models.SET_NULL, null=True, blank=True, related_name='purchases',
+    )
     coupon = models.ForeignKey(Coupon, on_delete=models.SET_NULL, null=True, blank=True, related_name='purchases')
+    currency = models.CharField(max_length=3, default='NRS', help_text='NRS only — this platform does not support other currencies.')
     original_amount = models.DecimalField(max_digits=9, decimal_places=2)
     discount_amount = models.DecimalField(max_digits=9, decimal_places=2, default=0)
     final_amount = models.DecimalField(max_digits=9, decimal_places=2)
@@ -266,17 +296,27 @@ class Purchase(models.Model):
         help_text='Which channel the student says they paid through — still manually verified, no live gateway.',
     )
     payment_reference = models.CharField(
-        max_length=150, blank=True,
+        max_length=150, blank=True, db_index=True,
         help_text='Bank transfer / eSewa / Khalti reference number the student provides as proof of payment.',
     )
-    payment_screenshot = models.ImageField(
-        upload_to='payment_screenshots/', null=True, blank=True,
-        help_text='Screenshot/photo of the payment receipt, submitted as proof of payment.',
+    # Deprecated in favor of payment_screenshot_key/bucket (GCS private-bucket
+    # storage — see billing/gcs.py) — kept, nullable and unused for new
+    # submissions, for one release cycle only. Not backfilled: any file this
+    # field previously pointed at was on Cloud Run's ephemeral local disk and
+    # is already gone by the time this migration runs.
+    payment_screenshot = models.ImageField(upload_to='payment_screenshots/', null=True, blank=True)
+    payment_screenshot_key = models.CharField(
+        max_length=255, blank=True, help_text='GCS object key (private bucket) for the submitted screenshot.',
     )
+    payment_screenshot_bucket = models.CharField(max_length=100, blank=True)
     status = models.CharField(max_length=25, choices=STATUS_CHOICES, default='unpaid')
     admin_note = models.CharField(
         max_length=255, blank=True,
         help_text='Rejection reason or resubmission-request reason — which one is determined by status.',
+    )
+    expires_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text='QR payment window deadline (created_at + 30 min) for orders with a nonzero amount. Null for free/100%-off orders, which never expire since nothing is owed.',
     )
     created_at = models.DateTimeField(auto_now_add=True)
     decided_at = models.DateTimeField(null=True, blank=True)
@@ -284,11 +324,26 @@ class Purchase(models.Model):
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='+',
     )
 
+    # How long a QR-payable order stays in 'unpaid' before the expiry cron
+    # (see PurchaseViewSet / payment_service.expire) flips it to 'expired'.
+    EXPIRY_MINUTES = 30
+
     class Meta:
         ordering = ['-created_at']
 
     def __str__(self):
         return f'{self.user} — {self.kind} (Rs.{self.final_amount}) [{self.status}]'
+
+    @property
+    def order_id(self):
+        """Display-only order code derived from the PK — not a separate
+        stored identifier, so there's exactly one source of truth for
+        "which purchase is this" across DB lookups, URLs, and the UI."""
+        return f'HM-{self.id:06d}'
+
+    @property
+    def is_expired(self):
+        return bool(self.expires_at and self.status == 'unpaid' and timezone.now() > self.expires_at)
 
 
 class Scholarship(models.Model):
@@ -333,12 +388,19 @@ class NotificationLog(models.Model):
         ('expiry', 'On expiry'),
         ('grace_period', 'Grace period'),
         ('renewal_confirmation', 'Renewal confirmation'),
+        ('payment_submitted', 'Payment submitted'),
+        ('payment_approved', 'Payment approved'),
+        ('payment_rejected', 'Payment rejected'),
+        ('payment_expired', 'Payment expired'),
     ]
     STATUS_CHOICES = [('sent', 'Sent'), ('failed', 'Failed'), ('skipped', 'Skipped')]
 
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='notification_logs')
     subscription = models.ForeignKey(
         Subscription, on_delete=models.CASCADE, null=True, blank=True, related_name='notification_logs',
+    )
+    purchase = models.ForeignKey(
+        Purchase, on_delete=models.CASCADE, null=True, blank=True, related_name='notification_logs',
     )
     channel = models.CharField(max_length=10, choices=CHANNEL_CHOICES)
     notification_type = models.CharField(max_length=25, choices=TYPE_CHOICES)
@@ -373,3 +435,44 @@ class GrandTestAccess(models.Model):
             chars = string.ascii_uppercase + string.digits
             self.password = 'HM-' + ''.join(random.choices(chars, k=4)) + '-' + ''.join(random.choices(chars, k=4))
         super().save(*args, **kwargs)
+
+
+class PaymentAuditLog(models.Model):
+    """Immutable trail of every payment state transition — who did it, what
+    changed, and why. Written only by billing.payment_audit.record_payment_event(),
+    called from every branch of billing.payment_service (activate/reject/expire/
+    cancel) and PurchaseViewSet.submit_payment. Never updated after creation.
+    Mirrors core.models.DeletionAuditLog's shape/conventions."""
+    ACTION_CHOICES = [
+        ('submitted', 'Payment submitted'),
+        ('approved', 'Approved'),
+        ('rejected', 'Rejected'),
+        ('resubmission_requested', 'Resubmission requested'),
+        ('expired', 'Expired'),
+        ('cancelled', 'Cancelled'),
+    ]
+
+    purchase = models.ForeignKey(Purchase, on_delete=models.CASCADE, related_name='audit_log')
+    action = models.CharField(max_length=25, choices=ACTION_CHOICES)
+    previous_status = models.CharField(max_length=25, blank=True)
+    new_status = models.CharField(max_length=25)
+
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='+',
+    )
+    # Snapshot so the log stays meaningful even after the actor's own account
+    # is later deleted (actor FK goes null, this doesn't) — matches
+    # DeletionAuditLog's actor_email convention.
+    actor_email = models.CharField(max_length=255, blank=True)
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+
+    reason = models.CharField(max_length=500, blank=True)
+    metadata = models.JSONField(default=dict, blank=True, help_text='Extra structured context, e.g. {"payment_reference": "..."}.')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [models.Index(fields=['purchase', 'created_at'])]
+
+    def __str__(self):
+        return f'Purchase {self.purchase_id}: {self.previous_status} -> {self.new_status} ({self.action})'

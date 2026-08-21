@@ -134,12 +134,17 @@ def coupon_usage(limit=10):
 def payment_outcomes():
     rows = Purchase.objects.values('status').annotate(count=Count('id'))
     counts = {r['status']: r['count'] for r in rows}
+    # Rejection rate is deliberately approved-vs-rejected only — an expired
+    # or cancelled order was never actually reviewed, so counting it here
+    # would understate how often a *reviewed* payment gets rejected.
     total_decided = counts.get('approved', 0) + counts.get('rejected', 0)
     rejection_rate = (counts.get('rejected', 0) / total_decided * 100) if total_decided else 0.0
     return {
         'pending': counts.get('pending', 0),
         'approved': counts.get('approved', 0),
         'rejected': counts.get('rejected', 0),
+        'expired': counts.get('expired', 0),
+        'cancelled': counts.get('cancelled', 0),
         'rejection_rate_percent': round(rejection_rate, 2),
     }
 

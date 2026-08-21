@@ -111,6 +111,9 @@ class TeacherCourseViewSet(viewsets.ModelViewSet):
         status_filter = self.request.query_params.get('status')
         if status_filter:
             qs = qs.filter(status=status_filter)
+        category_id = self.request.query_params.get('category')
+        if category_id:
+            qs = qs.filter(category_id=category_id)
         return qs
 
     def destroy(self, request, *args, **kwargs):

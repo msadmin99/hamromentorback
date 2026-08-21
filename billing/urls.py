@@ -5,6 +5,7 @@ from .views import (
     AnalyticsView,
     ApplyCouponView,
     CouponViewSet,
+    ExpireStalePaymentsView,
     GrantAccessView,
     MyCouponsView,
     MySubscriptionsView,
@@ -31,4 +32,5 @@ urlpatterns = [
     path('analytics/', AnalyticsView.as_view(), name='billing-analytics'),
     path('subscriptions/<int:pk>/auto-renew/', SubscriptionAutoRenewView.as_view(), name='subscription-auto-renew'),
     path('cron/send-renewal-reminders/', SendRenewalRemindersView.as_view(), name='send-renewal-reminders'),
+    path('cron/expire-stale-payments/', ExpireStalePaymentsView.as_view(), name='expire-stale-payments'),
 ] + router.urls

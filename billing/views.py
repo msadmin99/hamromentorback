@@ -2,18 +2,20 @@ from decimal import Decimal
 
 from django.conf import settings
 from django.core.mail import send_mail
-from django.db.models import F, Q
+from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import AllowAny, IsAdminUser, IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.throttling import UserRateThrottle
 from rest_framework.views import APIView
 
 from hamromentor.permissions import IsAdminRoleOrAbove, IsAdminRoleOrAboveOrReadOnly
 from tests_app.models import Test
 
+from . import payment_service
 from .analytics import build_analytics
 from .models import (
     Coupon,
@@ -26,10 +28,14 @@ from .models import (
     SubscriptionPlan,
 )
 from .notifications import send_notification
+from .payment_providers import ManualQRProvider
+from .payment_service import PaymentError, _extend_or_create_subscription
+from .screenshot_storage import screenshot_view_url
 from .serializers import (
     ApplyCouponSerializer,
     CouponSerializer,
     CreatePurchaseSerializer,
+    PaymentAuditLogSerializer,
     PaymentMethodSerializer,
     PurchaseSerializer,
     ScholarshipSerializer,
@@ -39,9 +45,23 @@ from .serializers import (
 )
 
 
-def _resolve_amount(kind, plan, grand_test):
+class SubmitPaymentThrottle(UserRateThrottle):
+    # DRF's SimpleRateThrottle reads the rate from settings.REST_FRAMEWORK's
+    # DEFAULT_THROTTLE_RATES[scope], not a class attribute — overriding
+    # get_rate() keeps this self-contained without touching global settings
+    # (same pattern as academics/import_views.py::ImportUploadThrottle).
+    scope = 'submit_payment'
+
+    def get_rate(self):
+        return '10/hour'
+
+
+def _resolve_amount(kind, plan, grand_test, teacher_course=None):
     if kind == 'subscription':
         return plan.price, plan.product_type
+    if kind == 'teacher_course':
+        amount = Decimal('0') if teacher_course.is_free else teacher_course.price
+        return amount, 'teacher_course'
     return (grand_test.price or Decimal('0')), 'grand_test'
 
 
@@ -74,13 +94,13 @@ def find_auto_apply_coupon(user, product_type, plan, grand_test, amount):
     return best
 
 
-def compute_price(kind, plan, grand_test, coupon_code, user):
+def compute_price(kind, plan, grand_test, coupon_code, user, teacher_course=None):
     """Server-authoritative price computation — never trust a client-sent discount.
 
     Tries, in order: a manually-typed coupon code; the best matching auto-apply
     coupon; a one-time referral "friend" discount on a referred student's first
     purchase. At most one of these ever applies — no stacking."""
-    amount, product_type = _resolve_amount(kind, plan, grand_test)
+    amount, product_type = _resolve_amount(kind, plan, grand_test, teacher_course=teacher_course)
     coupon = None
     discount = Decimal('0')
     error = None
@@ -121,102 +141,6 @@ def compute_price(kind, plan, grand_test, coupon_code, user):
         coupon = None
         discount = Decimal('0')
     return amount, discount, amount - discount, coupon, error
-
-
-def _maybe_reward_referrer(purchase):
-    """First time a referred student's purchase is approved, credit the referrer's wallet."""
-    user = purchase.user
-    if not user.referred_by_id:
-        return
-    prior_approved = Purchase.objects.filter(user=user, status='approved').exclude(pk=purchase.pk).exists()
-    if prior_approved:
-        return
-    referrer = user.referred_by
-    referrer.wallet_balance = referrer.wallet_balance + Decimal(settings.REFERRAL_REWARD_AMOUNT)
-    referrer.save(update_fields=['wallet_balance'])
-
-
-def _send_grand_test_email(access):
-    test = access.test
-    lines = [
-        f'Hi {access.user.first_name or access.user.email},',
-        '',
-        'Your payment has been confirmed. Here are your exam details:',
-        '',
-        f'Grand Test: {test.title}',
-    ]
-    if test.scheduled_start:
-        lines.append(f'Exam date/time: {test.scheduled_start.strftime("%d %b %Y, %I:%M %p")}')
-    lines += [
-        f'Duration: {test.duration_minutes} minutes',
-        '',
-        f'Your unique password: {access.password}',
-        '',
-        'Keep this password private — it is unique to you and required to start the exam.',
-        '',
-        'Good luck!',
-        'Dr. Gutka Support',
-    ]
-    try:
-        send_mail(
-            f'Your Grand Test access — {test.title}', '\n'.join(lines),
-            settings.DEFAULT_FROM_EMAIL, [access.user.email], fail_silently=True,
-        )
-    finally:
-        access.email_sent_at = timezone.now()
-        access.save(update_fields=['email_sent_at'])
-
-
-def _extend_or_create_subscription(user, course, product_type, duration, plan=None, mock_test_quota=None):
-    """Shared by purchase activation and the admin manual-grant/scholarship
-    endpoint — extends an existing active subscription for the same
-    user+course+product rather than creating a duplicate row, exactly like a
-    real renewal. Returns (subscription, was_renewal)."""
-    now = timezone.now()
-    existing = Subscription.objects.filter(
-        user=user, course=course, product_type=product_type, is_active=True,
-    ).filter(Q(expires_at__isnull=True) | Q(expires_at__gte=now)).first()
-
-    start_from = existing.expires_at if (existing and existing.expires_at and existing.expires_at > now) else now
-    expires_at = start_from + duration if duration else None
-
-    if existing:
-        existing.expires_at = expires_at
-        if plan:
-            existing.plan = plan
-        if mock_test_quota is not None:
-            existing.mock_test_quota = (existing.mock_test_quota or 0) + mock_test_quota
-        existing.save()
-        return existing, True
-
-    subscription = Subscription.objects.create(
-        user=user, plan=plan, course=course, product_type=product_type,
-        expires_at=expires_at, mock_test_quota=mock_test_quota,
-    )
-    return subscription, False
-
-
-def _activate_purchase(purchase):
-    """Returns (subscription_or_access, was_renewal) — was_renewal is always
-    False for a grand_test purchase (GrandTestAccess has no renewal concept)."""
-    if purchase.kind == 'subscription':
-        plan = purchase.plan
-        subscription, was_renewal = _extend_or_create_subscription(
-            purchase.user, plan.course, plan.product_type, plan.duration_timedelta(),
-            plan=plan, mock_test_quota=plan.mock_test_quota,
-        )
-        if was_renewal:
-            send_notification(purchase.user, 'renewal_confirmation', subscription)
-        return subscription, was_renewal
-
-    access, _created = GrandTestAccess.objects.get_or_create(
-        user=purchase.user, test=purchase.grand_test, defaults={'purchase': purchase},
-    )
-    access.purchase = purchase
-    access.granted_at = timezone.now()
-    access.save()
-    _send_grand_test_email(access)
-    return access, False
 
 
 class GrantAccessView(APIView):
@@ -344,13 +268,20 @@ class ApplyCouponView(APIView):
         data = serializer.validated_data
         plan = get_object_or_404(SubscriptionPlan, pk=data['plan_id']) if data.get('plan_id') else None
         grand_test = get_object_or_404(Test, pk=data['grand_test_id']) if data.get('grand_test_id') else None
+        teacher_course = None
+        if data.get('teacher_course_id'):
+            from marketplace.models import TeacherCourse
+
+            teacher_course = get_object_or_404(TeacherCourse, pk=data['teacher_course_id'])
         if data['kind'] == 'subscription' and not plan:
             return Response({'detail': 'plan_id is required.'}, status=400)
         if data['kind'] == 'grand_test' and not grand_test:
             return Response({'detail': 'grand_test_id is required.'}, status=400)
+        if data['kind'] == 'teacher_course' and not teacher_course:
+            return Response({'detail': 'teacher_course_id is required.'}, status=400)
 
         amount, discount, final, coupon, error = compute_price(
-            data['kind'], plan, grand_test, data.get('code', ''), request.user,
+            data['kind'], plan, grand_test, data.get('code', ''), request.user, teacher_course=teacher_course,
         )
         if error:
             return Response({'detail': error, 'valid': False}, status=400)
@@ -409,7 +340,9 @@ class MyCouponsView(APIView):
 
 
 class PurchaseViewSet(viewsets.ModelViewSet):
-    queryset = Purchase.objects.select_related('user', 'plan', 'grand_test', 'coupon', 'grand_test_access').all()
+    queryset = Purchase.objects.select_related(
+        'user', 'plan', 'grand_test', 'teacher_course', 'coupon', 'grand_test_access',
+    ).all()
     permission_classes = [IsAuthenticated]
     http_method_names = ['get', 'post', 'head', 'options']
 
@@ -426,6 +359,25 @@ class PurchaseViewSet(viewsets.ModelViewSet):
         status_filter = self.request.query_params.get('status')
         if status_filter:
             qs = qs.filter(status=status_filter)
+        search = self.request.query_params.get('search')
+        if search:
+            search = search.strip()
+            order_match = None
+            if search.upper().startswith('HM-'):
+                try:
+                    order_match = int(search.upper().removeprefix('HM-'))
+                except ValueError:
+                    order_match = None
+            qs = qs.filter(Q(payment_reference__icontains=search) | Q(pk=order_match)) if order_match else qs.filter(payment_reference__icontains=search)
+        provider = self.request.query_params.get('provider')
+        if provider:
+            qs = qs.filter(payment_method__provider_type=provider)
+        date_from = self.request.query_params.get('date_from')
+        date_to = self.request.query_params.get('date_to')
+        if date_from:
+            qs = qs.filter(created_at__date__gte=date_from)
+        if date_to:
+            qs = qs.filter(created_at__date__lte=date_to)
         return qs
 
     def create(self, request, *args, **kwargs):
@@ -434,99 +386,133 @@ class PurchaseViewSet(viewsets.ModelViewSet):
         data = serializer.validated_data
         plan = get_object_or_404(SubscriptionPlan, pk=data['plan_id']) if data.get('plan_id') else None
         grand_test = get_object_or_404(Test, pk=data['grand_test_id']) if data.get('grand_test_id') else None
+        teacher_course = None
+        if data.get('teacher_course_id'):
+            from marketplace.models import TeacherCourse
+
+            teacher_course = get_object_or_404(TeacherCourse, pk=data['teacher_course_id'], status='approved')
         if data['kind'] == 'subscription' and not plan:
             return Response({'detail': 'plan_id is required.'}, status=400)
         if data['kind'] == 'grand_test' and not grand_test:
             return Response({'detail': 'grand_test_id is required.'}, status=400)
+        if data['kind'] == 'teacher_course' and not teacher_course:
+            return Response({'detail': 'teacher_course_id is required.'}, status=400)
         if data['kind'] == 'grand_test' and GrandTestAccess.objects.filter(user=request.user, test=grand_test).exists():
             return Response({'detail': 'You already have access to this Grand Test.'}, status=400)
+        if data['kind'] == 'teacher_course':
+            from marketplace.models import CourseEnrollment
+
+            already_enrolled = CourseEnrollment.objects.filter(
+                user=request.user, course=teacher_course, is_active=True,
+            ).filter(Q(expires_at__isnull=True) | Q(expires_at__gte=timezone.now())).exists()
+            if already_enrolled:
+                return Response({'detail': 'You already have access to this course.'}, status=400)
 
         amount, discount, final, coupon, error = compute_price(
-            data['kind'], plan, grand_test, data.get('coupon_code', ''), request.user,
+            data['kind'], plan, grand_test, data.get('coupon_code', ''), request.user, teacher_course=teacher_course,
         )
         if error:
             return Response({'detail': error}, status=400)
 
         purchase = Purchase.objects.create(
-            user=request.user, kind=data['kind'], plan=plan, grand_test=grand_test, coupon=coupon,
-            original_amount=amount, discount_amount=discount, final_amount=final,
+            user=request.user, kind=data['kind'], plan=plan, grand_test=grand_test, teacher_course=teacher_course,
+            coupon=coupon, original_amount=amount, discount_amount=discount, final_amount=final,
+            expires_at=(timezone.now() + timezone.timedelta(minutes=Purchase.EXPIRY_MINUTES)) if final > 0 else None,
         )
 
         if final <= 0:
             # Nothing to verify — a 100%-off / free-grant coupon needs no manual bank-transfer
             # check, so activate immediately instead of leaving it stuck in "pending".
-            _activate_purchase(purchase)
-            purchase.status = 'approved'
-            purchase.decided_at = timezone.now()
-            purchase.save()
-            if purchase.coupon:
-                Coupon.objects.filter(pk=purchase.coupon_id).update(usage_count=F('usage_count') + 1)
-            _maybe_reward_referrer(purchase)
+            payment_service.activate(purchase.id, request=request, allow_unpaid=True)
+            purchase.refresh_from_db()
 
         return Response(PurchaseSerializer(purchase).data, status=status.HTTP_201_CREATED)
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated], url_path='submit-payment')
+    @action(
+        detail=True, methods=['post'], permission_classes=[IsAuthenticated],
+        url_path='submit-payment', throttle_classes=[SubmitPaymentThrottle],
+    )
     def submit_payment(self, request, pk=None):
         """Student submits (or resubmits) proof of payment — the same endpoint
         serves both a first-time submission (status='unpaid') and a resubmission
         after the admin requested new proof (status='resubmission_requested'),
-        since the form and transition are identical either way."""
+        since the form and transition are identical either way. All the actual
+        guard/lock/duplicate-reference logic lives in payment_service.submit."""
         purchase = self.get_object()
-        if purchase.status not in ('unpaid', 'resubmission_requested'):
-            return Response({'detail': 'This purchase is not awaiting payment submission.'}, status=400)
         serializer = SubmitPaymentSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        purchase.payment_method = data['payment_method']
-        purchase.payment_reference = data['payment_reference']
-        purchase.payment_screenshot = data['payment_screenshot']
-        purchase.status = 'pending'
-        purchase.admin_note = ''
-        purchase.save()
+        try:
+            purchase = payment_service.submit(
+                purchase.id, request=request,
+                payment_method=data['payment_method'],
+                payment_reference=data['payment_reference'],
+                screenshot_file=data['payment_screenshot'],
+            )
+        except PaymentError as exc:
+            return Response({'detail': exc.message}, status=400)
         return Response(PurchaseSerializer(purchase).data)
 
     @action(detail=True, methods=['post'], permission_classes=[IsAdminUser])
     def approve(self, request, pk=None):
         purchase = self.get_object()
-        if purchase.status != 'pending':
-            return Response({'detail': 'This purchase has already been decided.'}, status=400)
-        _activate_purchase(purchase)
-        purchase.status = 'approved'
-        purchase.decided_at = timezone.now()
-        purchase.decided_by = request.user
-        purchase.save()
-        if purchase.coupon:
-            Coupon.objects.filter(pk=purchase.coupon_id).update(usage_count=F('usage_count') + 1)
-        _maybe_reward_referrer(purchase)
+        try:
+            purchase = ManualQRProvider.approve(purchase.id, actor=request.user, request=request)
+        except PaymentError as exc:
+            return Response({'detail': exc.message}, status=400)
         return Response(PurchaseSerializer(purchase).data)
 
     @action(detail=True, methods=['post'], permission_classes=[IsAdminUser])
     def reject(self, request, pk=None):
         purchase = self.get_object()
-        if purchase.status not in ('pending', 'resubmission_requested'):
-            return Response({'detail': 'This purchase has already been decided.'}, status=400)
-        note = (request.data.get('admin_note') or '').strip()
-        if not note:
-            return Response({'detail': 'A reason is required to reject a purchase.'}, status=400)
-        purchase.status = 'rejected'
-        purchase.admin_note = note
-        purchase.decided_at = timezone.now()
-        purchase.decided_by = request.user
-        purchase.save()
+        note = request.data.get('admin_note') or ''
+        try:
+            purchase = ManualQRProvider.reject(purchase.id, note, actor=request.user, request=request)
+        except PaymentError as exc:
+            return Response({'detail': exc.message}, status=400)
         return Response(PurchaseSerializer(purchase).data)
 
     @action(detail=True, methods=['post'], permission_classes=[IsAdminUser], url_path='request-resubmission')
     def request_resubmission(self, request, pk=None):
         purchase = self.get_object()
-        if purchase.status != 'pending':
-            return Response({'detail': 'This purchase is not awaiting verification.'}, status=400)
-        note = (request.data.get('admin_note') or '').strip()
-        if not note:
-            return Response({'detail': 'A reason is required when requesting new proof.'}, status=400)
-        purchase.status = 'resubmission_requested'
-        purchase.admin_note = note
-        purchase.save()
+        note = request.data.get('admin_note') or ''
+        try:
+            purchase = payment_service.request_resubmission(purchase.id, note, actor=request.user, request=request)
+        except PaymentError as exc:
+            return Response({'detail': exc.message}, status=400)
         return Response(PurchaseSerializer(purchase).data)
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
+    def cancel(self, request, pk=None):
+        """Student (or staff) explicitly cancels an unpaid/resubmission order —
+        e.g. they changed their mind before scanning the QR. Distinct from
+        expiry (a passive timeout); this is an active choice."""
+        purchase = self.get_object()
+        try:
+            purchase = payment_service.cancel(purchase.id, actor=request.user, request=request)
+        except PaymentError as exc:
+            return Response({'detail': exc.message}, status=400)
+        return Response(PurchaseSerializer(purchase).data)
+
+    @action(detail=True, methods=['get'], permission_classes=[IsAuthenticated])
+    def screenshot(self, request, pk=None):
+        """Returns a short-lived signed URL for the submitted payment
+        screenshot — never a direct/predictable public path. Owner or staff
+        only; returned as JSON (not a redirect) so the signed URL doesn't end
+        up in server access/referrer logs the way a redirect target would."""
+        purchase = self.get_object()
+        if not (request.user.is_staff or purchase.user_id == request.user.id):
+            return Response({'detail': 'Not allowed.'}, status=403)
+        url = screenshot_view_url(purchase.payment_screenshot_bucket, purchase.payment_screenshot_key)
+        if not url:
+            return Response({'detail': 'No screenshot on file for this purchase.'}, status=404)
+        return Response({'url': url})
+
+    @action(detail=True, methods=['get'], permission_classes=[IsAdminUser], url_path='audit-log')
+    def audit_log(self, request, pk=None):
+        purchase = self.get_object()
+        entries = purchase.audit_log.select_related('actor').all()
+        return Response(PaymentAuditLogSerializer(entries, many=True).data)
 
     @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated], url_path='email-invoice')
     def email_invoice(self, request, pk=None):
@@ -535,9 +521,14 @@ class PurchaseViewSet(viewsets.ModelViewSet):
         grand-test-access emails. No PDF generation (no library in this stack;
         the printable page already covers view/print/save-as-PDF)."""
         purchase = self.get_object()
-        item_label = purchase.grand_test.title if purchase.kind == 'grand_test' else (purchase.plan.name if purchase.plan else 'Purchase')
+        if purchase.kind == 'grand_test':
+            item_label = purchase.grand_test.title if purchase.grand_test_id else 'Grand Test'
+        elif purchase.kind == 'teacher_course':
+            item_label = purchase.teacher_course.title if purchase.teacher_course_id else 'Course'
+        else:
+            item_label = purchase.plan.name if purchase.plan_id else 'Purchase'
         lines = [
-            f'Invoice #{purchase.id}',
+            f'Invoice {purchase.order_id}',
             f'Date: {purchase.created_at.strftime("%d %b %Y")}',
             '',
             f'Item: {item_label}',
@@ -557,7 +548,7 @@ class PurchaseViewSet(viewsets.ModelViewSet):
         if not purchase.user.email:
             return Response({'detail': 'No email address on file for this account.'}, status=400)
         send_mail(
-            f'Your invoice #{purchase.id} — Dr. Gutka', '\n'.join(lines),
+            f'Your invoice {purchase.order_id} — Dr. Gutka', '\n'.join(lines),
             settings.DEFAULT_FROM_EMAIL, [purchase.user.email], fail_silently=False,
         )
         return Response({'sent': True})
@@ -631,3 +622,26 @@ class SendRenewalRemindersView(APIView):
                 counts[log.status] = counts.get(log.status, 0) + 1
 
         return Response(counts)
+
+
+class ExpireStalePaymentsView(APIView):
+    """POST /api/cron/expire-stale-payments/ — sweeps 'unpaid' purchases past
+    their 30-minute QR window and flips them to 'expired'. Needs a *much*
+    more frequent Cloud Scheduler entry than send-renewal-reminders (e.g.
+    every 5 minutes, not daily) — same shared-secret pattern, separate job."""
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        if not _check_cron_secret(request):
+            return Response({'detail': 'Invalid or missing cron secret.'}, status=401)
+
+        stale_ids = list(
+            Purchase.objects.filter(status='unpaid', expires_at__isnull=False, expires_at__lt=timezone.now())
+            .values_list('id', flat=True)
+        )
+        expired_count = 0
+        for purchase_id in stale_ids:
+            payment_service.expire(purchase_id)
+            expired_count += 1
+
+        return Response({'checked': len(stale_ids), 'expired': expired_count})

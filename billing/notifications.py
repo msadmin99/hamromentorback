@@ -83,3 +83,75 @@ def send_notification(user, notification_type, subscription, channels=('email',)
             )
         )
     return logs
+
+
+# --- Payment (Purchase) notifications ---
+# A separate render path from the reminder MESSAGES above: those are always
+# Subscription-shaped (course/expiry), but a payment event can be for a
+# subscription, a Grand Test, or a Teacher Course purchase, and needs to
+# reflect the actual admin_note on rejection. Kept as plain string templates
+# (not the MESSAGES dict) since the context shape is different enough that
+# forcing them into the same _render() would need more branching than it's
+# worth.
+
+PAYMENT_MESSAGES = {
+    'payment_submitted': (
+        'We received your payment proof — {item}',
+        'Thanks! We received your payment proof for {item} (Order {order_id}, Rs. {amount}). '
+        "We'll verify it and activate your access shortly.",
+    ),
+    'payment_approved': (
+        'Payment verified — {item} is now active',
+        'Your payment has been verified successfully. Your purchased product is now available. '
+        '{item} (Order {order_id}, Rs. {amount}) is now active on your account.',
+    ),
+    'payment_rejected': (
+        'Payment could not be verified — {item}',
+        'Your payment could not be verified. Reason: {reason}. '
+        'Order {order_id} for {item} — you can submit a new payment reference and screenshot anytime.',
+    ),
+    'payment_expired': (
+        'Your payment window has expired — {item}',
+        'Your 30-minute payment window for {item} (Order {order_id}, Rs. {amount}) has expired '
+        'without a submitted payment. Start a new order anytime to try again.',
+    ),
+}
+
+
+def _purchase_item_label(purchase):
+    if purchase.kind == 'grand_test':
+        return purchase.grand_test.title if purchase.grand_test_id else 'your Grand Test'
+    if purchase.kind == 'teacher_course':
+        return purchase.teacher_course.title if purchase.teacher_course_id else 'your course'
+    return purchase.plan.name if purchase.plan_id else 'your subscription'
+
+
+def _render_payment(notification_type, purchase):
+    subject_tpl, body_tpl = PAYMENT_MESSAGES[notification_type]
+    ctx = {
+        'item': _purchase_item_label(purchase),
+        'order_id': purchase.order_id,
+        'amount': purchase.final_amount,
+        'reason': purchase.admin_note or 'Not specified.',
+    }
+    return subject_tpl.format(**ctx), body_tpl.format(**ctx)
+
+
+def send_payment_notification(user, notification_type, purchase, channels=('email',)):
+    """Same channel/logging shape as send_notification, for Purchase-shaped
+    events (submitted/approved/rejected/expired) instead of Subscription-
+    shaped reminders."""
+    subject, body = _render_payment(notification_type, purchase)
+    logs = []
+    for channel in channels:
+        sender = CHANNEL_SENDERS.get(channel)
+        if not sender:
+            continue
+        status, detail = sender(user, subject, body)
+        logs.append(
+            NotificationLog.objects.create(
+                user=user, purchase=purchase, channel=channel,
+                notification_type=notification_type, status=status, detail=detail,
+            )
+        )
+    return logs
