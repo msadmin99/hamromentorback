@@ -1,3 +1,4 @@
+from django.db.models import Exists, OuterRef
 from django.shortcuts import get_object_or_404
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
@@ -82,6 +83,7 @@ class QuestionViewSet(viewsets.ModelViewSet):
         course = self.request.query_params.get('course')
         teacher = self.request.query_params.get('teacher')
         search = self.request.query_params.get('search')
+        bookmarked = self.request.query_params.get('bookmarked')
         if subject:
             qs = qs.filter(subject__slug=subject)
         if chapter:
@@ -101,6 +103,11 @@ class QuestionViewSet(viewsets.ModelViewSet):
                 | Q(subject__name__icontains=search) | Q(chapter__name__icontains=search)
                 | Q(topic__name__icontains=search)
             )
+        if bookmarked in ('true', '1'):
+            if self.request.user.is_authenticated:
+                qs = qs.filter(attempts__user=self.request.user, attempts__is_bookmarked=True)
+            else:
+                qs = qs.none()
 
         user = self.request.user
         if not (user.is_authenticated and user.is_staff):
@@ -110,6 +117,17 @@ class QuestionViewSet(viewsets.ModelViewSet):
                 qs = qs.exclude(subject_id__in=locked_subject_ids)
         elif getattr(user, 'admin_role', None) == 'teacher' and not user.can_manage_all_content:
             qs = qs.filter(created_by=user)
+
+        if user.is_authenticated:
+            # One EXISTS subquery joined into the main SELECT, not a query
+            # per row — QuestionSerializer.get_is_bookmarked just reads this
+            # annotation, so fetching a whole chapter's worth of questions
+            # for a solve session stays a single query.
+            qs = qs.annotate(
+                is_bookmarked_by_user=Exists(
+                    QuestionAttempt.objects.filter(user=user, question=OuterRef('pk'), is_bookmarked=True)
+                )
+            )
         return qs.distinct()
 
     def destroy(self, request, *args, **kwargs):
@@ -268,6 +286,26 @@ class QuestionViewSet(viewsets.ModelViewSet):
             'explanation_video_url': question.explanation_video_url,
             'references': question.references,
         })
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
+    def bookmark(self, request, pk=None):
+        """Toggles a bookmark independently of answer() — deliberately a
+        separate action, not `answer` called with only `bookmark`, because
+        answer()'s update_or_create always writes selected_option/is_correct
+        from the request (None/False when option_id is omitted), which would
+        silently blank out a previously-recorded answer. Bookmarking must be
+        safe to do before, during, or after answering, so this only ever
+        touches is_bookmarked."""
+        question = self.get_object()
+        # bool("False") is True — request.data.get() can come back as a
+        # form-encoded string as well as a real JSON boolean, so a plain
+        # bool() cast would make "turn bookmark off" silently turn it on.
+        is_bookmarked = request.data.get('bookmark') in (True, 'true', 'True', '1', 1)
+        QuestionAttempt.objects.update_or_create(
+            user=request.user, question=question,
+            defaults={'is_bookmarked': is_bookmarked},
+        )
+        return Response({'is_bookmarked': is_bookmarked})
 
 
 class QuestionExcelTemplateView(APIView):

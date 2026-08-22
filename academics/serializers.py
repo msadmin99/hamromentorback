@@ -132,16 +132,24 @@ class QuestionSerializer(serializers.ModelSerializer):
     subject_name = serializers.CharField(source='subject.name', read_only=True)
     chapter_name = serializers.CharField(source='chapter.name', read_only=True)
     image_data = serializers.SerializerMethodField()
+    is_bookmarked = serializers.SerializerMethodField()
 
     class Meta:
         model = Question
         fields = [
             'id', 'public_id', 'text', 'image', 'image_data', 'latex', 'marks', 'negative_marks',
-            'year', 'subject', 'subject_name', 'chapter', 'chapter_name', 'topic', 'options',
+            'year', 'subject', 'subject_name', 'chapter', 'chapter_name', 'topic', 'options', 'is_bookmarked',
         ]
 
     def get_image_data(self, obj):
         return resolve_image_data(obj.image_asset, obj.image)
+
+    def get_is_bookmarked(self, obj):
+        # Relies on QuestionViewSet.get_queryset()'s is_bookmarked_by_user
+        # annotation (a single EXISTS subquery) rather than a per-object
+        # query here — this field can appear on a whole chapter's worth of
+        # questions in one response.
+        return bool(getattr(obj, 'is_bookmarked_by_user', False))
 
 
 class QuestionAdminSerializer(serializers.ModelSerializer):

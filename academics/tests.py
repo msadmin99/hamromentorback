@@ -9,7 +9,7 @@ from rest_framework.test import APITestCase
 
 from academics.import_dedup import existing_texts_for_subject, find_duplicate, normalize_option_set, normalize_text
 from academics.importers.docx_parser import parse_docx
-from academics.models import Chapter, ImportBatch, ImportRow, Option, Question, Subject, Topic
+from academics.models import Chapter, ImportBatch, ImportRow, Option, Question, QuestionAttempt, Subject, Topic
 from core.models import DeletionAuditLog
 from tests_app.models import Test, TestAttempt, TestQuestion
 
@@ -369,3 +369,87 @@ class ImportDedupTests(TestCase):
         different_options = _pq('Normality of 1 M solution of phosphoric acid is', ['0.5 N', '0.1 N', '2.0 N', '3.0 N'])
         dup_id, score = find_duplicate(different_options, existing_map, self_index=None)
         self.assertIsNone(dup_id)
+
+
+class QuestionBookmarkFilterTests(APITestCase):
+    """Powers the QBank 'Bookmarks' page — ?bookmarked=true must return only
+    this user's own bookmarked questions, never another student's."""
+
+    def setUp(self):
+        self.student = User.objects.create_user(username='student1', email='student1@example.com', password='pw12345')
+        self.other = User.objects.create_user(username='other1', email='other1@example.com', password='pw12345')
+        self.subject = Subject.objects.create(name='Physics')
+        self.bookmarked_q = Question.objects.create(subject=self.subject, text='Bookmarked question')
+        self.plain_q = Question.objects.create(subject=self.subject, text='Not bookmarked')
+        QuestionAttempt.objects.create(user=self.student, question=self.bookmarked_q, is_bookmarked=True)
+        QuestionAttempt.objects.create(user=self.student, question=self.plain_q, is_bookmarked=False)
+        # Another student bookmarking the same question must not leak into self.student's list.
+        QuestionAttempt.objects.create(user=self.other, question=self.plain_q, is_bookmarked=True)
+
+    def test_bookmarked_filter_returns_only_own_bookmarks(self):
+        self.client.force_authenticate(user=self.student)
+        resp = self.client.get('/api/questions/?bookmarked=true')
+        self.assertEqual(resp.status_code, 200)
+        ids = {q['id'] for q in resp.data}
+        self.assertEqual(ids, {self.bookmarked_q.id})
+
+    def test_bookmarked_filter_requires_auth(self):
+        resp = self.client.get('/api/questions/?bookmarked=true')
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data, [])
+
+    def test_without_filter_all_visible_questions_still_returned(self):
+        self.client.force_authenticate(user=self.student)
+        resp = self.client.get('/api/questions/')
+        ids = {q['id'] for q in resp.data}
+        self.assertEqual(ids, {self.bookmarked_q.id, self.plain_q.id})
+
+
+class QuestionBookmarkToggleTests(APITestCase):
+    """Regression coverage: bookmarking must never blank out a previously
+    recorded answer (see the bookmark() action's docstring for the bug in
+    answer() this deliberately avoids)."""
+
+    def setUp(self):
+        self.student = User.objects.create_user(username='student1', email='student1@example.com', password='pw12345')
+        self.subject = Subject.objects.create(name='Physics')
+        self.question = Question.objects.create(subject=self.subject, text='2+2=?')
+        self.option = Option.objects.create(question=self.question, text='4', is_correct=True)
+        self.client.force_authenticate(user=self.student)
+
+    def test_bookmark_on_a_never_attempted_question_creates_attempt(self):
+        resp = self.client.post(f'/api/questions/{self.question.id}/bookmark/', {'bookmark': True})
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.data['is_bookmarked'])
+        attempt = QuestionAttempt.objects.get(user=self.student, question=self.question)
+        self.assertTrue(attempt.is_bookmarked)
+        self.assertIsNone(attempt.selected_option)
+
+    def test_bookmarking_does_not_erase_a_previously_recorded_answer(self):
+        self.client.post(f'/api/questions/{self.question.id}/answer/', {'option_id': self.option.id})
+        self.client.post(f'/api/questions/{self.question.id}/bookmark/', {'bookmark': True})
+
+        attempt = QuestionAttempt.objects.get(user=self.student, question=self.question)
+        self.assertTrue(attempt.is_bookmarked)
+        self.assertEqual(attempt.selected_option_id, self.option.id)
+        self.assertTrue(attempt.is_correct)
+
+    def test_unbookmark_clears_the_flag_only(self):
+        self.client.post(f'/api/questions/{self.question.id}/answer/', {'option_id': self.option.id})
+        self.client.post(f'/api/questions/{self.question.id}/bookmark/', {'bookmark': True})
+        resp = self.client.post(f'/api/questions/{self.question.id}/bookmark/', {'bookmark': False})
+
+        self.assertFalse(resp.data['is_bookmarked'])
+        attempt = QuestionAttempt.objects.get(user=self.student, question=self.question)
+        self.assertFalse(attempt.is_bookmarked)
+        self.assertEqual(attempt.selected_option_id, self.option.id)
+
+    def test_is_bookmarked_reflects_in_the_question_list_response(self):
+        other_question = Question.objects.create(subject=self.subject, text='3+3=?')
+        self.client.post(f'/api/questions/{self.question.id}/bookmark/', {'bookmark': True})
+
+        resp = self.client.get('/api/questions/')
+
+        by_id = {q['id']: q['is_bookmarked'] for q in resp.data}
+        self.assertTrue(by_id[self.question.id])
+        self.assertFalse(by_id[other_question.id])
