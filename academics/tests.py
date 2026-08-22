@@ -7,6 +7,7 @@ from docx import Document as DocxDocument
 from rest_framework import status
 from rest_framework.test import APITestCase
 
+from academics.import_dedup import existing_texts_for_subject, find_duplicate, normalize_option_set, normalize_text
 from academics.importers.docx_parser import parse_docx
 from academics.models import Chapter, ImportBatch, ImportRow, Option, Question, Subject, Topic
 from core.models import DeletionAuditLog
@@ -313,3 +314,58 @@ class DocxParserExplanationTests(TestCase):
 
         self.assertEqual(len(questions), 2)
         self.assertEqual(len(questions[1]['options']), 4)
+
+
+def _pq(text, option_texts):
+    return {'text_html': text, 'options': [{'text_html': t} for t in option_texts]}
+
+
+def _batch_entry(pq):
+    return {'text': normalize_text(pq['text_html']), 'options': normalize_option_set(o['text_html'] for o in pq['options'])}
+
+
+class ImportDedupTests(TestCase):
+    """Regression coverage for a real reported false-positive: two questions
+    sharing a common template stem ("Normality of X M solution of Y is?")
+    but different specifics and different options were being flagged as
+    duplicates on stem similarity alone. Duplicate detection must require
+    both the stem AND the option set to substantially match."""
+
+    def test_similar_stem_with_different_options_is_not_flagged(self):
+        candidate = _pq('Normality of 1 M solution of phosphoric acid is', ['0.5 N', '0.1 N', '2.0 N', '3.0 N'])
+        other = _pq('Normality of 1 M solution of sulphuric acid is', ['1 N', '2 N', 'N/2', 'N/4'])
+        batch = {1: _batch_entry(other)}
+
+        dup_id, score = find_duplicate(candidate, {}, batch, self_index=0)
+
+        self.assertIsNone(dup_id)
+        self.assertEqual(score, 0.0)
+
+    def test_identical_stem_and_options_is_flagged(self):
+        candidate = _pq('Normality of 1 M solution of sulphuric acid is', ['1 N', '2 N', 'N/2', 'N/4'])
+        other = _pq('Normality of 1 M solution of sulphuric acid is', ['1 N', '2 N', 'N/2', 'N/4'])
+        batch = {1: _batch_entry(other)}
+
+        dup_id, score = find_duplicate(candidate, {}, batch, self_index=0)
+
+        self.assertEqual(dup_id, 'row:1')
+        self.assertGreaterEqual(score, 0.85)
+
+    def test_matches_against_existing_db_question_require_both_dimensions(self):
+        subject = Subject.objects.create(name='Chemistry')
+        existing = Question.objects.create(subject=subject, text='Normality of 1 M solution of sulphuric acid is')
+        Option.objects.create(question=existing, text='1 N')
+        Option.objects.create(question=existing, text='2 N')
+        Option.objects.create(question=existing, text='N/2')
+        Option.objects.create(question=existing, text='N/4')
+
+        existing_map = existing_texts_for_subject(subject)
+
+        same_options = _pq('Normality of 1 M solution of sulphuric acid is', ['1 N', '2 N', 'N/2', 'N/4'])
+        dup_id, score = find_duplicate(same_options, existing_map, self_index=None)
+        self.assertEqual(dup_id, existing.id)
+        self.assertGreaterEqual(score, 0.85)
+
+        different_options = _pq('Normality of 1 M solution of phosphoric acid is', ['0.5 N', '0.1 N', '2.0 N', '3.0 N'])
+        dup_id, score = find_duplicate(different_options, existing_map, self_index=None)
+        self.assertIsNone(dup_id)

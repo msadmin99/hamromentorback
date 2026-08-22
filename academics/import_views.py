@@ -14,7 +14,7 @@ from rest_framework.views import APIView
 
 from tests_app.serializers import TestAdminSerializer
 
-from .import_dedup import existing_texts_for_subject, find_duplicate, normalize_text
+from .import_dedup import existing_texts_for_subject, find_duplicate, normalize_option_set, normalize_text
 from .import_engine import create_question_from_row, question_is_referenced
 from .import_validation import validate_parsed_question
 from .importers import PARSERS
@@ -171,7 +171,13 @@ def _run_dedup(batch):
 
     existing = existing_texts_for_subject(batch.subject)
     rows = list(batch.rows.exclude(status='error').order_by('row_number'))
-    batch_texts = {row.id: normalize_text(row.raw_data.get('text_html')) for row in rows}
+    batch_texts = {
+        row.id: {
+            'text': normalize_text(row.raw_data.get('text_html')),
+            'options': normalize_option_set(o.get('text_html') for o in (row.raw_data.get('options') or [])),
+        }
+        for row in rows
+    }
 
     for row in rows:
         dup_id, score = find_duplicate(row.raw_data, existing, batch_texts, self_index=row.id)
