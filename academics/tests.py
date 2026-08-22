@@ -1,8 +1,13 @@
+import io
+
 from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test import TestCase
+from docx import Document as DocxDocument
 from rest_framework import status
 from rest_framework.test import APITestCase
 
+from academics.importers.docx_parser import parse_docx
 from academics.models import Chapter, ImportBatch, ImportRow, Option, Question, Subject, Topic
 from core.models import DeletionAuditLog
 from tests_app.models import Test, TestAttempt, TestQuestion
@@ -224,3 +229,87 @@ class ImportBatchCreateTestModeMismatchTests(APITestCase):
         )
 
         self.assertEqual(resp.status_code, 400)
+
+
+def _build_docx(lines):
+    """Builds a minimal in-memory .docx from plain-text lines, mirroring
+    docx_parser.build_template_docx()'s pattern."""
+    doc = DocxDocument()
+    for line in lines:
+        doc.add_paragraph(line)
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf
+
+
+class DocxParserExplanationTests(TestCase):
+    """Regression coverage for a real reported bug: a rich, AI-style
+    explanation (Correct Answer / Core Concept / ... / Option Analysis /
+    Common Exam Trap / Review Point) was being shredded on import, because
+    the parser treated ANY line starting with "digit." or "letter)" as a
+    new question/option — even decimal values and a per-option breakdown
+    that legitimately appear inside the explanation itself. Confirmed via
+    the actual "Volumetric Analysis.docx" file: 70 phantom rows and 8
+    "options" per question instead of 66 real questions with 4 each."""
+
+    def test_decimal_value_inside_explanation_does_not_start_a_new_question(self):
+        buf = _build_docx([
+            'Q1. What is the normality of a 1 M solution of H3PO4?',
+            'A) 0.5 N', 'B) 0.1 N', 'C) 2.0 N', 'D) 3.0 N',
+            'Answer: D',
+            'Explanation:',
+            'Correct Answer: D) 3.0 N',
+            '0.5 N -- would require n = 0.5, which has no chemical basis.',
+            '2.0 N -- this matches a diprotic acid, not H3PO4.',
+            'Review Point: Normality = Molarity x Basicity.',
+        ])
+
+        questions = parse_docx(buf)
+
+        self.assertEqual(len(questions), 1)
+        self.assertEqual(len(questions[0]['options']), 4)
+        self.assertIn('0.5 N', questions[0]['explanation_html'])
+        self.assertIn('Review Point', questions[0]['explanation_html'])
+
+    def test_lettered_option_analysis_inside_explanation_is_not_read_as_new_options(self):
+        buf = _build_docx([
+            'Q1. Molecular weight of a tribasic acid is W. Its equivalent weight is:',
+            'A) W/2', 'B) W/3', 'C) W', 'D) 3W',
+            'Answer: B',
+            'Explanation:',
+            'Correct Answer: B) W/3',
+            'Option Analysis:',
+            'A) W/2 -- corresponds to a dibasic acid.',
+            'B) W/3 -- correctly divides by basicity.',
+            'C) W -- would mean the acid is monobasic.',
+            'D) 3W -- incorrectly multiplies instead of dividing.',
+            'Review Point: Equivalent weight = Molecular weight / Basicity.',
+        ])
+
+        questions = parse_docx(buf)
+
+        self.assertEqual(len(questions), 1)
+        question = questions[0]
+        self.assertEqual(len(question['options']), 4)
+        correct = [i for i, o in enumerate(question['options']) if o['is_correct']]
+        self.assertEqual(correct, [1])  # B
+        self.assertIn('Option Analysis', question['explanation_html'])
+        self.assertIn('Review Point', question['explanation_html'])
+
+    def test_explicit_q_prefix_still_starts_a_new_question_even_mid_explanation(self):
+        buf = _build_docx([
+            'Q1. First question?',
+            'A) 1', 'B) 2', 'C) 3', 'D) 4',
+            'Answer: A',
+            'Explanation:',
+            'Some explanation text without a proper close.',
+            'Q2. Second question?',
+            'A) 5', 'B) 6', 'C) 7', 'D) 8',
+            'Answer: B',
+        ])
+
+        questions = parse_docx(buf)
+
+        self.assertEqual(len(questions), 2)
+        self.assertEqual(len(questions[1]['options']), 4)

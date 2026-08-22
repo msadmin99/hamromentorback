@@ -32,7 +32,7 @@ from docx.oxml.ns import qn
 
 from .base import ParsedQuestion, save_temp_image
 
-QUESTION_RE = re.compile(r'^\s*(?:Q\.?\s*)?(\d+)\s*[.):]\s*')
+QUESTION_RE = re.compile(r'^\s*(Q\.?\s*)?(\d+)\s*[.):]\s*')
 OPTION_RE = re.compile(r'^\s*([A-Da-d])\s*[.):]\s*')
 ANSWER_RE = re.compile(r'^\s*Answer\s*:?\s*([A-Da-d])', re.IGNORECASE)
 EXPLANATION_RE = re.compile(r'^\s*Explanation\s*:?\s*')
@@ -106,7 +106,12 @@ def parse_docx(file_obj, batch_id=None):
             continue
 
         m = QUESTION_RE.match(raw_text)
-        if m:
+        # A bare "12." (no "Q" prefix) is ambiguous with a decimal value like
+        # "0.5 N — ..." that a rich explanation's per-option breakdown often
+        # starts a line with — only trust it as a genuine new question when
+        # it's explicitly "Q12." or we're not already inside an explanation
+        # (a real new question never starts mid-explanation without a marker).
+        if m and (m.group(1) or mode != 'explanation'):
             flush()
             current = ParsedQuestion()
             mode = 'question'
@@ -120,7 +125,11 @@ def parse_docx(file_obj, batch_id=None):
             continue  # stray text before the first recognized question marker
 
         m = OPTION_RE.match(raw_text)
-        if m:
+        # Same ambiguity as above: a "Detailed Option Analysis" breakdown
+        # inside the explanation commonly repeats "A) ... / B) ... / C) ..."
+        # to justify each choice — that must stay part of the explanation,
+        # never be read as a second set of real options for the question.
+        if m and mode != 'explanation':
             mode = 'option'
             html_val = _paragraph_html(para, strip_prefix_len=m.end())
             img = _paragraph_image(para, document, batch_id, f'q{len(questions) + 1}_option{len(current["options"]) + 1}')
@@ -128,7 +137,7 @@ def parse_docx(file_obj, batch_id=None):
             continue
 
         m = ANSWER_RE.match(raw_text)
-        if m:
+        if m and mode != 'explanation':
             letter = m.group(1).upper()
             for i, opt in enumerate(current['options']):
                 opt['is_correct'] = chr(ord('A') + i) == letter
@@ -136,7 +145,7 @@ def parse_docx(file_obj, batch_id=None):
             continue
 
         m = EXPLANATION_RE.match(raw_text)
-        if m and (raw_text.lower().startswith('explanation')):
+        if m and mode != 'explanation' and raw_text.lower().startswith('explanation'):
             mode = 'explanation'
             current['explanation_html'] = _paragraph_html(para, strip_prefix_len=m.end())
             img = _paragraph_image(para, document, batch_id, f'q{len(questions) + 1}_explanation')
