@@ -105,6 +105,7 @@ class Coupon(models.Model):
         ('mock_test', 'Mock Test Package'),
         ('grand_test', 'Grand Test'),
         ('video', 'Video Lectures Subscription'),
+        ('pyq', 'Past Year Questions Subscription'),
     ]
     ELIGIBILITY_CHOICES = [
         ('everyone', 'Everyone'),
@@ -116,14 +117,14 @@ class Coupon(models.Model):
 
     code = models.CharField(max_length=50, unique=True)
     name = models.CharField(max_length=150, blank=True)
-    course = models.ForeignKey(
-        # SET_NULL (not CASCADE): the field is nullable specifically to mean
-        # "applies across every course" (see help_text) — deleting the scoped
-        # Course should fall back to that same unscoped state, not destroy
-        # the coupon itself. CASCADE here was a copy-paste bug found during
-        # the permanent-deletion-system audit — past purchases that used
-        # this coupon are already SET_NULL-protected either way.
-        'courses.Course', on_delete=models.SET_NULL, null=True, blank=True, related_name='coupons',
+    courses = models.ManyToManyField(
+        # Empty = "applies across every course" (see help_text) — was a
+        # nullable single ForeignKey until a coupon needed to scope to more
+        # than one course at once (e.g. CEE-MBBS + CEE-BDS but not others).
+        # Removing a Course just drops it from this set rather than
+        # destroying the coupon, same non-destructive intent the old
+        # SET_NULL had.
+        'courses.Course', blank=True, related_name='coupons',
         help_text='Blank = applies across every course.',
     )
     discount_type = models.CharField(max_length=20, choices=DISCOUNT_TYPE_CHOICES, default='percentage')
@@ -172,16 +173,18 @@ class Coupon(models.Model):
         return self.applies_to == 'all' or self.applies_to == product_type
 
     def applies_to_course(self, plan, grand_test):
-        """Blank course = applies everywhere. Otherwise must match the subscription
-        plan's course, or (for Grand Test) be among the test's mapped courses — an
-        unscoped Grand Test (Test.courses blank = visible to everyone) matches any coupon."""
-        if self.course_id is None:
+        """Blank courses = applies everywhere. Otherwise must include the
+        subscription plan's course, or (for Grand Test) overlap with the
+        test's mapped courses — an unscoped Grand Test (Test.courses blank =
+        visible to everyone) matches any coupon."""
+        coupon_course_ids = set(self.courses.values_list('id', flat=True))
+        if not coupon_course_ids:
             return True
         if plan is not None:
-            return plan.course_id == self.course_id
+            return plan.course_id in coupon_course_ids
         if grand_test is not None:
-            course_ids = list(grand_test.courses.values_list('id', flat=True))
-            return not course_ids or self.course_id in course_ids
+            test_course_ids = set(grand_test.courses.values_list('id', flat=True))
+            return not test_course_ids or bool(test_course_ids & coupon_course_ids)
         return True
 
     def is_eligible_for(self, user):

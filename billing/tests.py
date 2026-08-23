@@ -413,3 +413,83 @@ class PastYearQuestionsAccessTests(BillingTestCase):
         pyq_test = Test.objects.create(title='IOM 2075 (free)', exam_type='pyq', is_pro=False, university='IOM')
         resp = self.client.post(f'/api/tests/{pyq_test.id}/start/', {})
         self.assertEqual(resp.status_code, 201)
+
+
+class CouponMultiCourseTests(BillingTestCase):
+    """Coupon.course was a single nullable FK ("blank = every course"); it's
+    now a ManyToMany so one code can scope to several specific courses at
+    once (e.g. CEE-MBBS + CEE-BDS but not others) instead of admins needing
+    a separate code per course."""
+
+    def setUp(self):
+        super().setUp()
+        self.other_course = Course.objects.create(name='CEE-MD Pharmacy', prefix='PHM')
+        self.other_plan = self._make_plan(course=self.other_course, name='3 Month QBank (Pharmacy)')
+        self.unscoped_course = Course.objects.create(name='CEE-BDS', prefix='BDS')
+        self.unscoped_plan = self._make_plan(course=self.unscoped_course, name='3 Month QBank (BDS)')
+
+    def test_coupon_scoped_to_two_courses_applies_to_both(self):
+        coupon = Coupon.objects.create(code='TWOCOURSE', discount_type='percentage', discount_value=10)
+        coupon.courses.add(self.course, self.other_course)
+
+        self.assertTrue(coupon.applies_to_course(self.plan, None))
+        self.assertTrue(coupon.applies_to_course(self.other_plan, None))
+
+    def test_coupon_scoped_to_two_courses_does_not_apply_to_a_third(self):
+        coupon = Coupon.objects.create(code='TWOCOURSE2', discount_type='percentage', discount_value=10)
+        coupon.courses.add(self.course, self.other_course)
+
+        self.assertFalse(coupon.applies_to_course(self.unscoped_plan, None))
+
+    def test_coupon_with_no_courses_applies_everywhere(self):
+        coupon = Coupon.objects.create(code='SITEWIDE', discount_type='percentage', discount_value=10)
+
+        self.assertTrue(coupon.applies_to_course(self.plan, None))
+        self.assertTrue(coupon.applies_to_course(self.other_plan, None))
+        self.assertTrue(coupon.applies_to_course(self.unscoped_plan, None))
+
+    def test_apply_coupon_endpoint_rejects_a_course_not_in_scope(self):
+        coupon = Coupon.objects.create(code='TWOCOURSE3', discount_type='percentage', discount_value=10, applies_to='qbank')
+        coupon.courses.add(self.course, self.other_course)
+
+        resp = self.client.post('/api/coupons/apply/', {
+            'code': 'TWOCOURSE3', 'kind': 'subscription', 'plan_id': self.unscoped_plan.id,
+        })
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(resp.data['valid'])
+
+    def test_apply_coupon_endpoint_accepts_a_course_in_scope(self):
+        coupon = Coupon.objects.create(code='TWOCOURSE4', discount_type='percentage', discount_value=10, applies_to='qbank')
+        coupon.courses.add(self.course, self.other_course)
+
+        resp = self.client.post('/api/coupons/apply/', {
+            'code': 'TWOCOURSE4', 'kind': 'subscription', 'plan_id': self.other_plan.id,
+        })
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.data['valid'])
+
+    def test_deleting_a_course_leaves_coupon_scoped_to_the_rest(self):
+        coupon = Coupon.objects.create(code='TWOCOURSE5', discount_type='percentage', discount_value=10)
+        coupon.courses.add(self.course, self.other_course)
+
+        self.other_course.delete()
+        coupon.refresh_from_db()
+
+        self.assertEqual(list(coupon.courses.values_list('id', flat=True)), [self.course.id])
+        self.assertTrue(coupon.applies_to_course(self.plan, None))
+
+    def test_serializer_exposes_course_names_for_multiple_courses(self):
+        from billing.serializers import CouponSerializer
+
+        coupon = Coupon.objects.create(code='TWOCOURSE6', discount_type='percentage', discount_value=10)
+        coupon.courses.add(self.course, self.other_course)
+
+        data = CouponSerializer(coupon).data
+        self.assertEqual(set(data['course_names']), {self.course.name, self.other_course.name})
+        self.assertEqual(set(data['courses']), {self.course.id, self.other_course.id})
+
+    def test_pyq_is_a_valid_applies_to_choice(self):
+        coupon = Coupon.objects.create(code='PYQCODE', discount_type='percentage', discount_value=10, applies_to='pyq')
+        self.assertEqual(coupon.applies_to, 'pyq')
+        self.assertTrue(coupon.applies_to_product('pyq'))
+        self.assertFalse(coupon.applies_to_product('qbank'))

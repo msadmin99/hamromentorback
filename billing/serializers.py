@@ -66,18 +66,21 @@ class SubscriptionSerializer(serializers.ModelSerializer):
 
 
 class CouponSerializer(serializers.ModelSerializer):
-    course_name = serializers.CharField(source='course.name', read_only=True)
+    course_names = serializers.SerializerMethodField()
 
     class Meta:
         model = Coupon
         fields = [
-            'id', 'code', 'name', 'course', 'course_name', 'discount_type', 'discount_value', 'applies_to',
+            'id', 'code', 'name', 'courses', 'course_names', 'discount_type', 'discount_value', 'applies_to',
             'start_date', 'expiry_date', 'max_uses', 'max_uses_per_user', 'min_purchase_amount',
             'max_discount_amount', 'first_purchase_only', 'eligibility', 'eligible_emails', 'new_student_days',
             'auto_apply', 'is_active', 'usage_count', 'created_at',
         ]
         read_only_fields = ['usage_count', 'created_at']
-        extra_kwargs = {'code': {'validators': []}}
+        extra_kwargs = {'code': {'validators': []}, 'courses': {'required': False}}
+
+    def get_course_names(self, obj):
+        return [c.name for c in obj.courses.all()]
 
     def validate_code(self, value):
         return value.strip().upper()

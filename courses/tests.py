@@ -48,15 +48,19 @@ class CourseDeleteTests(APITestCase):
         entry = DeletionAuditLog.objects.get(resource_type='Course')
         self.assertEqual(entry.result, 'success')
 
-    def test_deleting_course_sets_coupon_course_to_null_instead_of_cascading(self):
+    def test_deleting_course_drops_it_from_coupon_courses_instead_of_cascading(self):
         """Regression test for the Coupon.course CASCADE->SET_NULL fix found
-        during the deletion-system audit: a coupon scoped to a course must
-        survive that course's deletion, falling back to unscoped."""
+        during the deletion-system audit (course was originally a single FK;
+        now a ManyToMany for multi-course coupons, same non-destructive
+        intent): a coupon scoped to a course must survive that course's
+        deletion, falling back to unscoped once the course drops out of its
+        courses set."""
         course = Course.objects.create(name='CEE-MD Ayurveda', prefix='AYU')
-        coupon = Coupon.objects.create(code='AYU10', course=course)
+        coupon = Coupon.objects.create(code='AYU10')
+        coupon.courses.add(course)
 
         course.delete()
 
         coupon.refresh_from_db()
-        self.assertIsNone(coupon.course)
+        self.assertEqual(coupon.courses.count(), 0)
         self.assertTrue(Coupon.objects.filter(id=coupon.id).exists())

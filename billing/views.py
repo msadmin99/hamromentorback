@@ -307,7 +307,8 @@ class MyCouponsView(APIView):
         for coupon in Coupon.objects.filter(is_active=True):
             if not coupon.is_valid_now() or not coupon.is_eligible_for(user):
                 continue
-            if coupon.course_id is not None and coupon.course_id != user.active_course_id:
+            coupon_course_ids = set(coupon.courses.values_list('id', flat=True))
+            if coupon_course_ids and user.active_course_id not in coupon_course_ids:
                 continue
             uses_by_user = Purchase.objects.filter(
                 user=user, coupon=coupon, status__in=Purchase.OPEN_STATUSES,
