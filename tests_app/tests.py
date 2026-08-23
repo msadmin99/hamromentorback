@@ -158,3 +158,39 @@ class SubmitTestFeedsQuestionPerformanceTests(APITestCase):
         self.assertEqual(qa.incorrect_count, 1)
         sources = set(QuestionEvent.objects.filter(user=self.student, question=self.question).values_list('source', flat=True))
         self.assertEqual(sources, {'qbank', 'test'})
+
+
+class KpiOverviewQuestionsTodayTests(APITestCase):
+    """kpi_overview()'s questions_today — powers the Home page Daily Goal
+    widget. Must count distinct questions from QuestionEvent (platform-wide:
+    QBank practice + every test type) regardless of the overview's own
+    date_from/date_to window, and never count yesterday's activity."""
+
+    def setUp(self):
+        self.student = User.objects.create_user(username='student1', email='student1@example.com', password='pw12345')
+        self.subject = Subject.objects.create(name='Physics')
+        self.q1 = Question.objects.create(subject=self.subject, text='Q1')
+        self.q2 = Question.objects.create(subject=self.subject, text='Q2')
+        self.client.force_authenticate(user=self.student)
+
+    def test_counts_distinct_questions_answered_today_only(self):
+        from academics.services import record_question_result
+
+        record_question_result(self.student, self.q1, True, source='qbank')
+        record_question_result(self.student, self.q1, False, source='test')  # same question again today
+        record_question_result(self.student, self.q2, True, source='qbank')
+
+        yesterday = QuestionEvent.objects.create(
+            user=self.student, question=self.q2, is_correct=True, source='qbank',
+        )
+        yesterday.created_at = timezone.now() - timezone.timedelta(days=1)
+        yesterday.save(update_fields=['created_at'])
+
+        resp = self.client.get('/api/performance/overview/')
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data['kpis']['questions_today'], 2)
+
+    def test_zero_when_no_activity_today(self):
+        resp = self.client.get('/api/performance/overview/')
+        self.assertEqual(resp.data['kpis']['questions_today'], 0)

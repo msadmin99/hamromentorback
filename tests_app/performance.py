@@ -1,13 +1,14 @@
 """Pure aggregation functions for the student 'My Performance' dashboard —
 read-only, derived entirely from existing TestAttempt/Answer/QuestionAttempt/
-VideoProgress rows. No new models.
+QuestionEvent/VideoProgress rows. No new models.
 
 Deliberately NOT computed here, because the underlying data doesn't exist on
-this platform: reattempt history and correct-after-revision (QuestionAttempt
-is update_or_create, so a re-answer overwrites the prior one), per-question
-difficulty (only Test.difficulty exists), XP/points/badges, goals, and
-in-app notifications. `question_analytics()` reports this explicitly via its
-`not_tracked` key rather than silently returning zero.
+this platform: XP/points/badges and in-app notifications. `question_analytics()`
+reports its own remaining gaps explicitly via a `not_tracked` key rather than
+silently returning zero. Per-question difficulty, reattempt history, and a
+real daily-questions count (`kpi_overview`'s `questions_today`, added once
+academics.QuestionEvent started logging every answer) now exist — see
+academics.services.record_question_result.
 """
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -15,7 +16,7 @@ from datetime import datetime, timedelta
 from django.db.models import Avg, Count, Q, Sum
 from django.utils import timezone
 
-from academics.models import Chapter, QuestionAttempt, Subject, Topic
+from academics.models import Chapter, QuestionAttempt, QuestionEvent, Subject, Topic
 
 from .models import Answer, Test, TestAttempt
 
@@ -123,6 +124,15 @@ def kpi_overview(user, course=None, date_from=None, date_to=None):
     avg_seconds_per_question = round(attempt_seconds / total_answered, 1) if total_answered else 0.0
     streak = _activity_streak(user, course)
 
+    # Distinct questions answered today (QBank practice + every test type,
+    # since QuestionEvent is written platform-wide) — powers the Home page's
+    # Daily Goal widget. Independent of this function's own date_from/date_to
+    # window, which "today" isn't subject to.
+    today_qs = QuestionEvent.objects.filter(user=user, created_at__date=timezone.localdate())
+    if course:
+        today_qs = today_qs.filter(question__courses__id=course)
+    questions_today = today_qs.values('question').distinct().count()
+
     return {
         'total_attempts': len(attempts),
         'questions_attempted': total_answered,
@@ -135,6 +145,7 @@ def kpi_overview(user, course=None, date_from=None, date_to=None):
         'avg_seconds_per_question': avg_seconds_per_question,
         'current_streak_days': streak['current'],
         'longest_streak_days': streak['longest'],
+        'questions_today': questions_today,
     }
 
 
