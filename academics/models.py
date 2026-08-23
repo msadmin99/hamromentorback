@@ -90,6 +90,14 @@ class Topic(models.Model):
 
 
 class Question(models.Model):
+    DIFFICULTY_CHOICES = [
+        ('easy', 'Easy'), ('medium', 'Medium'), ('hard', 'Hard'), ('very_hard', 'Very Hard'),
+    ]
+    QUESTION_TYPE_CHOICES = [
+        ('conceptual', 'Conceptual'), ('recall', 'Recall'), ('clinical', 'Clinical'),
+        ('numerical', 'Numerical'), ('image_based', 'Image-based'), ('other', 'Other'),
+    ]
+
     subject = models.ForeignKey(Subject, on_delete=models.CASCADE, related_name='questions')
     chapter = models.ForeignKey(Chapter, on_delete=models.SET_NULL, null=True, blank=True, related_name='questions')
     topic = models.ForeignKey(Topic, on_delete=models.SET_NULL, null=True, blank=True, related_name='questions')
@@ -97,6 +105,22 @@ class Question(models.Model):
         'courses.Course', blank=True, related_name='questions',
         help_text='Which course(s) this question belongs to (a question can be shared across courses).',
     )
+
+    instructor_difficulty = models.CharField(
+        max_length=10, choices=DIFFICULTY_CHOICES, blank=True,
+        help_text="Admin/teacher's own judgment call — independent of actual_difficulty below.",
+    )
+    actual_difficulty = models.CharField(
+        max_length=10, choices=DIFFICULTY_CHOICES, blank=True,
+        help_text='Computed from real student performance by the recompute_question_difficulty command. '
+                   'Never set by hand, never overwrites instructor_difficulty.',
+    )
+    actual_difficulty_sample_size = models.PositiveIntegerField(
+        default=0, help_text='How many attempts actual_difficulty was computed from.',
+    )
+    actual_difficulty_updated_at = models.DateTimeField(null=True, blank=True)
+    question_type = models.CharField(max_length=15, choices=QUESTION_TYPE_CHOICES, blank=True)
+    tags = models.JSONField(default=list, blank=True, help_text='Free-text keyword tags for search, e.g. ["vector", "scalar"].')
 
     text = models.TextField()
     image = models.ImageField(upload_to='questions/', null=True, blank=True)
@@ -215,8 +239,22 @@ class Option(models.Model):
 
 
 class QuestionAttempt(models.Model):
-    """A single MCQ solve event, used both for QBank practice and driving
-    subject/chapter progress shown on the Home & QBank screens."""
+    """The student-question performance row — one per (user, question),
+    platform-wide (both QBank practice and every Daily/Mock/Grand/PYQ test
+    answer write here, via academics.services.record_question_result()).
+
+    `is_correct`/`selected_option`/`answered_at` keep their original meaning
+    (the LATEST result) for backward compatibility with existing readers
+    (bookmark toggle, ChapterSerializer.get_solved_count, QuestionSerializer).
+    `attempts_count`/`correct_count`/`incorrect_count` are new running
+    totals — incremented, never overwritten — that make Mastered/Weak/Need
+    Practice a real signal instead of a single last-answer snapshot.
+    """
+    MASTERY_CHOICES = [
+        ('new', 'New'), ('learning', 'Learning'), ('need_practice', 'Need Practice'),
+        ('weak', 'Weak'), ('mastered', 'Mastered'),
+    ]
+
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='question_attempts')
     question = models.ForeignKey(Question, on_delete=models.CASCADE, related_name='attempts')
     selected_option = models.ForeignKey(Option, on_delete=models.SET_NULL, null=True, blank=True)
@@ -224,8 +262,83 @@ class QuestionAttempt(models.Model):
     is_bookmarked = models.BooleanField(default=False)
     answered_at = models.DateTimeField(auto_now_add=True)
 
+    attempts_count = models.PositiveIntegerField(default=0)
+    correct_count = models.PositiveIntegerField(default=0)
+    incorrect_count = models.PositiveIntegerField(default=0)
+    last_result = models.BooleanField(null=True, blank=True, help_text='Mirrors is_correct — kept as an explicit, nullable field for New (never attempted, still attempts_count=0) vs Incorrect.')
+    mastery_status = models.CharField(max_length=15, choices=MASTERY_CHOICES, default='new')
+    revision_due_at = models.DateTimeField(null=True, blank=True)
+
     class Meta:
         ordering = ['-answered_at']
+        # Enforced here (previously only an informal update_or_create
+        # convention with no DB guarantee) because record_question_result()
+        # now does incremental math (attempts_count += 1) instead of blind
+        # overwrites — a duplicate row per (user, question) would silently
+        # split those counts across two rows. The migration merges any
+        # pre-existing duplicates before this constraint is added.
+        unique_together = ('user', 'question')
+        indexes = [
+            models.Index(fields=['user', 'mastery_status']),
+            models.Index(fields=['user', 'revision_due_at']),
+        ]
+
+
+class QuestionEvent(models.Model):
+    """Append-only log of every answered question, from both QBank practice
+    and test-taking — never updated after creation. QuestionAttempt only
+    holds current totals/state; this is what answers "when" and "how often
+    recently", which the Mistake Bank (recent mistakes, frequently repeated
+    mistakes) needs and a single overwritten row can't provide. Written
+    exclusively by academics.services.record_question_result()."""
+    SOURCE_CHOICES = [('qbank', 'QBank Practice'), ('test', 'Test')]
+
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='question_events')
+    question = models.ForeignKey(Question, on_delete=models.CASCADE, related_name='events')
+    is_correct = models.BooleanField()
+    source = models.CharField(max_length=10, choices=SOURCE_CHOICES)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['user', 'question', 'created_at']),
+            models.Index(fields=['user', 'is_correct', 'created_at']),
+        ]
+
+
+class QuestionBankConfig(models.Model):
+    """Singleton (pk always 1) of admin-editable Question Bank tuning
+    knobs — same load()/save() pattern as core.models.SiteSettings."""
+    min_attempts_for_difficulty = models.PositiveIntegerField(
+        default=30, help_text='A question needs at least this many attempts before actual_difficulty is computed. Below this, actual_difficulty stays blank.',
+    )
+    easy_min_pct = models.PositiveIntegerField(default=75, help_text='% correct at or above this = Easy.')
+    medium_min_pct = models.PositiveIntegerField(default=55, help_text='% correct at or above this (and below Easy) = Medium.')
+    hard_min_pct = models.PositiveIntegerField(default=30, help_text='% correct at or above this (and below Medium) = Hard. Below this = Very Hard.')
+    mastered_min_pct = models.PositiveIntegerField(default=80, help_text="Student's own accuracy on a question at/above this (with >=2 attempts) = Mastered.")
+    weak_max_pct = models.PositiveIntegerField(default=40, help_text="Student's own accuracy on a question at/below this = Weak.")
+    revision_interval_correct_days = models.PositiveIntegerField(default=7)
+    revision_interval_incorrect_days = models.PositiveIntegerField(default=1)
+
+    class Meta:
+        verbose_name = 'Question Bank settings'
+        verbose_name_plural = 'Question Bank settings'
+
+    def __str__(self):
+        return 'Question Bank settings'
+
+    def save(self, *args, **kwargs):
+        self.pk = 1
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        pass
+
+    @classmethod
+    def load(cls):
+        obj, _ = cls.objects.get_or_create(pk=1)
+        return obj
 
 
 class ImportBatch(models.Model):

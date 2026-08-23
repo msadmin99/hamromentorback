@@ -452,4 +452,271 @@ class QuestionBookmarkToggleTests(APITestCase):
 
         by_id = {q['id']: q['is_bookmarked'] for q in resp.data}
         self.assertTrue(by_id[self.question.id])
-        self.assertFalse(by_id[other_question.id])
+
+
+class RecordQuestionResultTests(TestCase):
+    """academics.services.record_question_result — the single write path
+    for the Smart Question Bank's performance tracking, used by both QBank
+    practice and test submission."""
+
+    def setUp(self):
+        self.student = User.objects.create_user(username='student1', email='student1@example.com', password='pw12345')
+        self.subject = Subject.objects.create(name='Physics')
+        self.question = Question.objects.create(subject=self.subject, text='2+2=?')
+
+    def test_first_correct_attempt_is_learning_not_mastered(self):
+        from academics.services import record_question_result
+
+        attempt = record_question_result(self.student, self.question, True, source='qbank')
+
+        self.assertEqual(attempt.attempts_count, 1)
+        self.assertEqual(attempt.correct_count, 1)
+        self.assertEqual(attempt.incorrect_count, 0)
+        self.assertTrue(attempt.is_correct)
+        self.assertTrue(attempt.last_result)
+        self.assertEqual(attempt.mastery_status, 'learning')
+        self.assertIsNotNone(attempt.revision_due_at)
+
+    def test_two_correct_attempts_become_mastered(self):
+        from academics.services import record_question_result
+
+        record_question_result(self.student, self.question, True, source='qbank')
+        attempt = record_question_result(self.student, self.question, True, source='qbank')
+
+        self.assertEqual(attempt.attempts_count, 2)
+        self.assertEqual(attempt.mastery_status, 'mastered')
+
+    def test_repeated_incorrect_attempts_become_weak(self):
+        from academics.services import record_question_result
+
+        record_question_result(self.student, self.question, False, source='qbank')
+        record_question_result(self.student, self.question, False, source='qbank')
+        attempt = record_question_result(self.student, self.question, False, source='qbank')
+
+        self.assertEqual(attempt.attempts_count, 3)
+        self.assertEqual(attempt.incorrect_count, 3)
+        self.assertEqual(attempt.mastery_status, 'weak')
+        self.assertFalse(attempt.last_result)
+
+    def test_counts_accumulate_across_calls_instead_of_overwriting(self):
+        from academics.services import record_question_result
+
+        record_question_result(self.student, self.question, True, source='qbank')
+        record_question_result(self.student, self.question, False, source='test')
+        attempt = record_question_result(self.student, self.question, True, source='qbank')
+
+        self.assertEqual(attempt.attempts_count, 3)
+        self.assertEqual(attempt.correct_count, 2)
+        self.assertEqual(attempt.incorrect_count, 1)
+
+    def test_never_touches_bookmark(self):
+        from academics.services import record_question_result
+
+        QuestionAttempt.objects.create(user=self.student, question=self.question, is_bookmarked=True)
+        record_question_result(self.student, self.question, False, source='qbank')
+
+        attempt = QuestionAttempt.objects.get(user=self.student, question=self.question)
+        self.assertTrue(attempt.is_bookmarked)
+
+    def test_logs_an_immutable_question_event_each_call(self):
+        from academics.models import QuestionEvent
+        from academics.services import record_question_result
+
+        record_question_result(self.student, self.question, True, source='qbank')
+        record_question_result(self.student, self.question, False, source='test')
+
+        events = list(QuestionEvent.objects.filter(user=self.student, question=self.question).order_by('id'))
+        self.assertEqual(len(events), 2)
+        self.assertEqual([e.source for e in events], ['qbank', 'test'])
+        self.assertEqual([e.is_correct for e in events], [True, False])
+
+    def test_does_not_create_duplicate_attempt_rows(self):
+        from academics.services import record_question_result
+
+        for _ in range(3):
+            record_question_result(self.student, self.question, True, source='qbank')
+
+        self.assertEqual(QuestionAttempt.objects.filter(user=self.student, question=self.question).count(), 1)
+
+
+class QuestionAnswerRecordsPerformanceTests(APITestCase):
+    """/questions/{id}/answer/ must feed the new performance-tracking
+    counters, not just overwrite the latest-state fields, and must never
+    touch is_bookmarked (see QuestionBookmarkToggleTests for that contract)."""
+
+    def setUp(self):
+        self.student = User.objects.create_user(username='student1', email='student1@example.com', password='pw12345')
+        self.subject = Subject.objects.create(name='Physics')
+        self.question = Question.objects.create(subject=self.subject, text='2+2=?')
+        self.correct_option = Option.objects.create(question=self.question, text='4', is_correct=True)
+        self.wrong_option = Option.objects.create(question=self.question, text='5', is_correct=False)
+        self.client.force_authenticate(user=self.student)
+
+    def test_answering_twice_accumulates_attempts_count(self):
+        self.client.post(f'/api/questions/{self.question.id}/answer/', {'option_id': self.wrong_option.id})
+        self.client.post(f'/api/questions/{self.question.id}/answer/', {'option_id': self.correct_option.id})
+
+        attempt = QuestionAttempt.objects.get(user=self.student, question=self.question)
+        self.assertEqual(attempt.attempts_count, 2)
+        self.assertEqual(attempt.correct_count, 1)
+        self.assertEqual(attempt.incorrect_count, 1)
+
+    def test_answering_with_no_option_does_not_record_an_attempt(self):
+        self.client.post(f'/api/questions/{self.question.id}/answer/', {})
+        self.assertFalse(QuestionAttempt.objects.filter(user=self.student, question=self.question).exists())
+
+    def test_answering_does_not_reset_an_existing_bookmark(self):
+        self.client.post(f'/api/questions/{self.question.id}/bookmark/', {'bookmark': True})
+        self.client.post(f'/api/questions/{self.question.id}/answer/', {'option_id': self.correct_option.id})
+
+        attempt = QuestionAttempt.objects.get(user=self.student, question=self.question)
+        self.assertTrue(attempt.is_bookmarked)
+
+
+class QuestionDashboardEndpointTests(APITestCase):
+    def setUp(self):
+        self.student = User.objects.create_user(username='student1', email='student1@example.com', password='pw12345')
+        self.subject = Subject.objects.create(name='Physics')
+        self.q1 = Question.objects.create(subject=self.subject, text='Q1')
+        self.q2 = Question.objects.create(subject=self.subject, text='Q2')
+        self.q3 = Question.objects.create(subject=self.subject, text='Q3')  # never attempted
+        self.client.force_authenticate(user=self.student)
+
+    def test_dashboard_counts_reflect_real_attempts(self):
+        from academics.services import record_question_result
+
+        record_question_result(self.student, self.q1, True, source='qbank')
+        record_question_result(self.student, self.q1, True, source='qbank')  # -> mastered
+        record_question_result(self.student, self.q2, False, source='qbank')
+
+        resp = self.client.get('/api/questions/dashboard/')
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data['total_questions'], 3)
+        self.assertEqual(resp.data['attempted'], 2)
+        self.assertEqual(resp.data['new'], 1)
+        self.assertEqual(resp.data['correct'], 1)
+        self.assertEqual(resp.data['incorrect'], 1)
+        self.assertEqual(resp.data['mastered'], 1)
+        self.assertEqual(resp.data['weak'], 1)
+
+    def test_dashboard_requires_auth(self):
+        self.client.force_authenticate(user=None)
+        resp = self.client.get('/api/questions/dashboard/')
+        self.assertEqual(resp.status_code, 401)
+
+
+class QuestionMistakesEndpointTests(APITestCase):
+    def setUp(self):
+        self.student = User.objects.create_user(username='student1', email='student1@example.com', password='pw12345')
+        self.physics = Subject.objects.create(name='Physics')
+        self.chemistry = Subject.objects.create(name='Chemistry')
+        self.wrong_physics = Question.objects.create(subject=self.physics, text='Wrong physics Q')
+        self.wrong_chemistry = Question.objects.create(subject=self.chemistry, text='Wrong chem Q')
+        self.right_physics = Question.objects.create(subject=self.physics, text='Right physics Q')
+        self.client.force_authenticate(user=self.student)
+
+    def test_mistakes_grouped_by_subject_and_excludes_correct_questions(self):
+        from academics.services import record_question_result
+
+        record_question_result(self.student, self.wrong_physics, False, source='qbank')
+        record_question_result(self.student, self.wrong_chemistry, False, source='test')
+        record_question_result(self.student, self.right_physics, True, source='qbank')
+
+        resp = self.client.get('/api/questions/mistakes/')
+
+        self.assertEqual(resp.status_code, 200)
+        counts = {row['subject_name']: row['count'] for row in resp.data['by_subject']}
+        self.assertEqual(counts, {'Physics': 1, 'Chemistry': 1})
+        result_ids = {q['id'] for q in resp.data['results']}
+        self.assertEqual(result_ids, {self.wrong_physics.id, self.wrong_chemistry.id})
+
+    def test_a_question_later_answered_correctly_leaves_the_mistake_list(self):
+        from academics.services import record_question_result
+
+        record_question_result(self.student, self.wrong_physics, False, source='qbank')
+        record_question_result(self.student, self.wrong_physics, True, source='qbank')
+
+        resp = self.client.get('/api/questions/mistakes/')
+        result_ids = {q['id'] for q in resp.data['results']}
+        self.assertNotIn(self.wrong_physics.id, result_ids)
+
+
+class QuestionPracticeSessionEndpointTests(APITestCase):
+    def setUp(self):
+        self.student = User.objects.create_user(username='student1', email='student1@example.com', password='pw12345')
+        self.subject = Subject.objects.create(name='Physics')
+        self.new_q = Question.objects.create(subject=self.subject, text='Never attempted')
+        self.weak_q = Question.objects.create(subject=self.subject, text='Weak question')
+        self.mastered_q = Question.objects.create(subject=self.subject, text='Mastered question')
+        self.client.force_authenticate(user=self.student)
+
+    def test_status_new_returns_only_unattempted_questions(self):
+        from academics.services import record_question_result
+
+        record_question_result(self.student, self.weak_q, False, source='qbank')
+        record_question_result(self.student, self.mastered_q, True, source='qbank')
+        record_question_result(self.student, self.mastered_q, True, source='qbank')
+
+        resp = self.client.post('/api/questions/practice-session/', {'status': ['new']}, format='json')
+
+        ids = {q['id'] for q in resp.data}
+        self.assertEqual(ids, {self.new_q.id})
+
+    def test_status_weak_returns_only_weak_questions(self):
+        from academics.services import record_question_result
+
+        record_question_result(self.student, self.weak_q, False, source='qbank')
+        record_question_result(self.student, self.weak_q, False, source='qbank')
+
+        resp = self.client.post('/api/questions/practice-session/', {'status': ['weak']}, format='json')
+
+        ids = {q['id'] for q in resp.data}
+        self.assertEqual(ids, {self.weak_q.id})
+
+    def test_count_is_capped_at_100(self):
+        # Individual .create() calls, not bulk_create — Question.save() is
+        # what generates the unique slug/public_id, and bulk_create skips save().
+        for i in range(120):
+            Question.objects.create(subject=self.subject, text=f'Bulk {i}')
+
+        resp = self.client.post('/api/questions/practice-session/', {'count': 500}, format='json')
+
+        self.assertLessEqual(len(resp.data), 100)
+
+
+class RecomputeQuestionDifficultyCommandTests(TestCase):
+    def setUp(self):
+        self.subject = Subject.objects.create(name='Physics')
+        self.question = Question.objects.create(subject=self.subject, text='Q1', instructor_difficulty='hard')
+
+    def test_below_min_attempts_leaves_actual_difficulty_blank(self):
+        from django.core.management import call_command
+
+        from academics.models import QuestionBankConfig
+
+        QuestionBankConfig.objects.create(pk=1, min_attempts_for_difficulty=30)
+        student = User.objects.create_user(username='s1', email='s1@example.com', password='pw12345')
+        QuestionAttempt.objects.create(user=student, question=self.question, attempts_count=5, correct_count=5)
+
+        call_command('recompute_question_difficulty')
+
+        self.question.refresh_from_db()
+        self.assertEqual(self.question.actual_difficulty, '')
+
+    def test_meets_min_attempts_computes_difficulty_without_touching_instructor_difficulty(self):
+        from django.core.management import call_command
+
+        from academics.models import QuestionBankConfig
+
+        QuestionBankConfig.objects.create(pk=1, min_attempts_for_difficulty=10, easy_min_pct=75, medium_min_pct=55, hard_min_pct=30)
+        student = User.objects.create_user(username='s1', email='s1@example.com', password='pw12345')
+        # 2/10 correct = 20% -> below hard_min_pct (30) -> very_hard
+        QuestionAttempt.objects.create(user=student, question=self.question, attempts_count=10, correct_count=2)
+
+        call_command('recompute_question_difficulty')
+
+        self.question.refresh_from_db()
+        self.assertEqual(self.question.actual_difficulty, 'very_hard')
+        self.assertEqual(self.question.actual_difficulty_sample_size, 10)
+        self.assertEqual(self.question.instructor_difficulty, 'hard')

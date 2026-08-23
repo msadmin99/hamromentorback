@@ -3,8 +3,9 @@ from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
 
+from academics.models import Option, Question, QuestionAttempt, QuestionEvent, Subject
 from core.models import DeletionAuditLog
-from tests_app.models import ExamSession, ExamTemplate, Test, TestAttempt
+from tests_app.models import ExamSession, ExamTemplate, Test, TestAttempt, TestQuestion
 
 User = get_user_model()
 
@@ -95,3 +96,65 @@ class ExamSessionDeleteTests(APITestCase):
         self.assertFalse(ExamSession.objects.filter(id=self.session.id).exists())
         entry = DeletionAuditLog.objects.get(resource_type='ExamSession')
         self.assertEqual(entry.result, 'success')
+
+
+class SubmitTestFeedsQuestionPerformanceTests(APITestCase):
+    """Test submission must feed academics.QuestionAttempt/QuestionEvent
+    platform-wide (the Smart Question Bank's core architecture decision:
+    Weak/Mastered/Mistake Bank reflect Daily/Mock/Grand/PYQ activity too,
+    not just QBank practice) — additively, without changing scoring."""
+
+    def setUp(self):
+        self.student = User.objects.create_user(username='student1', email='student1@example.com', password='pw12345')
+        self.subject = Subject.objects.create(name='Physics')
+        self.question = Question.objects.create(subject=self.subject, text='2+2=?', marks=1, negative_marks=0)
+        self.correct = Option.objects.create(question=self.question, text='4', is_correct=True)
+        self.wrong = Option.objects.create(question=self.question, text='5', is_correct=False)
+        self.test = Test.objects.create(title='Mock Test 1', exam_type='mock', negative_marking=False)
+        TestQuestion.objects.create(test=self.test, question=self.question)
+        self.attempt = TestAttempt.objects.create(user=self.student, test=self.test, status='in_progress')
+        self.client.force_authenticate(user=self.student)
+
+    def test_submitting_a_test_records_question_performance(self):
+        self.client.post(f'/api/attempts/{self.attempt.id}/answer/', {'question_id': self.question.id, 'option_id': self.correct.id})
+        resp = self.client.post(f'/api/attempts/{self.attempt.id}/submit/')
+
+        self.assertEqual(resp.status_code, 200)
+        qa = QuestionAttempt.objects.get(user=self.student, question=self.question)
+        self.assertEqual(qa.attempts_count, 1)
+        self.assertEqual(qa.correct_count, 1)
+        event = QuestionEvent.objects.get(user=self.student, question=self.question)
+        self.assertEqual(event.source, 'test')
+        self.assertTrue(event.is_correct)
+
+    def test_changing_the_answer_before_submitting_does_not_overcount(self):
+        """SubmitAnswerView is update_or_create and can be hit repeatedly
+        while the student is still deciding — only the final submit should
+        count as one real attempt."""
+        self.client.post(f'/api/attempts/{self.attempt.id}/answer/', {'question_id': self.question.id, 'option_id': self.wrong.id})
+        self.client.post(f'/api/attempts/{self.attempt.id}/answer/', {'question_id': self.question.id, 'option_id': self.correct.id})
+        self.client.post(f'/api/attempts/{self.attempt.id}/answer/', {'question_id': self.question.id, 'option_id': self.wrong.id})
+        self.client.post(f'/api/attempts/{self.attempt.id}/submit/')
+
+        qa = QuestionAttempt.objects.get(user=self.student, question=self.question)
+        self.assertEqual(qa.attempts_count, 1)
+        self.assertEqual(qa.incorrect_count, 1)
+        self.assertEqual(QuestionEvent.objects.filter(user=self.student, question=self.question).count(), 1)
+
+    def test_unanswered_questions_are_not_recorded(self):
+        self.client.post(f'/api/attempts/{self.attempt.id}/submit/')
+        self.assertFalse(QuestionAttempt.objects.filter(user=self.student, question=self.question).exists())
+
+    def test_qbank_practice_and_test_attempts_accumulate_on_the_same_row(self):
+        from academics.services import record_question_result
+
+        record_question_result(self.student, self.question, True, source='qbank')
+        self.client.post(f'/api/attempts/{self.attempt.id}/answer/', {'question_id': self.question.id, 'option_id': self.wrong.id})
+        self.client.post(f'/api/attempts/{self.attempt.id}/submit/')
+
+        qa = QuestionAttempt.objects.get(user=self.student, question=self.question)
+        self.assertEqual(qa.attempts_count, 2)
+        self.assertEqual(qa.correct_count, 1)
+        self.assertEqual(qa.incorrect_count, 1)
+        sources = set(QuestionEvent.objects.filter(user=self.student, question=self.question).values_list('source', flat=True))
+        self.assertEqual(sources, {'qbank', 'test'})

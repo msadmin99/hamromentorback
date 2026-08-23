@@ -1,7 +1,9 @@
-from django.db.models import Exists, OuterRef
+from django.db.models import Count, Exists, OuterRef
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import AllowAny, IsAdminUser, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -9,7 +11,7 @@ from rest_framework.views import APIView
 from hamromentor.permissions import IsStaffOrReadOnly, IsStaffOrReadOnlyExcludingTeacherWrites
 
 from .excel import import_workbook, template_response
-from .models import Chapter, Option, Question, QuestionAttempt, Subject, Topic
+from .models import Chapter, Option, Question, QuestionAttempt, QuestionEvent, Subject, Topic
 from .serializers import (
     AnswerSubmitSerializer,
     ChapterSerializer,
@@ -19,6 +21,7 @@ from .serializers import (
     SubjectListSerializer,
     TopicSerializer,
 )
+from .services import record_question_result
 
 
 class SubjectViewSet(viewsets.ModelViewSet):
@@ -65,6 +68,48 @@ class TopicViewSet(viewsets.ModelViewSet):
         return qs
 
 
+def _locked_subject_ids(user):
+    """Subjects this user can't currently access (Pro subject, no active
+    subscription) — staff always see everything. Shared by every Question
+    Bank view that needs to scope a queryset to what a student may browse."""
+    if user.is_authenticated and user.is_staff:
+        return []
+    from billing.access import has_qbank_access
+    return [s.id for s in Subject.objects.all() if not has_qbank_access(user, s)]
+
+
+def _status_question_ids(user, statuses, base_qs):
+    """Resolves the spec's independent status flags (New/Mastered/Weak/
+    Need Practice/Incorrect/Bookmarked/Need Revision) to a set of matching
+    question ids, OR'd together — 'New + Incorrect' means either, not both.
+    base_qs is the already subject/chapter/topic/difficulty-filtered
+    Question queryset, so 'new' only considers questions actually in scope."""
+    from django.utils import timezone as tz
+
+    attempt_qs = QuestionAttempt.objects.filter(user=user)
+    ids = set()
+    if 'new' in statuses:
+        attempted_ids = set(attempt_qs.values_list('question_id', flat=True))
+        ids |= set(base_qs.exclude(id__in=attempted_ids).values_list('id', flat=True))
+    mastery_map = {'mastered': 'mastered', 'weak': 'weak', 'need_practice': 'need_practice', 'learning': 'learning'}
+    wanted_mastery = [mastery_map[s] for s in statuses if s in mastery_map]
+    if wanted_mastery:
+        ids |= set(attempt_qs.filter(mastery_status__in=wanted_mastery).values_list('question_id', flat=True))
+    if 'incorrect' in statuses:
+        ids |= set(attempt_qs.filter(last_result=False).values_list('question_id', flat=True))
+    if 'bookmarked' in statuses:
+        ids |= set(attempt_qs.filter(is_bookmarked=True).values_list('question_id', flat=True))
+    if 'need_revision' in statuses:
+        ids |= set(attempt_qs.filter(revision_due_at__lte=tz.now()).values_list('question_id', flat=True))
+    return ids
+
+
+class _BrowsePagination(PageNumberPagination):
+    page_size = 20
+    max_page_size = 50
+    page_size_query_param = 'page_size'
+
+
 class QuestionViewSet(viewsets.ModelViewSet):
     queryset = Question.objects.all().select_related('subject', 'chapter').prefetch_related('options')
     permission_classes = [IsStaffOrReadOnly]
@@ -84,6 +129,9 @@ class QuestionViewSet(viewsets.ModelViewSet):
         teacher = self.request.query_params.get('teacher')
         search = self.request.query_params.get('search')
         bookmarked = self.request.query_params.get('bookmarked')
+        difficulty = self.request.query_params.get('difficulty')
+        question_type = self.request.query_params.get('question_type')
+        status_param = self.request.query_params.get('status')
         if subject:
             qs = qs.filter(subject__slug=subject)
         if chapter:
@@ -101,32 +149,46 @@ class QuestionViewSet(viewsets.ModelViewSet):
             qs = qs.filter(
                 Q(public_id__icontains=search) | Q(text__icontains=search)
                 | Q(subject__name__icontains=search) | Q(chapter__name__icontains=search)
-                | Q(topic__name__icontains=search)
+                | Q(topic__name__icontains=search) | Q(tags__icontains=search)
             )
         if bookmarked in ('true', '1'):
             if self.request.user.is_authenticated:
                 qs = qs.filter(attempts__user=self.request.user, attempts__is_bookmarked=True)
             else:
                 qs = qs.none()
+        if difficulty:
+            from django.db.models import Q
+            qs = qs.filter(Q(instructor_difficulty=difficulty) | Q(actual_difficulty=difficulty))
+        if question_type:
+            qs = qs.filter(question_type=question_type)
 
         user = self.request.user
         if not (user.is_authenticated and user.is_staff):
-            from billing.access import has_qbank_access
-            locked_subject_ids = [s.id for s in Subject.objects.all() if not has_qbank_access(user, s)]
+            locked_subject_ids = _locked_subject_ids(user)
             if locked_subject_ids:
                 qs = qs.exclude(subject_id__in=locked_subject_ids)
         elif getattr(user, 'admin_role', None) == 'teacher' and not user.can_manage_all_content:
             qs = qs.filter(created_by=user)
 
+        if status_param and user.is_authenticated:
+            statuses = [s.strip() for s in status_param.split(',') if s.strip()]
+            if statuses:
+                qs = qs.filter(id__in=_status_question_ids(user, statuses, qs))
+
         if user.is_authenticated:
-            # One EXISTS subquery joined into the main SELECT, not a query
-            # per row — QuestionSerializer.get_is_bookmarked just reads this
-            # annotation, so fetching a whole chapter's worth of questions
-            # for a solve session stays a single query.
+            # Subqueries joined into the main SELECT, not a query per row —
+            # QuestionSerializer's get_is_bookmarked/get_mastery_status/
+            # get_last_result just read these annotations, so fetching a
+            # whole chapter's (or a search page's) worth of questions stays
+            # a handful of queries total, not one per question.
+            from django.db.models import Subquery
+
+            attempt_for_user = QuestionAttempt.objects.filter(user=user, question=OuterRef('pk'))
             qs = qs.annotate(
-                is_bookmarked_by_user=Exists(
-                    QuestionAttempt.objects.filter(user=user, question=OuterRef('pk'), is_bookmarked=True)
-                )
+                is_bookmarked_by_user=Exists(attempt_for_user.filter(is_bookmarked=True)),
+                mastery_status_for_user=Subquery(attempt_for_user.values('mastery_status')[:1]),
+                last_result_for_user=Subquery(attempt_for_user.values('last_result')[:1]),
+                revision_due_at_for_user=Subquery(attempt_for_user.values('revision_due_at')[:1]),
             )
         return qs.distinct()
 
@@ -259,22 +321,18 @@ class QuestionViewSet(viewsets.ModelViewSet):
         serializer = AnswerSubmitSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         option_id = serializer.validated_data.get('option_id')
-        bookmark = serializer.validated_data.get('bookmark', False)
 
         selected_option = None
         is_correct = False
         if option_id:
             selected_option = get_object_or_404(Option, pk=option_id, question=question)
             is_correct = selected_option.is_correct
-
-        attempt, _ = QuestionAttempt.objects.update_or_create(
-            user=request.user, question=question,
-            defaults={
-                'selected_option': selected_option,
-                'is_correct': is_correct,
-                'is_bookmarked': bookmark,
-            },
-        )
+            # bookmark is intentionally untouched here — it has its own dedicated
+            # action below; folding it into this call previously reset a prior
+            # bookmark to False on every plain answer (bool("False") is True, and
+            # the serializer's bookmark default is always present in
+            # validated_data even when the client never sent the key).
+            record_question_result(request.user, question, is_correct, source='qbank', selected_option=selected_option)
 
         correct_option = question.options.filter(is_correct=True).first()
         return Response({
@@ -306,6 +364,240 @@ class QuestionViewSet(viewsets.ModelViewSet):
             defaults={'is_bookmarked': is_bookmarked},
         )
         return Response({'is_bookmarked': is_bookmarked})
+
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def browse(self, request):
+        """Paginated variant of the list endpoint for the Question Bank
+        search/browse UI — deliberately a separate opt-in action rather than
+        turning on pagination globally, since every existing caller of
+        GET /questions/ (QuestionSolver, the bookmarks page, the Admin
+        QuestionPicker) expects a plain array back."""
+        qs = self.filter_queryset(self.get_queryset())
+        paginator = _BrowsePagination()
+        page = paginator.paginate_queryset(qs, request, view=self)
+        serializer = self.get_serializer(page, many=True)
+        return paginator.get_paginated_response(serializer.data)
+
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def dashboard(self, request):
+        """Question Bank dashboard stat cards — total/attempted/correct/
+        incorrect/accuracy/bookmarked/mastered/need-revision, scoped to an
+        optional subject/course. Two aggregate queries, not one per question."""
+        user = request.user
+        subject = request.query_params.get('subject')
+        course = request.query_params.get('course')
+
+        question_qs = Question.objects.all()
+        locked = _locked_subject_ids(user)
+        if locked:
+            question_qs = question_qs.exclude(subject_id__in=locked)
+        if subject:
+            question_qs = question_qs.filter(subject__slug=subject)
+        if course:
+            question_qs = question_qs.filter(courses__id=course)
+        total_questions = question_qs.distinct().count()
+
+        attempt_qs = QuestionAttempt.objects.filter(user=user, attempts_count__gt=0)
+        if subject:
+            attempt_qs = attempt_qs.filter(question__subject__slug=subject)
+        if course:
+            attempt_qs = attempt_qs.filter(question__courses__id=course)
+
+        attempted = attempt_qs.count()
+        correct = attempt_qs.filter(last_result=True).count()
+        incorrect = attempt_qs.filter(last_result=False).count()
+        accuracy = round(correct / attempted * 100, 2) if attempted else 0.0
+
+        return Response({
+            'total_questions': total_questions,
+            'attempted': attempted,
+            'new': max(total_questions - attempted, 0),
+            'correct': correct,
+            'incorrect': incorrect,
+            'accuracy': accuracy,
+            'bookmarked': attempt_qs.filter(is_bookmarked=True).count(),
+            'mastered': attempt_qs.filter(mastery_status='mastered').count(),
+            'weak': attempt_qs.filter(mastery_status='weak').count(),
+            'need_practice': attempt_qs.filter(mastery_status__in=['need_practice', 'learning']).count(),
+            'need_revision': attempt_qs.filter(revision_due_at__lte=timezone.now()).count(),
+        })
+
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def mistakes(self, request):
+        """Mistake Bank: subject-wise counts of currently-wrong questions,
+        plus a filtered/ordered list. scope=frequent orders by how many
+        times this question has been gotten wrong; scope=recent uses the
+        QuestionEvent log (QuestionAttempt.answered_at is set only once, on
+        first attempt, so it can't answer "most recently wrong")."""
+        user = request.user
+        locked = _locked_subject_ids(user)
+
+        base = QuestionAttempt.objects.filter(user=user, last_result=False)
+        if locked:
+            base = base.exclude(question__subject_id__in=locked)
+
+        by_subject = list(
+            base.values('question__subject_id', 'question__subject__name')
+            .annotate(count=Count('id')).order_by('-count')
+        )
+
+        qs = base.select_related('question', 'question__subject', 'question__chapter')
+        subject = request.query_params.get('subject')
+        chapter = request.query_params.get('chapter')
+        if subject:
+            qs = qs.filter(question__subject__slug=subject)
+        if chapter:
+            qs = qs.filter(question__chapter_id=chapter)
+
+        scope = request.query_params.get('scope', 'all')
+        if scope == 'frequent':
+            attempts = list(qs.order_by('-incorrect_count')[:100])
+        elif scope == 'recent':
+            recent_qids = list(
+                QuestionEvent.objects.filter(user=user, is_correct=False)
+                .order_by('-created_at').values_list('question_id', flat=True)[:300]
+            )
+            seen = set()
+            ordered_ids = [qid for qid in recent_qids if not (qid in seen or seen.add(qid))]
+            by_qid = {a.question_id: a for a in qs.filter(question_id__in=ordered_ids)}
+            attempts = [by_qid[qid] for qid in ordered_ids if qid in by_qid][:100]
+        else:
+            attempts = list(qs.order_by('-incorrect_count')[:100])
+
+        questions = [a.question for a in attempts]
+        for q in questions:
+            q.is_bookmarked_by_user = next((a.is_bookmarked for a in attempts if a.question_id == q.id), False)
+
+        return Response({
+            'by_subject': [
+                {'subject_id': row['question__subject_id'], 'subject_name': row['question__subject__name'], 'count': row['count']}
+                for row in by_subject
+            ],
+            'results': QuestionSerializer(questions, many=True, context={'request': request}).data,
+        })
+
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def recommended(self, request):
+        """QBank-specific sibling of tests_app.performance.recommendations()
+        — same rule-based philosophy and underlying aggregation (weakest
+        subjects, weak topics), but pointed at a QBank practice session
+        instead of a Test/Video, since that's what this dashboard should
+        drive the student into. Falls back to a plain "start practicing"
+        nudge when there isn't enough data yet — never fabricated examples."""
+        from tests_app.performance import subject_breakdown, topic_mastery
+
+        user = request.user
+        course = request.query_params.get('course')
+        course_id = int(course) if course else None
+
+        subjects = subject_breakdown(user, course_id)
+        attempted = [s for s in subjects if s['attempted'] >= 3]
+        weakest = sorted(attempted, key=lambda s: s['accuracy'])[:2]
+
+        suggestions = []
+        for s in weakest:
+            topics = topic_mastery(user, s['subject_id'])
+            weak_topics = sorted([t for t in topics if t['mastery'] == 'weak'], key=lambda t: t['accuracy'])
+            if weak_topics:
+                t = weak_topics[0]
+                weak_count = QuestionAttempt.objects.filter(
+                    user=user, mastery_status='weak', question__topic_id=t['topic_id'],
+                ).count()
+                suggestions.append({
+                    'type': 'revise_topic', 'subject_id': s['subject_id'], 'subject_name': s['subject_name'],
+                    'topic_id': t['topic_id'], 'topic_name': t['topic_name'], 'count': weak_count,
+                    'message': f"Revise {t['topic_name']} — {weak_count} weak question{'s' if weak_count != 1 else ''}",
+                    'practice_params': {'subject': s['subject_id'], 'topic': t['topic_id'], 'status': 'weak'},
+                })
+            else:
+                suggestions.append({
+                    'type': 'improve_subject', 'subject_id': s['subject_id'], 'subject_name': s['subject_name'],
+                    'accuracy': s['accuracy'],
+                    'message': f"Practice {s['subject_name']} — accuracy {s['accuracy']}%",
+                    'practice_params': {'subject': s['subject_id']},
+                })
+
+        mistake_count = QuestionAttempt.objects.filter(user=user, last_result=False).count()
+        if mistake_count:
+            suggestions.append({
+                'type': 'retry_mistakes', 'count': mistake_count,
+                'message': f"Retry your recent mistakes — {mistake_count} question{'s' if mistake_count != 1 else ''}",
+                'practice_params': {'status': 'incorrect'},
+            })
+
+        new_subject_qs = Subject.objects.all()
+        locked = _locked_subject_ids(user)
+        if locked:
+            new_subject_qs = new_subject_qs.exclude(id__in=locked)
+        attempted_subject_ids = set(QuestionAttempt.objects.filter(user=user).values_list('question__subject_id', flat=True))
+        never_touched = new_subject_qs.exclude(id__in=attempted_subject_ids).first()
+        if never_touched:
+            new_count = never_touched.questions.count()
+            if new_count:
+                suggestions.append({
+                    'type': 'new_subject', 'subject_id': never_touched.id, 'subject_name': never_touched.name, 'count': new_count,
+                    'message': f"New {never_touched.name} Questions — {new_count} question{'s' if new_count != 1 else ''}",
+                    'practice_params': {'subject': never_touched.id, 'status': 'new'},
+                })
+
+        if not suggestions:
+            suggestions.append({
+                'type': 'start_new', 'message': 'Start with New Questions',
+                'practice_params': {'status': 'new'},
+            })
+
+        return Response({'suggestions': suggestions[:4], 'note': 'Rule-based suggestions from your own performance data.'})
+
+    @action(detail=False, methods=['post'], url_path='practice-session', permission_classes=[IsAuthenticated])
+    def practice_session(self, request):
+        """Practice Session Builder's backend — given exam/subject/chapter/
+        topic(s)/difficulty/status/count, returns a bounded question list for
+        the existing QuestionSolver to consume. No second quiz engine."""
+        from django.db.models import Q as Q_
+
+        user = request.user
+        data = request.data
+
+        qs = Question.objects.all().select_related('subject', 'chapter').prefetch_related('options')
+        locked = _locked_subject_ids(user)
+        if locked:
+            qs = qs.exclude(subject_id__in=locked)
+        if data.get('course'):
+            qs = qs.filter(courses__id=data['course'])
+        if data.get('subject'):
+            subject_val = data['subject']
+            qs = qs.filter(subject_id=subject_val) if str(subject_val).isdigit() else qs.filter(subject__slug=subject_val)
+        if data.get('chapter'):
+            qs = qs.filter(chapter_id=data['chapter'])
+        topics = data.get('topics') or ([data['topic']] if data.get('topic') else [])
+        if topics:
+            qs = qs.filter(topic_id__in=topics)
+        difficulty = data.get('difficulty')
+        if difficulty and difficulty != 'any':
+            qs = qs.filter(Q_(instructor_difficulty=difficulty) | Q_(actual_difficulty=difficulty))
+
+        statuses = data.get('status') or []
+        if isinstance(statuses, str):
+            statuses = [statuses]
+        statuses = [s for s in statuses if s and s != 'any']
+        if statuses:
+            qs = qs.filter(id__in=_status_question_ids(user, statuses, qs))
+
+        try:
+            count = min(int(data.get('count') or 20), 100)
+        except (TypeError, ValueError):
+            count = 20
+
+        qs = qs.distinct().order_by('?')[:count]
+        questions = list(qs)
+        bookmarked_ids = set(
+            QuestionAttempt.objects.filter(user=user, question__in=questions, is_bookmarked=True)
+            .values_list('question_id', flat=True)
+        )
+        for q in questions:
+            q.is_bookmarked_by_user = q.id in bookmarked_ids
+
+        return Response(QuestionSerializer(questions, many=True, context={'request': request}).data)
 
 
 class QuestionExcelTemplateView(APIView):

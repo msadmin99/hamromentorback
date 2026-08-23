@@ -133,12 +133,17 @@ class QuestionSerializer(serializers.ModelSerializer):
     chapter_name = serializers.CharField(source='chapter.name', read_only=True)
     image_data = serializers.SerializerMethodField()
     is_bookmarked = serializers.SerializerMethodField()
+    mastery_status = serializers.SerializerMethodField()
+    is_incorrect = serializers.SerializerMethodField()
+    is_revision_due = serializers.SerializerMethodField()
 
     class Meta:
         model = Question
         fields = [
             'id', 'public_id', 'text', 'image', 'image_data', 'latex', 'marks', 'negative_marks',
             'year', 'subject', 'subject_name', 'chapter', 'chapter_name', 'topic', 'options', 'is_bookmarked',
+            'instructor_difficulty', 'actual_difficulty', 'question_type', 'tags',
+            'mastery_status', 'is_incorrect', 'is_revision_due',
         ]
 
     def get_image_data(self, obj):
@@ -150,6 +155,24 @@ class QuestionSerializer(serializers.ModelSerializer):
         # query here — this field can appear on a whole chapter's worth of
         # questions in one response.
         return bool(getattr(obj, 'is_bookmarked_by_user', False))
+
+    def get_mastery_status(self, obj):
+        # Independently set by callers that build their own queryset (e.g.
+        # QuestionViewSet.mistakes/practice_session) as a plain attribute —
+        # falls back to the get_queryset() subquery annotation, and to 'new'
+        # (never attempted) when neither is present.
+        explicit = getattr(obj, 'mastery_status_for_user', None)
+        return explicit or 'new'
+
+    def get_is_incorrect(self, obj):
+        return getattr(obj, 'last_result_for_user', None) is False
+
+    def get_is_revision_due(self, obj):
+        due = getattr(obj, 'revision_due_at_for_user', None)
+        if not due:
+            return False
+        from django.utils import timezone
+        return due <= timezone.now()
 
 
 class QuestionAdminSerializer(serializers.ModelSerializer):
@@ -166,8 +189,10 @@ class QuestionAdminSerializer(serializers.ModelSerializer):
             'explanation_latex', 'explanation_video_url', 'references',
             'marks', 'negative_marks', 'remarks', 'year', 'past_exam_years',
             'subject', 'chapter', 'topic', 'courses', 'options', 'created_by_name',
+            'instructor_difficulty', 'actual_difficulty', 'actual_difficulty_sample_size',
+            'question_type', 'tags',
         ]
-        read_only_fields = ['public_id']
+        read_only_fields = ['public_id', 'actual_difficulty', 'actual_difficulty_sample_size']
 
     def get_created_by_name(self, obj):
         if not obj.created_by_id:

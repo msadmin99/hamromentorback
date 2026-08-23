@@ -12,6 +12,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from academics.models import Option
+from academics.services import record_question_result
 from billing.access import (
     consume_quota,
     get_grand_test_access,
@@ -426,6 +427,12 @@ class SubmitTestView(APIView):
                     correct += 1
                 elif attempt.test.negative_marking:
                     score -= float(q.negative_marks)
+                # Once per submitted attempt, not per answer-change (SubmitAnswerView
+                # is update_or_create and can be hit many times while the student is
+                # still deciding) — this is the platform-wide feed into Weak/Mastered/
+                # Mistake Bank alongside QBank practice. Additive only: doesn't touch
+                # Answer/TestAttempt/scoring above.
+                record_question_result(request.user, q, answer.is_correct, source='test', selected_option=answer.selected_option)
 
         attempt.score = round(score, 2)
         attempt.accuracy = round((correct / answered) * 100, 2) if answered else 0
