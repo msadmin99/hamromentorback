@@ -1,11 +1,16 @@
+from decimal import Decimal
+
 from rest_framework import serializers
 
 from .models import (
+    MAX_COMBO_DISCOUNT_PERCENT,
+    ComboPlan,
     Coupon,
     GrandTestAccess,
     PaymentAuditLog,
     PaymentMethod,
     Purchase,
+    PurchaseComboItem,
     Scholarship,
     Subscription,
     SubscriptionPlan,
@@ -52,6 +57,53 @@ class SubscriptionPlanSerializer(serializers.ModelSerializer):
         ]
 
 
+class ComboPlanSerializer(serializers.ModelSerializer):
+    plan_details = serializers.SerializerMethodField()
+    individual_value = serializers.SerializerMethodField()
+    you_save = serializers.SerializerMethodField()
+    final_price = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ComboPlan
+        fields = [
+            'id', 'name', 'course', 'plans', 'plan_details', 'discount_percent', 'individual_value',
+            'you_save', 'final_price', 'is_popular', 'is_best_value', 'is_active', 'order', 'created_at',
+        ]
+
+    def _individual_value(self, obj):
+        return sum((p.price for p in obj.plans.all()), Decimal('0'))
+
+    def get_plan_details(self, obj):
+        return [
+            {
+                'id': p.id, 'product_type': p.product_type, 'name': p.name, 'price': p.price,
+                'duration_value': p.duration_value, 'duration_unit': p.duration_unit,
+                'mock_test_quota': p.mock_test_quota,
+            }
+            for p in obj.plans.all()
+        ]
+
+    def get_individual_value(self, obj):
+        return self._individual_value(obj)
+
+    def get_you_save(self, obj):
+        return self._individual_value(obj) * obj.discount_percent / 100
+
+    def get_final_price(self, obj):
+        value = self._individual_value(obj)
+        return value - (value * obj.discount_percent / 100)
+
+    def validate_discount_percent(self, value):
+        if value > MAX_COMBO_DISCOUNT_PERCENT:
+            raise serializers.ValidationError(f'Discount cannot exceed {MAX_COMBO_DISCOUNT_PERCENT}%.')
+        return value
+
+    def validate_plans(self, value):
+        if len({p.product_type for p in value}) != len(value):
+            raise serializers.ValidationError('A combo can only include one plan per product type.')
+        return value
+
+
 class SubscriptionSerializer(serializers.ModelSerializer):
     course_name = serializers.CharField(source='course.name', read_only=True)
     plan_name = serializers.CharField(source='plan.name', read_only=True)
@@ -86,6 +138,15 @@ class CouponSerializer(serializers.ModelSerializer):
         return value.strip().upper()
 
 
+class PurchaseComboItemSerializer(serializers.ModelSerializer):
+    plan_name = serializers.CharField(source='plan.name', read_only=True)
+    product_type = serializers.CharField(source='plan.product_type', read_only=True)
+
+    class Meta:
+        model = PurchaseComboItem
+        fields = ['id', 'plan', 'plan_name', 'product_type', 'price']
+
+
 class GrandTestAccessSerializer(serializers.ModelSerializer):
     test_title = serializers.CharField(source='test.title', read_only=True)
 
@@ -102,6 +163,8 @@ class PurchaseSerializer(serializers.ModelSerializer):
     plan_name = serializers.CharField(source='plan.name', read_only=True)
     grand_test_title = serializers.CharField(source='grand_test.title', read_only=True)
     teacher_course_title = serializers.CharField(source='teacher_course.title', read_only=True)
+    combo_plan_name = serializers.CharField(source='combo_plan.name', read_only=True)
+    combo_items = PurchaseComboItemSerializer(many=True, read_only=True)
     coupon_code = serializers.CharField(source='coupon.code', read_only=True)
     grand_test_access = GrandTestAccessSerializer(read_only=True)
     payment_method_detail = PaymentMethodSerializer(source='payment_method', read_only=True)
@@ -111,7 +174,8 @@ class PurchaseSerializer(serializers.ModelSerializer):
         model = Purchase
         fields = [
             'id', 'order_id', 'user', 'user_name', 'user_email', 'kind', 'plan', 'plan_name', 'grand_test',
-            'grand_test_title', 'teacher_course', 'teacher_course_title', 'coupon', 'coupon_code', 'currency',
+            'grand_test_title', 'teacher_course', 'teacher_course_title', 'combo_plan', 'combo_plan_name',
+            'combo_items', 'coupon', 'coupon_code', 'currency',
             'original_amount', 'discount_amount', 'final_amount', 'payment_method', 'payment_method_detail',
             'payment_reference', 'has_screenshot', 'status', 'admin_note', 'expires_at', 'is_expired',
             'created_at', 'decided_at', 'grand_test_access',
@@ -163,6 +227,8 @@ class CreatePurchaseSerializer(serializers.Serializer):
     plan_id = serializers.IntegerField(required=False, allow_null=True)
     grand_test_id = serializers.IntegerField(required=False, allow_null=True)
     teacher_course_id = serializers.IntegerField(required=False, allow_null=True)
+    combo_plan_id = serializers.IntegerField(required=False, allow_null=True)
+    plan_ids = serializers.ListField(child=serializers.IntegerField(), required=False)
     coupon_code = serializers.CharField(required=False, allow_blank=True)
 
 

@@ -7,6 +7,13 @@ from django.db import models
 from django.utils import timezone
 from django.utils.text import slugify
 
+# "Build Your Own Combo" pricing tiers, keyed by number of distinct product
+# types selected — a fixed business rule, not admin-editable (unlike
+# REFERRAL_FRIEND_DISCOUNT_PERCENT in settings.py, which is a single env-
+# overridable scalar; a tier table doesn't fit that pattern cleanly).
+COMBO_DISCOUNT_TIERS = {2: 15, 3: 25, 4: 30, 5: 35}
+MAX_COMBO_DISCOUNT_PERCENT = 35
+
 
 class SubscriptionPlan(models.Model):
     """Admin-defined purchasable plan for one product type under one course."""
@@ -56,6 +63,34 @@ class SubscriptionPlan(models.Model):
         if self.duration_unit == 'year':
             return timedelta(days=365 * self.duration_value)
         return timedelta(days=30)
+
+
+class ComboPlan(models.Model):
+    """Admin-curated bundle of SubscriptionPlan rows sold as one discounted
+    package (e.g. "Ultimate Medical Prep"). Price is never stored — always
+    computed live from the current price of each plan in `plans`, so editing
+    a SubscriptionPlan's price automatically updates every combo containing
+    it (see ComboPlanSerializer)."""
+    name = models.CharField(max_length=150, help_text='e.g. "Ultimate Medical Prep"')
+    course = models.ForeignKey('courses.Course', on_delete=models.CASCADE, related_name='combo_plans')
+    plans = models.ManyToManyField(
+        SubscriptionPlan, related_name='combo_plans',
+        help_text='Exact plan rows included in this combo (pick specific durations/quotas).',
+    )
+    discount_percent = models.PositiveIntegerField(
+        default=15, help_text=f'Percent off the combined individual price. Capped at {MAX_COMBO_DISCOUNT_PERCENT}%.',
+    )
+    is_popular = models.BooleanField(default=False, help_text='Shows a "Popular" badge on the combo card.')
+    is_best_value = models.BooleanField(default=False, help_text='Shows a "Best Value" badge on the combo card.')
+    is_active = models.BooleanField(default=True)
+    order = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['course', 'order']
+
+    def __str__(self):
+        return f'{self.course.name} — {self.name}'
 
 
 class Subscription(models.Model):
@@ -262,6 +297,7 @@ class Purchase(models.Model):
         ('subscription', 'Subscription'),
         ('grand_test', 'Grand Test'),
         ('teacher_course', 'Teacher Course'),
+        ('combo', 'Combo Plan'),
     ]
     STATUS_CHOICES = [
         ('unpaid', 'Unpaid'),  # = "Awaiting Payment": order created, no proof submitted yet
@@ -288,6 +324,11 @@ class Purchase(models.Model):
     )
     teacher_course = models.ForeignKey(
         'marketplace.TeacherCourse', on_delete=models.SET_NULL, null=True, blank=True, related_name='purchases',
+    )
+    combo_plan = models.ForeignKey(
+        ComboPlan, on_delete=models.SET_NULL, null=True, blank=True, related_name='purchases',
+        help_text='Set for a predefined-bundle purchase, null for a custom "build your own" combo — '
+                   'either way the actual items are PurchaseComboItem rows, not this field.',
     )
     coupon = models.ForeignKey(Coupon, on_delete=models.SET_NULL, null=True, blank=True, related_name='purchases')
     currency = models.CharField(max_length=3, default='NRS', help_text='NRS only — this platform does not support other currencies.')
@@ -347,6 +388,20 @@ class Purchase(models.Model):
     @property
     def is_expired(self):
         return bool(self.expires_at and self.status == 'unpaid' and timezone.now() > self.expires_at)
+
+
+class PurchaseComboItem(models.Model):
+    """One SubscriptionPlan within a combo Purchase (kind='combo') — used for
+    both predefined ComboPlan buys and custom "build your own" combos, which
+    differ only in where the plan list/discount % came from at creation time.
+    `price` snapshots the plan's price at purchase time so invoice line-items
+    stay stable even if the plan's price later changes."""
+    purchase = models.ForeignKey(Purchase, on_delete=models.CASCADE, related_name='combo_items')
+    plan = models.ForeignKey(SubscriptionPlan, on_delete=models.CASCADE, related_name='combo_purchase_items')
+    price = models.DecimalField(max_digits=9, decimal_places=2)
+
+    def __str__(self):
+        return f'{self.purchase_id}: {self.plan.name} (Rs.{self.price})'
 
 
 class Scholarship(models.Model):

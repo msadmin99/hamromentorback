@@ -130,6 +130,19 @@ def _activate_product(purchase):
         _send_grand_test_email(access)
         return access
 
+    if purchase.kind == 'combo':
+        subscriptions = []
+        for item in purchase.combo_items.select_related('plan'):
+            plan = item.plan
+            subscription, was_renewal = _extend_or_create_subscription(
+                purchase.user, plan.course, plan.product_type, plan.duration_timedelta(),
+                plan=plan, mock_test_quota=plan.mock_test_quota,
+            )
+            if was_renewal:
+                send_notification(purchase.user, 'renewal_confirmation', subscription)
+            subscriptions.append(subscription)
+        return subscriptions
+
     if purchase.kind == 'teacher_course':
         from marketplace.models import CourseEnrollment
 

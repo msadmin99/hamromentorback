@@ -18,11 +18,14 @@ from tests_app.models import Test
 from . import payment_service
 from .analytics import build_analytics
 from .models import (
+    COMBO_DISCOUNT_TIERS,
+    ComboPlan,
     Coupon,
     GrandTestAccess,
     NotificationLog,
     PaymentMethod,
     Purchase,
+    PurchaseComboItem,
     Scholarship,
     Subscription,
     SubscriptionPlan,
@@ -33,6 +36,7 @@ from .payment_service import PaymentError, _extend_or_create_subscription
 from .screenshot_storage import screenshot_view_url
 from .serializers import (
     ApplyCouponSerializer,
+    ComboPlanSerializer,
     CouponSerializer,
     CreatePurchaseSerializer,
     PaymentAuditLogSerializer,
@@ -143,6 +147,45 @@ def compute_price(kind, plan, grand_test, coupon_code, user, teacher_course=None
     return amount, discount, amount - discount, coupon, error
 
 
+def _validate_and_price_combo(plans):
+    """Shared by ComboQuoteView (preview) and PurchaseViewSet.create()'s
+    custom "build your own" combo branch (actual purchase), so the two never
+    price the same selection differently. `plans` is a list of already-
+    fetched SubscriptionPlan objects. Returns
+    (individual_value, discount_percent, you_save, final_price) or raises
+    PaymentError with a user-facing message."""
+    if len(plans) < 2:
+        raise PaymentError('Select at least 2 products to build a combo.')
+    course_ids = {p.course_id for p in plans}
+    if len(course_ids) > 1:
+        raise PaymentError('All combo items must belong to the same course.')
+    product_types = [p.product_type for p in plans]
+    if len(set(product_types)) != len(product_types):
+        raise PaymentError('A combo can only include one plan per product type.')
+    if not all(p.is_active for p in plans):
+        raise PaymentError('One or more selected plans are no longer available.')
+
+    discount_percent = COMBO_DISCOUNT_TIERS.get(len(plans), 0)
+    individual_value = sum((p.price for p in plans), Decimal('0'))
+    you_save = individual_value * discount_percent / 100
+    final_price = individual_value - you_save
+    return individual_value, discount_percent, you_save, final_price
+
+
+def _price_predefined_combo(combo_plan):
+    """Predefined ComboPlan pricing uses the admin-set discount_percent
+    directly (not the "build your own" tier table) — the plans M2M was
+    already validated one-per-product-type at ComboPlan save time
+    (ComboPlanSerializer.validate_plans)."""
+    plans = list(combo_plan.plans.all())
+    if not plans:
+        raise PaymentError('This combo has no plans configured.')
+    individual_value = sum((p.price for p in plans), Decimal('0'))
+    you_save = individual_value * combo_plan.discount_percent / 100
+    final_price = individual_value - you_save
+    return plans, individual_value, you_save, final_price
+
+
 class GrantAccessView(APIView):
     """Admin-only manual grant — creates a Subscription directly with no
     Purchase row (zero revenue), reusing the same extend-or-create logic real
@@ -240,6 +283,22 @@ class SubscriptionPlanViewSet(viewsets.ModelViewSet):
         return qs
 
 
+class ComboPlanViewSet(viewsets.ModelViewSet):
+    queryset = ComboPlan.objects.select_related('course').prefetch_related('plans').all()
+    serializer_class = ComboPlanSerializer
+    permission_classes = [IsAdminRoleOrAboveOrReadOnly]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        course_id = self.request.query_params.get('course')
+        if course_id:
+            qs = qs.filter(course_id=course_id)
+        user = self.request.user
+        if not (user.is_authenticated and user.is_staff):
+            qs = qs.filter(is_active=True)
+        return qs
+
+
 class PaymentMethodViewSet(viewsets.ModelViewSet):
     queryset = PaymentMethod.objects.all()
     serializer_class = PaymentMethodSerializer
@@ -296,6 +355,36 @@ class ApplyCouponView(APIView):
         })
 
 
+class ComboQuoteView(APIView):
+    """Live pricing preview for the "Build Your Own Combo" builder — the
+    frontend calls this on every selection change; POST /purchases/ recomputes
+    the same way at actual purchase time via the same _validate_and_price_combo
+    helper, so preview and purchase never disagree."""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        # request.data is a QueryDict for multipart/form-encoded requests —
+        # .get() would silently return only the last value of a repeated
+        # key, same pitfall DRF's ListField avoids internally via .getlist().
+        if hasattr(request.data, 'getlist'):
+            plan_ids = request.data.getlist('plan_ids')
+        else:
+            plan_ids = request.data.get('plan_ids') or []
+        if not plan_ids:
+            return Response({'valid': False, 'detail': 'Select at least 2 products to build a combo.'}, status=400)
+        plans = list(SubscriptionPlan.objects.filter(pk__in=plan_ids))
+        if len(plans) != len(set(plan_ids)):
+            return Response({'valid': False, 'detail': 'One or more selected plans were not found.'}, status=400)
+        try:
+            individual_value, discount_percent, you_save, final_price = _validate_and_price_combo(plans)
+        except PaymentError as exc:
+            return Response({'valid': False, 'detail': exc.message}, status=400)
+        return Response({
+            'valid': True, 'individual_value': individual_value, 'discount_percent': discount_percent,
+            'you_save': you_save, 'final_price': final_price,
+        })
+
+
 class MyCouponsView(APIView):
     """Student dashboard: which promo codes they can currently use, which they've
     already redeemed with how much they saved, and a running savings total."""
@@ -342,8 +431,8 @@ class MyCouponsView(APIView):
 
 class PurchaseViewSet(viewsets.ModelViewSet):
     queryset = Purchase.objects.select_related(
-        'user', 'plan', 'grand_test', 'teacher_course', 'coupon', 'grand_test_access',
-    ).all()
+        'user', 'plan', 'grand_test', 'teacher_course', 'combo_plan', 'coupon', 'grand_test_access',
+    ).prefetch_related('combo_items__plan').all()
     permission_classes = [IsAuthenticated]
     http_method_names = ['get', 'post', 'head', 'options']
 
@@ -385,6 +474,10 @@ class PurchaseViewSet(viewsets.ModelViewSet):
         serializer = CreatePurchaseSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
+
+        if data['kind'] == 'combo':
+            return self._create_combo(request, data)
+
         plan = get_object_or_404(SubscriptionPlan, pk=data['plan_id']) if data.get('plan_id') else None
         grand_test = get_object_or_404(Test, pk=data['grand_test_id']) if data.get('grand_test_id') else None
         teacher_course = None
@@ -424,6 +517,41 @@ class PurchaseViewSet(viewsets.ModelViewSet):
         if final <= 0:
             # Nothing to verify — a 100%-off / free-grant coupon needs no manual bank-transfer
             # check, so activate immediately instead of leaving it stuck in "pending".
+            payment_service.activate(purchase.id, request=request, allow_unpaid=True)
+            purchase.refresh_from_db()
+
+        return Response(PurchaseSerializer(purchase).data, status=status.HTTP_201_CREATED)
+
+    def _create_combo(self, request, data):
+        """kind='combo' branch, split out of create() since combo purchases
+        resolve/price a list of plans instead of one product and never accept
+        a coupon_code — see _validate_and_price_combo / _price_predefined_combo."""
+        combo_plan = None
+        try:
+            if data.get('combo_plan_id'):
+                combo_plan = get_object_or_404(ComboPlan, pk=data['combo_plan_id'], is_active=True)
+                plans, individual_value, you_save, final_price = _price_predefined_combo(combo_plan)
+            else:
+                plan_ids = data.get('plan_ids') or []
+                if not plan_ids:
+                    return Response({'detail': 'combo_plan_id or plan_ids is required.'}, status=400)
+                plans = list(SubscriptionPlan.objects.filter(pk__in=plan_ids))
+                if len(plans) != len(set(plan_ids)):
+                    return Response({'detail': 'One or more selected plans were not found.'}, status=400)
+                individual_value, _discount_percent, you_save, final_price = _validate_and_price_combo(plans)
+        except PaymentError as exc:
+            return Response({'detail': exc.message}, status=400)
+
+        purchase = Purchase.objects.create(
+            user=request.user, kind='combo', combo_plan=combo_plan,
+            original_amount=individual_value, discount_amount=you_save, final_amount=final_price,
+            expires_at=(timezone.now() + timezone.timedelta(minutes=Purchase.EXPIRY_MINUTES)) if final_price > 0 else None,
+        )
+        PurchaseComboItem.objects.bulk_create([
+            PurchaseComboItem(purchase=purchase, plan=p, price=p.price) for p in plans
+        ])
+
+        if final_price <= 0:
             payment_service.activate(purchase.id, request=request, allow_unpaid=True)
             purchase.refresh_from_db()
 
@@ -526,6 +654,13 @@ class PurchaseViewSet(viewsets.ModelViewSet):
             item_label = purchase.grand_test.title if purchase.grand_test_id else 'Grand Test'
         elif purchase.kind == 'teacher_course':
             item_label = purchase.teacher_course.title if purchase.teacher_course_id else 'Course'
+        elif purchase.kind == 'combo':
+            if purchase.combo_plan_id:
+                item_label = purchase.combo_plan.name
+            else:
+                item_label = 'Custom Combo: ' + ', '.join(
+                    i.plan.name for i in purchase.combo_items.select_related('plan')
+                )
         else:
             item_label = purchase.plan.name if purchase.plan_id else 'Purchase'
         lines = [

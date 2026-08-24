@@ -493,3 +493,130 @@ class CouponMultiCourseTests(BillingTestCase):
         self.assertEqual(coupon.applies_to, 'pyq')
         self.assertTrue(coupon.applies_to_product('pyq'))
         self.assertFalse(coupon.applies_to_product('qbank'))
+
+
+class ComboPlanPurchaseTests(BillingTestCase):
+    """Every combo item is a SubscriptionPlan (never a Grand Test or
+    TeacherCourse — see the plan file for why); activation reuses
+    _extend_or_create_subscription exactly like a single purchase would, so
+    these tests mainly cover the multi-item pricing/validation surface."""
+
+    def setUp(self):
+        super().setUp()
+        self.mock_plan = self._make_plan(product_type='mock_test', name='30 Mock Tests', price=300, mock_test_quota=30)
+        self.daily_plan = self._make_plan(product_type='daily_test', name='100 Daily Tests', price=200, mock_test_quota=100)
+        self.pyq_plan = self._make_plan(product_type='pyq', name='1 Year PYQ', price=400)
+        self.video_plan = self._make_plan(product_type='video', name='1 Year Video', price=600)
+        self.other_course = Course.objects.create(name='CEE-BDS', prefix='BDS')
+        self.other_course_plan = self._make_plan(course=self.other_course, product_type='mock_test', name='Other Mock', price=250, mock_test_quota=10)
+
+    def _make_combo(self, plans, discount_percent=15, **overrides):
+        from billing.models import ComboPlan
+
+        combo = ComboPlan.objects.create(name='Test Combo', course=self.course, discount_percent=discount_percent, **overrides)
+        combo.plans.set(plans)
+        return combo
+
+    def test_predefined_combo_purchase_prices_correctly(self):
+        combo = self._make_combo([self.plan, self.mock_plan], discount_percent=15)  # 500 + 300 = 800
+
+        resp = self.client.post('/api/purchases/', {'kind': 'combo', 'combo_plan_id': combo.id})
+
+        self.assertEqual(resp.status_code, 201, resp.data)
+        self.assertEqual(str(resp.data['original_amount']), '800.00')
+        self.assertEqual(str(resp.data['discount_amount']), '120.00')
+        self.assertEqual(str(resp.data['final_amount']), '680.00')
+        self.assertEqual(len(resp.data['combo_items']), 2)
+        self.assertEqual(resp.data['combo_plan_name'], 'Test Combo')
+
+    def test_predefined_combo_purchase_activates_every_underlying_plan(self):
+        combo = self._make_combo([self.plan, self.mock_plan], discount_percent=15)
+        resp = self.client.post('/api/purchases/', {'kind': 'combo', 'combo_plan_id': combo.id})
+        purchase_id = resp.data['id']
+        self._submit(purchase_id)
+        self.client.force_authenticate(user=self.staff)
+
+        approve_resp = self.client.post(f'/api/purchases/{purchase_id}/approve/', {})
+
+        self.assertEqual(approve_resp.status_code, 200)
+        qbank_sub = Subscription.objects.get(user=self.student, course=self.course, product_type='qbank')
+        self.assertTrue(qbank_sub.is_current)
+        mock_sub = Subscription.objects.get(user=self.student, course=self.course, product_type='mock_test')
+        self.assertEqual(mock_sub.mock_test_quota, 30)
+
+    def test_free_combo_auto_approves_and_activates(self):
+        free_plan_a = self._make_plan(product_type='daily_test', name='Free Daily', price=0)
+        free_plan_b = self._make_plan(product_type='video', name='Free Video', price=0)
+        combo = self._make_combo([free_plan_a, free_plan_b], discount_percent=15)
+
+        resp = self.client.post('/api/purchases/', {'kind': 'combo', 'combo_plan_id': combo.id})
+
+        self.assertEqual(resp.status_code, 201, resp.data)
+        self.assertEqual(resp.data['status'], 'approved')
+        self.assertTrue(Subscription.objects.filter(user=self.student, course=self.course, product_type='daily_test').exists())
+        self.assertTrue(Subscription.objects.filter(user=self.student, course=self.course, product_type='video').exists())
+
+    def test_custom_combo_prices_by_item_count_tier(self):
+        resp = self.client.post('/api/purchases/', {
+            'kind': 'combo', 'plan_ids': [self.plan.id, self.mock_plan.id, self.daily_plan.id],  # 3 items -> 25%
+        })
+        self.assertEqual(resp.status_code, 201, resp.data)
+        self.assertEqual(str(resp.data['original_amount']), '1000.00')  # 500 + 300 + 200
+        self.assertEqual(str(resp.data['discount_amount']), '250.00')
+        self.assertEqual(str(resp.data['final_amount']), '750.00')
+        self.assertIsNone(resp.data['combo_plan'])
+
+    def test_custom_combo_never_exceeds_35_percent(self):
+        resp = self.client.post('/api/purchases/', {
+            'kind': 'combo',
+            'plan_ids': [self.plan.id, self.mock_plan.id, self.daily_plan.id, self.pyq_plan.id, self.video_plan.id],
+        })
+        self.assertEqual(resp.status_code, 201, resp.data)
+        individual = 500 + 300 + 200 + 400 + 600
+        self.assertEqual(float(resp.data['discount_amount']), individual * 0.35)
+
+    def test_custom_combo_quote_matches_purchase_pricing(self):
+        quote = self.client.post('/api/combo-quote/', {'plan_ids': [self.plan.id, self.mock_plan.id]})
+        purchase = self.client.post('/api/purchases/', {'kind': 'combo', 'plan_ids': [self.plan.id, self.mock_plan.id]})
+
+        self.assertEqual(quote.status_code, 200, quote.data)
+        self.assertEqual(str(quote.data['final_price']), purchase.data['final_amount'])
+
+    def test_custom_combo_rejects_single_item(self):
+        resp = self.client.post('/api/purchases/', {'kind': 'combo', 'plan_ids': [self.plan.id]})
+        self.assertEqual(resp.status_code, 400)
+
+    def test_custom_combo_rejects_two_plans_of_the_same_product_type(self):
+        second_qbank = self._make_plan(name='6 Month QBank', price=800)
+        resp = self.client.post('/api/purchases/', {'kind': 'combo', 'plan_ids': [self.plan.id, second_qbank.id]})
+        self.assertEqual(resp.status_code, 400)
+
+    def test_custom_combo_rejects_plans_from_different_courses(self):
+        resp = self.client.post('/api/purchases/', {'kind': 'combo', 'plan_ids': [self.plan.id, self.other_course_plan.id]})
+        self.assertEqual(resp.status_code, 400)
+
+    def test_combo_purchase_ignores_a_submitted_coupon_code(self):
+        Coupon.objects.create(code='WONTSTACK', discount_type='percentage', discount_value=50)
+        resp = self.client.post('/api/purchases/', {
+            'kind': 'combo', 'plan_ids': [self.plan.id, self.mock_plan.id], 'coupon_code': 'WONTSTACK',
+        })
+        self.assertEqual(resp.status_code, 201, resp.data)
+        self.assertIsNone(resp.data['coupon'])
+        self.assertEqual(str(resp.data['discount_amount']), '120.00')  # still the 15% tier, not the 50% coupon
+
+    def test_combo_plan_serializer_rejects_discount_over_35_percent(self):
+        self.client.force_authenticate(user=self.staff)
+        resp = self.client.post('/api/combo-plans/', {
+            'name': 'Too Generous', 'course': self.course.id, 'plans': [self.plan.id, self.mock_plan.id],
+            'discount_percent': 40,
+        })
+        self.assertEqual(resp.status_code, 400)
+
+    def test_combo_plan_serializer_exposes_live_computed_pricing(self):
+        from billing.serializers import ComboPlanSerializer
+
+        combo = self._make_combo([self.plan, self.mock_plan], discount_percent=20)
+        data = ComboPlanSerializer(combo).data
+        self.assertEqual(data['individual_value'], 800)
+        self.assertEqual(data['you_save'], 160)
+        self.assertEqual(data['final_price'], 640)

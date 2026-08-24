@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import Coupon, GrandTestAccess, PaymentMethod, Purchase, Subscription, SubscriptionPlan
+from .models import ComboPlan, Coupon, GrandTestAccess, PaymentMethod, Purchase, Subscription, SubscriptionPlan
 
 
 @admin.register(PaymentMethod)
@@ -13,6 +13,13 @@ class PaymentMethodAdmin(admin.ModelAdmin):
 class SubscriptionPlanAdmin(admin.ModelAdmin):
     list_display = ('name', 'course', 'product_type', 'price', 'duration_value', 'duration_unit', 'is_active')
     list_filter = ('product_type', 'is_active')
+
+
+@admin.register(ComboPlan)
+class ComboPlanAdmin(admin.ModelAdmin):
+    list_display = ('name', 'course', 'discount_percent', 'is_best_value', 'is_popular', 'is_active')
+    list_filter = ('course', 'is_active')
+    filter_horizontal = ('plans',)
 
 
 @admin.register(Subscription)
