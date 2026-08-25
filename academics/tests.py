@@ -751,3 +751,56 @@ class QuestionCourseScopingTests(APITestCase):
         self.assertIn(self.cee_question.id, ids)
         self.assertIn(self.shared_question.id, ids)
         self.assertNotIn(self.nmcle_question.id, ids)
+
+
+class SubjectCourseScopingTests(APITestCase):
+    """A subject explicitly scoped to specific course(s) must not surface to
+    a student enrolled in an unrelated course — the reported bug: a CEE-PG
+    student's Question Bank was showing CEE-UG-only subjects (Physics/
+    Chemistry/Botany) alongside their own (Pathology/Physiology/Anatomy),
+    because SubjectViewSet.get_queryset() only filtered by course when the
+    client happened to send ?course=, exactly the same class of gap already
+    fixed for Test/Question."""
+
+    def setUp(self):
+        from courses.models import Course, Enrollment
+
+        self.cee_ug = Course.objects.create(name='CEE-MBBS Scoping', prefix='CEEUGSCOPE')
+        self.cee_pg = Course.objects.create(name='MD/MS Scoping', prefix='CEEPGSCOPE')
+        self.pg_student = User.objects.create_user(username='pg_student', email='pgstudent@example.com', password='pw12345')
+        Enrollment.objects.create(user=self.pg_student, course=self.cee_pg)
+
+        self.physics = Subject.objects.create(name='Physics Scoping')
+        self.physics.courses.set([self.cee_ug])
+        self.pathology = Subject.objects.create(name='Pathology Scoping')
+        self.pathology.courses.set([self.cee_pg])
+        self.shared = Subject.objects.create(name='Shared Scoping')  # blank courses = shared
+
+        self.client.force_authenticate(user=self.pg_student)
+
+    def test_subject_list_excludes_other_courses_subject_even_without_course_param(self):
+        resp = self.client.get('/api/subjects/')
+        ids = {s['id'] for s in resp.data}
+        self.assertIn(self.pathology.id, ids)
+        self.assertIn(self.shared.id, ids)
+        self.assertNotIn(self.physics.id, ids)
+
+    def test_tampered_course_param_cannot_widen_access(self):
+        resp = self.client.get(f'/api/subjects/?course={self.cee_ug.id}')
+        ids = {s['id'] for s in resp.data}
+        self.assertNotIn(self.physics.id, ids)
+
+    def test_chapters_of_an_unassigned_subject_are_excluded(self):
+        from academics.models import Chapter
+
+        chapter = Chapter.objects.create(subject=self.physics, name='Kinematics')
+        resp = self.client.get(f'/api/chapters/?subject={self.physics.slug}')
+        ids = {c['id'] for c in resp.data}
+        self.assertNotIn(chapter.id, ids)
+
+    def test_recommended_new_subject_suggestion_never_names_an_unassigned_subject(self):
+        resp = self.client.get('/api/questions/recommended/')
+        self.assertEqual(resp.status_code, 200)
+        new_subject_suggestions = [s for s in resp.data['suggestions'] if s.get('type') == 'new_subject']
+        for s in new_subject_suggestions:
+            self.assertNotEqual(s['subject_id'], self.physics.id)

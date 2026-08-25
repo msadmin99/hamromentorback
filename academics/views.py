@@ -24,6 +24,28 @@ from .serializers import (
 from .services import record_question_result
 
 
+def _course_scoped(qs, user, *, courses_lookup):
+    """Always-applied (not opt-in on a query param) course-eligibility
+    filter for non-staff — the same fix already made to Test/Question
+    (tests_app.access.visible_test_queryset / academics QuestionViewSet):
+    a row with NO courses assigned is treated as shared/ungated (matches
+    Subject's own 'can be shared across courses' design and today's real
+    data, where every subject is explicitly scoped), a row WITH courses
+    assigned is only visible to a student actually enrolled in one of
+    them. `courses_lookup` is the ORM path to the M2M from `qs`'s model,
+    e.g. 'courses' for Subject itself, 'subject__courses' for Chapter."""
+    if user and user.is_authenticated and user.is_staff:
+        return qs
+    from django.db.models import Q
+
+    from courses.access import eligible_course_ids
+
+    course_ids = eligible_course_ids(user)
+    isnull_lookup = f'{courses_lookup}__isnull'
+    in_lookup = f'{courses_lookup}__id__in'
+    return qs.filter(Q(**{isnull_lookup: True}) | Q(**{in_lookup: course_ids})).distinct()
+
+
 class SubjectViewSet(viewsets.ModelViewSet):
     queryset = Subject.objects.all().prefetch_related('courses')
     permission_classes = [IsStaffOrReadOnlyExcludingTeacherWrites]
@@ -36,8 +58,12 @@ class SubjectViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         qs = super().get_queryset()
+        qs = _course_scoped(qs, self.request.user, courses_lookup='courses')
         course_id = self.request.query_params.get('course')
         if course_id:
+            # Narrows within the already-eligible set above for staff too
+            # (e.g. the Admin Subjects page filtering by course) — never a
+            # substitute for the eligibility filter for non-staff.
             qs = qs.filter(courses__id=course_id)
         return qs.distinct()
 
@@ -49,6 +75,7 @@ class ChapterViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         qs = super().get_queryset()
+        qs = _course_scoped(qs, self.request.user, courses_lookup='subject__courses')
         subject_slug = self.request.query_params.get('subject')
         if subject_slug:
             qs = qs.filter(subject__slug=subject_slug)
@@ -62,6 +89,7 @@ class TopicViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         qs = super().get_queryset()
+        qs = _course_scoped(qs, self.request.user, courses_lookup='chapter__subject__courses')
         chapter_id = self.request.query_params.get('chapter')
         if chapter_id:
             qs = qs.filter(chapter_id=chapter_id)
@@ -536,7 +564,7 @@ class QuestionViewSet(viewsets.ModelViewSet):
                 'practice_params': {'status': 'incorrect'},
             })
 
-        new_subject_qs = Subject.objects.all()
+        new_subject_qs = _course_scoped(Subject.objects.all(), user, courses_lookup='courses')
         locked = _locked_subject_ids(user)
         if locked:
             new_subject_qs = new_subject_qs.exclude(id__in=locked)
