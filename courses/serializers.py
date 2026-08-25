@@ -46,9 +46,20 @@ class CourseSerializer(serializers.ModelSerializer):
 
     def get_question_count(self, obj):
         # Was Question.objects.count() — the platform-wide total regardless
-        # of `obj`, showing e.g. NMCLE's full question count on a CEE-UG
-        # course card. Question.courses' related_name is 'questions'.
-        return obj.questions.count()
+        # of `obj`. obj.questions.count() (Question.courses' related_name)
+        # alone undercounts to 0 for every course, since Question.courses is
+        # unpopulated on every real question — only Subject.courses is
+        # actually maintained by admins. Mirrors
+        # academics.views._question_course_scoped's inheritance rule: a
+        # question with its own `courses` tag counts there; a question with
+        # none counts toward every course its Subject is scoped to.
+        from django.db.models import Q
+
+        from academics.models import Question
+
+        return Question.objects.filter(
+            Q(courses=obj) | Q(courses__isnull=True, subject__courses=obj)
+        ).distinct().count()
 
 
 class EnrollmentSerializer(serializers.ModelSerializer):

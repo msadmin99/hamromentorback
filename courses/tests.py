@@ -64,3 +64,37 @@ class CourseDeleteTests(APITestCase):
         coupon.refresh_from_db()
         self.assertEqual(coupon.courses.count(), 0)
         self.assertTrue(Coupon.objects.filter(id=coupon.id).exists())
+
+
+class CourseQuestionCountTests(APITestCase):
+    """get_question_count must be per-course, not a platform-wide total
+    (the originally reported bug), and must count questions that inherit
+    their course scope from Subject (the real production shape, where
+    Question.courses is unpopulated) — not only questions explicitly
+    tagged on Question.courses (which production never uses)."""
+
+    def setUp(self):
+        from academics.models import Question, Subject
+
+        self.cee_ug = Course.objects.create(name='CEE-UG QCount', prefix='CEEUGQCOUNT')
+        self.cee_pg = Course.objects.create(name='CEE-PG QCount', prefix='CEEPGQCOUNT')
+
+        physics = Subject.objects.create(name='Physics QCount')
+        physics.courses.set([self.cee_ug])
+        Question.objects.create(subject=physics, text='Physics QCount Q1')
+        Question.objects.create(subject=physics, text='Physics QCount Q2')
+
+        pathology = Subject.objects.create(name='Pathology QCount')
+        pathology.courses.set([self.cee_pg])
+        Question.objects.create(subject=pathology, text='Pathology QCount Q1')
+
+        self.staff = User.objects.create_user(
+            username='qcount_staff', email='qcount_staff@example.com', password='pw12345', is_staff=True, admin_role='admin',
+        )
+        self.client.force_authenticate(user=self.staff)
+
+    def test_question_count_is_per_course_not_platform_wide(self):
+        resp = self.client.get('/api/courses/')
+        by_id = {c['id']: c['question_count'] for c in resp.data}
+        self.assertEqual(by_id[self.cee_ug.id], 2)
+        self.assertEqual(by_id[self.cee_pg.id], 1)
