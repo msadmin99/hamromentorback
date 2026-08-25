@@ -63,3 +63,37 @@ class CourseGatedVideoListingScopingTests(APITestCase):
         resp = self.client.get(f'/api/videos/?course={self.cee_ug.id}')
         titles = {v['title'] for v in resp.data}
         self.assertNotIn('UG Course Video', titles)
+
+
+class LinkedTestVisibilityTests(APITestCase):
+    """VideoDetailSerializer.get_linked_tests_detail must not leak a linked
+    Test's id/title/exam_type when that Test itself is a draft or scoped to
+    a course the viewer isn't enrolled in — being linked from an otherwise-
+    visible Video says nothing about the Test's own eligibility."""
+
+    def setUp(self):
+        from courses.models import Course, Enrollment
+        from tests_app.models import Test
+
+        self.cee_ug = Course.objects.create(name='CEE-UG LinkedTest', prefix='CEEUGLINKEDTEST')
+        self.cee_pg = Course.objects.create(name='CEE-PG LinkedTest', prefix='CEEPGLINKEDTEST')
+
+        self.pg_student = User.objects.create_user(username='linked_pg', email='linked_pg@example.com', password='pw12345')
+        Enrollment.objects.create(user=self.pg_student, course=self.cee_pg)
+
+        self.video = Video.objects.create(title='Shared Video With Linked Tests', access_level='public')
+
+        self.pg_test = Test.objects.create(title='PG Linked Quiz', exam_type='qbank', is_draft=False)
+        self.pg_test.courses.set([self.cee_pg])
+        self.ug_test = Test.objects.create(title='UG Linked Quiz', exam_type='qbank', is_draft=False)
+        self.ug_test.courses.set([self.cee_ug])
+        self.draft_test = Test.objects.create(title='Draft Linked Quiz', exam_type='qbank')
+        self.draft_test.courses.set([self.cee_pg])
+        self.video.linked_tests.set([self.pg_test, self.ug_test, self.draft_test])
+
+        self.client.force_authenticate(user=self.pg_student)
+
+    def test_linked_tests_excludes_other_course_and_draft_tests(self):
+        resp = self.client.get(f'/api/videos/{self.video.id}/')
+        ids = {t['id'] for t in resp.data['linked_tests_detail']}
+        self.assertEqual(ids, {self.pg_test.id})

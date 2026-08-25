@@ -104,7 +104,18 @@ class VideoDetailSerializer(VideoListSerializer):
         return VideoResourceSerializer(obj.resources.all(), many=True).data
 
     def get_linked_tests_detail(self, obj):
-        return [{'id': t.id, 'title': t.title, 'exam_type': t.exam_type} for t in obj.linked_tests.all()]
+        # A linked Test can be draft or scoped to a course other than the
+        # viewer's own — obj.linked_tests.all() alone leaked its id/title/
+        # exam_type regardless, since being visible on this Video (already
+        # course-scoped) says nothing about the linked Test's own
+        # eligibility. visible_test_queryset is the same gate used for the
+        # main Test listing/start endpoints.
+        from tests_app.access import visible_test_queryset
+
+        request = self.context.get('request')
+        user = request.user if request else None
+        visible = visible_test_queryset(user, obj.linked_tests.all())
+        return [{'id': t.id, 'title': t.title, 'exam_type': t.exam_type} for t in visible]
 
 
 class VideoAdminSerializer(serializers.ModelSerializer):
