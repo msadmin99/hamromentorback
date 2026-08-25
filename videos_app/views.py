@@ -24,6 +24,27 @@ class VideoCategoryViewSet(viewsets.ModelViewSet):
     permission_classes = [IsStaffOrReadOnly]
 
 
+def _course_gated_video_scoped(qs, user):
+    """billing.access.has_video_access() already correctly gates the actual
+    stream/progress endpoints (videos_app/views.py's stream/mark-progress
+    actions) against real Enrollment for access_level='course' videos. But
+    VideoViewSet.get_queryset() — the LIST endpoint — had no equivalent
+    check at all: a course-gated video scoped to an unrelated course was
+    still fully listed (title/description/thumbnail) to any authenticated
+    user, only its actual playback was blocked. Only touches
+    access_level='course' rows; every other access_level's visibility
+    (public/registered/premium/teacher_only) is unaffected."""
+    if user and user.is_authenticated and user.is_staff:
+        return qs
+    from django.db.models import Q as Q_gate
+
+    from courses.access import eligible_course_ids
+
+    course_ids = eligible_course_ids(user)
+    allowed = ~Q_gate(access_level='course') | Q_gate(courses__isnull=True) | Q_gate(courses__id__in=course_ids)
+    return qs.filter(allowed).distinct()
+
+
 class VideoViewSet(viewsets.ModelViewSet):
     queryset = (
         Video.objects.select_related('subject', 'chapter', 'topic', 'category', 'created_by')
@@ -82,6 +103,7 @@ class VideoViewSet(viewsets.ModelViewSet):
         is_staff_user = user.is_authenticated and user.is_staff
         if not is_staff_user:
             qs = qs.filter(is_active=True, is_archived=False)
+            qs = _course_gated_video_scoped(qs, user)
         else:
             if params.get('include_archived') != 'true':
                 qs = qs.exclude(is_archived=True)
