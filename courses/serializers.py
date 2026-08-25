@@ -45,8 +45,10 @@ class CourseSerializer(serializers.ModelSerializer):
         return obj.enrollments.filter(is_active=True).count()
 
     def get_question_count(self, obj):
-        from academics.models import Question
-        return Question.objects.count()
+        # Was Question.objects.count() — the platform-wide total regardless
+        # of `obj`, showing e.g. NMCLE's full question count on a CEE-UG
+        # course card. Question.courses' related_name is 'questions'.
+        return obj.questions.count()
 
 
 class EnrollmentSerializer(serializers.ModelSerializer):

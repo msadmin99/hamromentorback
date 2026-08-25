@@ -452,3 +452,118 @@ class AdminExamCreateEditApiTests(APITestCase):
         test.refresh_from_db()
         self.assertEqual(test.title, 'Partial patch — renamed')
         self.assertEqual(list(test.courses.values_list('id', flat=True)), [self.course.id])
+
+
+class PerformanceCourseScopingTests(APITestCase):
+    """The `tests_app/performance.py` catalog reads (subject_breakdown,
+    activity_calendar's upcoming exams, recommendations, and
+    SubjectPerformanceDetailView's subject_id path param) previously trusted
+    an optional, client-supplied `course` and went fully unfiltered whenever
+    it was omitted. These confirm a CEE-PG student's own performance
+    dashboard/calendar/recommendations never disclose a CEE-UG-only
+    subject, exam, or suggestion — including when `course` is tampered."""
+
+    def setUp(self):
+        from courses.models import Course, Enrollment
+
+        self.cee_ug = Course.objects.create(name='CEE-UG Perf', prefix='CEEUGPERF')
+        self.cee_pg = Course.objects.create(name='CEE-PG Perf', prefix='CEEPGPERF')
+
+        self.pg_student = User.objects.create_user(username='perf_pg', email='perf_pg@example.com', password='pw12345')
+        Enrollment.objects.create(user=self.pg_student, course=self.cee_pg)
+
+        self.physics = Subject.objects.create(name='Physics Perf', is_free=True)
+        self.physics.courses.set([self.cee_ug])
+        self.physics_q = Question.objects.create(subject=self.physics, text='Physics Perf Q1')
+        self.physics_q.courses.set([self.cee_ug])
+
+        self.pathology = Subject.objects.create(name='Pathology Perf', is_free=True)
+        self.pathology.courses.set([self.cee_pg])
+        self.pathology_q = Question.objects.create(subject=self.pathology, text='Pathology Perf Q1')
+        self.pathology_q.courses.set([self.cee_pg])
+
+        self.client.force_authenticate(user=self.pg_student)
+
+    def test_overview_subject_breakdown_excludes_other_course_subject(self):
+        resp = self.client.get('/api/performance/overview/')
+        names = {s['subject_name'] for s in resp.data['subjects']}
+        self.assertIn('Pathology Perf', names)
+        self.assertNotIn('Physics Perf', names)
+
+    def test_overview_tampered_course_param_cannot_surface_other_course_subject(self):
+        resp = self.client.get(f'/api/performance/overview/?course={self.cee_ug.id}')
+        names = {s['subject_name'] for s in resp.data['subjects']}
+        self.assertNotIn('Physics Perf', names)
+
+    def test_subject_detail_denies_unassigned_subject_by_id(self):
+        resp = self.client.get(f'/api/performance/subjects/{self.physics.id}/')
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_subject_detail_allows_assigned_subject_by_id(self):
+        resp = self.client.get(f'/api/performance/subjects/{self.pathology.id}/')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+    def test_calendar_upcoming_exams_excludes_other_course_exam(self):
+        ug_exam = Test.objects.create(
+            title='UG Perf Exam', exam_type='mock', is_draft=False,
+            scheduled_start=timezone.now() + timezone.timedelta(days=3),
+        )
+        ug_exam.courses.set([self.cee_ug])
+        month = timezone.now().strftime('%Y-%m')
+
+        resp = self.client.get(f'/api/performance/calendar/?month={month}')
+
+        test_ids = {row['test_id'] for row in resp.data['upcoming_exams']}
+        self.assertNotIn(ug_exam.id, test_ids)
+
+    def test_calendar_upcoming_exams_excludes_draft_exam_even_if_course_assigned(self):
+        draft_exam = Test.objects.create(
+            title='PG Draft Perf Exam', exam_type='mock',
+            scheduled_start=timezone.now() + timezone.timedelta(days=3),
+        )
+        draft_exam.courses.set([self.cee_pg])
+        month = timezone.now().strftime('%Y-%m')
+
+        resp = self.client.get(f'/api/performance/calendar/?month={month}')
+
+        test_ids = {row['test_id'] for row in resp.data['upcoming_exams']}
+        self.assertNotIn(draft_exam.id, test_ids)
+
+    def test_calendar_upcoming_exams_includes_own_course_published_exam(self):
+        pg_exam = Test.objects.create(
+            title='PG Perf Exam', exam_type='mock', is_draft=False,
+            scheduled_start=timezone.now() + timezone.timedelta(days=3),
+        )
+        pg_exam.courses.set([self.cee_pg])
+        month = timezone.now().strftime('%Y-%m')
+
+        resp = self.client.get(f'/api/performance/calendar/?month={month}')
+
+        test_ids = {row['test_id'] for row in resp.data['upcoming_exams']}
+        self.assertIn(pg_exam.id, test_ids)
+
+    def test_recommendations_never_suggests_other_course_test_for_shared_subject(self):
+        """A subject shared across both courses can have a Test scoped to
+        only one of them — the suggested_test_id/suggested_video_id must
+        never point at the other course's resource."""
+        shared_subject = Subject.objects.create(name='Anatomy Perf Shared', is_free=True)
+        shared_subject.courses.set([self.cee_ug, self.cee_pg])
+
+        for i in range(3):
+            shared_q = Question.objects.create(subject=shared_subject, text=f'Anatomy Perf Shared Q{i}')
+            shared_q.courses.set([self.cee_ug, self.cee_pg])
+            QuestionAttempt.objects.create(
+                user=self.pg_student, question=shared_q, is_correct=False,
+                attempts_count=1, correct_count=0,
+            )
+
+        ug_only_test = Test.objects.create(
+            title='Anatomy UG-only QBank Perf', exam_type='qbank', is_draft=False, subject=shared_subject,
+        )
+        ug_only_test.courses.set([self.cee_ug])
+
+        resp = self.client.get('/api/performance/overview/')
+
+        revise = [s for s in resp.data['recommendations']['suggestions'] if s.get('subject_id') == shared_subject.id]
+        self.assertTrue(revise)
+        self.assertNotEqual(revise[0]['suggested_test_id'], ug_only_test.id)

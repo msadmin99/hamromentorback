@@ -18,9 +18,28 @@ from django.utils import timezone
 
 from academics.models import Chapter, QuestionAttempt, QuestionEvent, Subject, Topic
 
+from .access import visible_test_queryset
 from .models import Answer, Test, TestAttempt
 
 MIN_ATTEMPTS_FOR_SUBJECT_RANK = 5
+
+
+def _effective_course_ids(user, course=None):
+    """The course scope to filter CATALOG reads by (Subject/Test/Video rows
+    not already scoped to `user=user`) — never trusts a client-supplied
+    `course` blindly. If a specific course is requested, it must be one the
+    student is actually enrolled in, else it's simply not honored (empty
+    set — 'return zero results for unauthorized content', not a silent
+    fallback to something wider). If no course is requested, defaults to
+    every course the student is enrolled in — never 'unfiltered
+    platform-wide', which is what every function below did before this
+    fix whenever its `course` argument was left unset."""
+    from courses.access import eligible_course_ids
+
+    eligible = eligible_course_ids(user)
+    if course:
+        return {course} if course in eligible else set()
+    return eligible
 
 
 def _attempts_qs(user, course=None, date_from=None, date_to=None, exam_types=None):
@@ -278,9 +297,15 @@ def subject_breakdown(user, course=None):
         else:
             bucket['score'] -= float(q['negative_marks'])
 
-    subjects_qs = Subject.objects.all()
-    if course:
-        subjects_qs = subjects_qs.filter(courses__id=course)
+    # Was Subject.objects.all() (unfiltered when course omitted) — listed
+    # every subject platform-wide, across every unrelated program, in a
+    # student's own subject breakdown (with an honest attempted=0 for ones
+    # they could never have touched, but still disclosing subject names/
+    # curriculum from courses they aren't enrolled in).
+    from django.db.models import Q as _Q
+
+    course_ids = _effective_course_ids(user, course)
+    subjects_qs = Subject.objects.filter(_Q(courses__isnull=True) | _Q(courses__id__in=course_ids))
 
     rows = []
     for subject in subjects_qs.distinct():
@@ -537,16 +562,23 @@ def recommendations(user, course=None):
     attempted = [s for s in subjects if s['attempted'] >= 3]
     weakest = sorted(attempted, key=lambda s: s['accuracy'])[:3]
 
+    # `subjects`/`weakest` are already course-eligible (subject_breakdown is
+    # fixed above), but a shared subject (e.g. Anatomy under both CEE-PG and
+    # NMCLE) can have a Test/Video scoped to only ONE of those courses —
+    # `course` being optional here previously meant these were unfiltered by
+    # course whenever omitted, so a CEE-PG student could still be handed a
+    # suggested_test_id/suggested_video_id from an NMCLE-only resource.
+    course_ids = _effective_course_ids(user, course)
     suggestions = []
     for s in weakest:
-        video_qs = Video.objects.filter(subject_id=s['subject_id'])
-        if course:
-            video_qs = video_qs.filter(courses__id=course)
+        video_qs = Video.objects.filter(subject_id=s['subject_id']).filter(
+            Q(courses__isnull=True) | Q(courses__id__in=course_ids)
+        )
         video = video_qs.first()
 
-        test_qs = TestModel.objects.filter(subject_id=s['subject_id'])
+        test_qs = visible_test_queryset(user, TestModel.objects.filter(subject_id=s['subject_id']))
         if course:
-            test_qs = test_qs.filter(Q(courses__id=course) | Q(courses__isnull=True))
+            test_qs = test_qs.filter(courses__id=course)
         practice_test = test_qs.filter(exam_type='qbank').first() or test_qs.first()
 
         suggestions.append({
@@ -639,11 +671,17 @@ def activity_calendar(user, course, month):
     for d in vp_qs.values_list('last_watched_at__date', flat=True).distinct():
         days[d.isoformat()]['video'] = True
 
-    upcoming_qs = Test.objects.filter(
+    # Was courses__isnull=True treated as "shared" — wrong for Test, where
+    # blank means "not yet assigned to anyone" (see tests_app.models.Test),
+    # not shared, and had no is_draft/assigned_students/assigned_batches
+    # check at all, leaking draft and out-of-course exam ids/titles into
+    # the calendar. visible_test_queryset is the same eligibility gate
+    # _start_attempt() itself uses.
+    upcoming_qs = visible_test_queryset(user, Test.objects.filter(
         scheduled_start__date__gte=start, scheduled_start__date__lt=end, scheduled_start__gte=timezone.now(),
-    )
+    ))
     if course:
-        upcoming_qs = upcoming_qs.filter(Q(courses__id=course) | Q(courses__isnull=True))
+        upcoming_qs = upcoming_qs.filter(courses__id=course)
     upcoming_exams = [
         {'date': t.scheduled_start.date().isoformat(), 'test_id': t.id, 'title': t.title, 'exam_type': t.exam_type}
         for t in upcoming_qs.distinct()

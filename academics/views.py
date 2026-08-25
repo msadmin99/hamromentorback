@@ -195,17 +195,7 @@ class QuestionViewSet(viewsets.ModelViewSet):
             locked_subject_ids = _locked_subject_ids(user)
             if locked_subject_ids:
                 qs = qs.exclude(subject_id__in=locked_subject_ids)
-            # Course-eligibility, independent of the subscription-lock check
-            # above: a question explicitly tagged to specific course(s) must
-            # not surface for a student not enrolled in any of them — this is
-            # what search (which has no subject-first funnel to rely on)
-            # needs to stay course-aware. Untagged/shared questions
-            # (courses empty) are unaffected, matching Subject's existing
-            # "blank = shared across courses" convention.
-            from django.db.models import Q as _Q
-
-            from courses.access import eligible_course_ids
-            qs = qs.filter(_Q(courses__isnull=True) | _Q(courses__id__in=eligible_course_ids(user)))
+            qs = _course_scoped(qs, user, courses_lookup='courses')
         elif getattr(user, 'admin_role', None) == 'teacher' and not user.can_manage_all_content:
             qs = qs.filter(created_by=user)
 
@@ -426,13 +416,16 @@ class QuestionViewSet(viewsets.ModelViewSet):
         subject = request.query_params.get('subject')
         course = request.query_params.get('course')
 
-        question_qs = Question.objects.all()
+        question_qs = _course_scoped(Question.objects.all(), user, courses_lookup='courses')
         locked = _locked_subject_ids(user)
         if locked:
             question_qs = question_qs.exclude(subject_id__in=locked)
         if subject:
             question_qs = question_qs.filter(subject__slug=subject)
         if course:
+            # Narrows within the already-eligible set above — never a
+            # substitute for it (see QuestionViewSet.get_queryset for the
+            # same principle applied to the main listing/search endpoint).
             question_qs = question_qs.filter(courses__id=course)
         total_questions = question_qs.distinct().count()
 
@@ -597,11 +590,20 @@ class QuestionViewSet(viewsets.ModelViewSet):
         user = request.user
         data = request.data
 
-        qs = Question.objects.all().select_related('subject', 'chapter').prefetch_related('options')
+        qs = _course_scoped(
+            Question.objects.all().select_related('subject', 'chapter').prefetch_related('options'),
+            user, courses_lookup='courses',
+        )
         locked = _locked_subject_ids(user)
         if locked:
             qs = qs.exclude(subject_id__in=locked)
         if data.get('course'):
+            # Narrows within the already-eligible set above — a client
+            # sending a course id the student isn't enrolled in can no
+            # longer widen the base queryset past it (this action used to
+            # build Question.objects.all() directly with no eligibility
+            # filter at all — the actual leak behind "Physics/Chemistry
+            # still appear when practicing").
             qs = qs.filter(courses__id=data['course'])
         if data.get('subject'):
             subject_val = data['subject']

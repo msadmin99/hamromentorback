@@ -572,6 +572,21 @@ class SubjectPerformanceDetailView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request, subject_id):
+        from django.db.models import Q
+
+        from academics.models import Subject
+        from courses.access import eligible_course_ids
+
+        user = request.user
+        accessible = Subject.objects.filter(pk=subject_id)
+        if not (user.is_authenticated and user.is_staff):
+            # chapter_breakdown()/topic_mastery() take a bare subject_id with
+            # no eligibility check of their own — any authenticated student
+            # could otherwise request an unrelated program's subject_id
+            # directly and receive its chapter/topic names and counts.
+            accessible = accessible.filter(Q(courses__isnull=True) | Q(courses__id__in=eligible_course_ids(user)))
+        if not accessible.exists():
+            raise NotFound('Subject not found.')
         return Response(performance.chapter_breakdown(request.user, subject_id))
 
 

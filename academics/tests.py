@@ -804,3 +804,163 @@ class SubjectCourseScopingTests(APITestCase):
         new_subject_suggestions = [s for s in resp.data['suggestions'] if s.get('type') == 'new_subject']
         for s in new_subject_suggestions:
             self.assertNotEqual(s['subject_id'], self.physics.id)
+
+
+class CompleteCourseScopingAuditTests(APITestCase):
+    """Full-matrix regression suite for the course-scoping audit: anonymous,
+    no-enrollment, single-course (CEE-UG / CEE-PG), and multi-course
+    students, across Subject listing, Question browse/search, the Practice
+    Session Builder (the exact endpoint behind the reported "Physics/
+    Chemistry still appear in CEE-PG practice" bug), the QBank dashboard,
+    and recommendations — each also probed with a tampered ?course=/course
+    param to confirm a client value can only narrow, never widen, access."""
+
+    def setUp(self):
+        from courses.models import Course, Enrollment
+
+        self.cee_ug = Course.objects.create(name='CEE-UG Audit', prefix='CEEUGAUDIT')
+        self.cee_pg = Course.objects.create(name='CEE-PG Audit', prefix='CEEPGAUDIT')
+
+        self.cee_ug_student = User.objects.create_user(username='audit_ug', email='audit_ug@example.com', password='pw12345')
+        Enrollment.objects.create(user=self.cee_ug_student, course=self.cee_ug)
+
+        self.cee_pg_student = User.objects.create_user(username='audit_pg', email='audit_pg@example.com', password='pw12345')
+        Enrollment.objects.create(user=self.cee_pg_student, course=self.cee_pg)
+
+        self.multi_student = User.objects.create_user(username='audit_multi', email='audit_multi@example.com', password='pw12345')
+        Enrollment.objects.create(user=self.multi_student, course=self.cee_ug)
+        Enrollment.objects.create(user=self.multi_student, course=self.cee_pg)
+
+        self.no_enrollment_student = User.objects.create_user(username='audit_none', email='audit_none@example.com', password='pw12345')
+
+        def _subject_with_question(name, course):
+            subject = Subject.objects.create(name=name, is_free=True)
+            subject.courses.set([course])
+            question = Question.objects.create(subject=subject, text=f'{name} question 1')
+            question.courses.set([course])
+            return subject, question
+
+        self.physics, self.physics_q = _subject_with_question('Physics Audit', self.cee_ug)
+        self.chemistry, self.chemistry_q = _subject_with_question('Chemistry Audit', self.cee_ug)
+        self.botany, self.botany_q = _subject_with_question('Botany Audit', self.cee_ug)
+        self.pathology, self.pathology_q = _subject_with_question('Pathology Audit', self.cee_pg)
+        self.physiology, self.physiology_q = _subject_with_question('Physiology Audit', self.cee_pg)
+        self.anatomy, self.anatomy_q = _subject_with_question('Anatomy Audit', self.cee_pg)
+
+    # -- Subject listing ---------------------------------------------------
+
+    def test_cee_pg_student_sees_only_pg_subjects(self):
+        self.client.force_authenticate(user=self.cee_pg_student)
+        resp = self.client.get('/api/subjects/')
+        names = {s['name'] for s in resp.data}
+        self.assertEqual(names, {'Pathology Audit', 'Physiology Audit', 'Anatomy Audit'})
+
+    def test_cee_ug_student_sees_only_ug_subjects(self):
+        self.client.force_authenticate(user=self.cee_ug_student)
+        resp = self.client.get('/api/subjects/')
+        names = {s['name'] for s in resp.data}
+        self.assertEqual(names, {'Physics Audit', 'Chemistry Audit', 'Botany Audit'})
+
+    def test_multi_course_student_sees_both_courses_subjects(self):
+        self.client.force_authenticate(user=self.multi_student)
+        resp = self.client.get('/api/subjects/')
+        names = {s['name'] for s in resp.data}
+        self.assertEqual(
+            names,
+            {'Physics Audit', 'Chemistry Audit', 'Botany Audit', 'Pathology Audit', 'Physiology Audit', 'Anatomy Audit'},
+        )
+
+    def test_anonymous_user_sees_none_of_these_scoped_subjects(self):
+        resp = self.client.get('/api/subjects/')
+        names = {s['name'] for s in resp.data}
+        self.assertFalse(names & {'Physics Audit', 'Pathology Audit'})
+
+    def test_no_enrollment_student_sees_none_of_these_scoped_subjects(self):
+        self.client.force_authenticate(user=self.no_enrollment_student)
+        resp = self.client.get('/api/subjects/')
+        names = {s['name'] for s in resp.data}
+        self.assertFalse(names & {'Physics Audit', 'Pathology Audit'})
+
+    # -- Practice Session Builder (the exact reported leak) ----------------
+
+    def test_practice_session_for_pg_student_never_returns_ug_questions(self):
+        self.client.force_authenticate(user=self.cee_pg_student)
+        resp = self.client.post('/api/questions/practice-session/', {'count': 50}, format='json')
+        ids = {q['id'] for q in resp.data}
+        self.assertIn(self.pathology_q.id, ids)
+        self.assertNotIn(self.physics_q.id, ids)
+        self.assertNotIn(self.chemistry_q.id, ids)
+        self.assertNotIn(self.botany_q.id, ids)
+
+    def test_practice_session_for_ug_student_never_returns_pg_questions(self):
+        self.client.force_authenticate(user=self.cee_ug_student)
+        resp = self.client.post('/api/questions/practice-session/', {'count': 50}, format='json')
+        ids = {q['id'] for q in resp.data}
+        self.assertIn(self.physics_q.id, ids)
+        self.assertNotIn(self.pathology_q.id, ids)
+        self.assertNotIn(self.physiology_q.id, ids)
+        self.assertNotIn(self.anatomy_q.id, ids)
+
+    def test_practice_session_tampered_course_param_returns_no_ug_questions_for_pg_student(self):
+        self.client.force_authenticate(user=self.cee_pg_student)
+        resp = self.client.post(
+            '/api/questions/practice-session/', {'count': 50, 'course': self.cee_ug.id}, format='json',
+        )
+        ids = {q['id'] for q in resp.data}
+        self.assertNotIn(self.physics_q.id, ids)
+        self.assertEqual(ids, set())
+
+    def test_practice_session_tampered_subject_slug_returns_nothing_for_unassigned_subject(self):
+        self.client.force_authenticate(user=self.cee_pg_student)
+        resp = self.client.post(
+            '/api/questions/practice-session/', {'count': 50, 'subject': self.physics.slug}, format='json',
+        )
+        self.assertEqual(resp.data, [])
+
+    # -- QBank dashboard -----------------------------------------------------
+
+    def test_dashboard_total_questions_excludes_other_course_for_pg_student(self):
+        self.client.force_authenticate(user=self.cee_pg_student)
+        resp = self.client.get('/api/questions/dashboard/')
+        self.assertEqual(resp.data['total_questions'], 3)
+
+    def test_dashboard_tampered_course_param_cannot_widen_pg_student_totals(self):
+        self.client.force_authenticate(user=self.cee_pg_student)
+        resp = self.client.get(f'/api/questions/dashboard/?course={self.cee_ug.id}')
+        self.assertEqual(resp.data['total_questions'], 0)
+
+    # -- Question browse / search --------------------------------------------
+
+    def test_browse_search_for_pg_student_excludes_ug_matches(self):
+        self.client.force_authenticate(user=self.cee_pg_student)
+        resp = self.client.get('/api/questions/browse/', {'search': 'Audit question'})
+        ids = {q['id'] for q in resp.data['results']}
+        self.assertIn(self.pathology_q.id, ids)
+        self.assertNotIn(self.physics_q.id, ids)
+
+    def test_direct_question_id_via_browse_never_returns_unassigned_course_question(self):
+        self.client.force_authenticate(user=self.cee_pg_student)
+        resp = self.client.get('/api/questions/browse/', {'search': 'Physics Audit'})
+        ids = {q['id'] for q in resp.data['results']}
+        self.assertNotIn(self.physics_q.id, ids)
+
+    # -- Chapter / Topic nested-resource bypass ------------------------------
+
+    def test_chapters_of_unassigned_subject_not_reachable_by_pg_student(self):
+        from academics.models import Chapter
+
+        chapter = Chapter.objects.create(subject=self.physics, name='Kinematics Audit')
+        self.client.force_authenticate(user=self.cee_pg_student)
+        resp = self.client.get(f'/api/chapters/?subject={self.physics.slug}')
+        ids = {c['id'] for c in resp.data}
+        self.assertNotIn(chapter.id, ids)
+
+    def test_topics_of_unassigned_subject_not_reachable_by_pg_student(self):
+        from academics.models import Chapter, Topic
+
+        chapter = Chapter.objects.create(subject=self.physics, name='Kinematics Audit 2')
+        topic = Topic.objects.create(chapter=chapter, name='Vectors Audit')
+        self.client.force_authenticate(user=self.cee_pg_student)
+        resp = self.client.get(f'/api/topics/?chapter={chapter.id}')
+        ids = {t['id'] for t in resp.data}
+        self.assertNotIn(topic.id, ids)
