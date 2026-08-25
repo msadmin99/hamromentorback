@@ -456,14 +456,23 @@ class QuestionViewSet(viewsets.ModelViewSet):
             # Narrows within the already-eligible set above — never a
             # substitute for it (see QuestionViewSet.get_queryset for the
             # same principle applied to the main listing/search endpoint).
-            question_qs = question_qs.filter(courses__id=course)
+            # courses__id=course alone would match nothing for a question
+            # relying on its Subject's scope (courses__isnull=True case),
+            # same reasoning as _question_course_scoped above.
+            from django.db.models import Q as Q_course
+            question_qs = question_qs.filter(
+                Q_course(courses__id=course) | Q_course(courses__isnull=True, subject__courses__id=course)
+            )
         total_questions = question_qs.distinct().count()
 
         attempt_qs = QuestionAttempt.objects.filter(user=user, attempts_count__gt=0)
         if subject:
             attempt_qs = attempt_qs.filter(question__subject__slug=subject)
         if course:
-            attempt_qs = attempt_qs.filter(question__courses__id=course)
+            attempt_qs = attempt_qs.filter(
+                Q_course(question__courses__id=course)
+                | Q_course(question__courses__isnull=True, question__subject__courses__id=course)
+            )
 
         attempted = attempt_qs.count()
         correct = attempt_qs.filter(last_result=True).count()
