@@ -24,6 +24,7 @@ from billing.access import (
 from hamromentor.permissions import IsStaffOrReadOnly
 
 from . import performance
+from .access import can_access_test, visible_test_queryset
 from .exam_versioning import RescheduleError, clone_test_as_new_version, create_reschedule_session
 from .models import Answer, ExamSession, ExamTemplate, Test, TestAttempt
 from .serializers import (
@@ -50,6 +51,14 @@ def _start_attempt(request, test, session=None):
     serializer = StartTestSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
     submitted_password = serializer.validated_data.get('access_password')
+
+    # Academic-eligibility gate — the actual enforcement point for "a student
+    # must not be able to access an unauthorized exam by changing the URL,
+    # changing the exam ID, or calling the API directly." Listing (get_queryset)
+    # already filters correctly, but this is what stops a leaked/guessed Test
+    # ID from bypassing that filter entirely.
+    if not can_access_test(request.user, test):
+        return Response({'detail': 'You do not have access to this exam.'}, status=status.HTTP_403_FORBIDDEN)
 
     if session:
         session.refresh_status()
@@ -178,11 +187,15 @@ class TestViewSet(viewsets.ModelViewSet):
             qs = qs.filter(university=university)
 
         user = self.request.user
-        if not (user.is_authenticated and user.is_staff):
-            qs = qs.filter(is_draft=False)
+        # Always-applied, server-derived eligibility filter — never opt-in on
+        # whether the client happened to send ?course=, and never widened by
+        # a client-supplied course id the student isn't actually enrolled in.
+        qs = visible_test_queryset(user, qs)
         if course_id and not (user.is_authenticated and user.is_staff):
-            from django.db.models import Q
-            qs = qs.filter(Q(courses__id=course_id) | Q(courses__isnull=True))
+            # Narrows within the already-eligible set above (e.g. a student
+            # enrolled in multiple courses picking one) — never a substitute
+            # for it.
+            qs = qs.filter(courses__id=course_id)
         if user.is_authenticated and getattr(user, 'admin_role', None) == 'teacher' and not user.can_manage_all_content:
             qs = qs.filter(created_by=user)
         return qs.distinct()
@@ -212,7 +225,13 @@ class TestViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
     def start(self, request, pk=None):
-        return _start_attempt(request, self.get_object())
+        # Deliberately Test.objects (not self.get_object(), which is scoped
+        # by get_queryset()'s eligibility filter) — a test outside that
+        # filter must still resolve here so can_access_test() inside
+        # _start_attempt() is the actual, explicit 403 enforcement point,
+        # not an incidental 404 from the object lookup failing first.
+        test = get_object_or_404(Test, pk=pk)
+        return _start_attempt(request, test)
 
     @action(detail=True, methods=['post'])
     def reschedule(self, request, pk=None):
@@ -251,6 +270,39 @@ class TestViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_409_CONFLICT,
             )
         return Response(ExamSessionSerializer(session, context={'request': request}).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=['post'])
+    def access_preview(self, request):
+        """'Who can see this exam?' preview (spec item 16) — computed from
+        the NOT-YET-SAVED selection currently in the create/edit form (sent
+        in the request body), not the saved Test row, so an admin can review
+        it before ever hitting Confirm & Publish. POST-for-read is
+        deliberate: the selection can be a large, arbitrary list of course/
+        student/batch ids, awkward as query params. Inherits this ViewSet's
+        IsStaffOrReadOnly, which already requires staff for non-GET methods."""
+        from courses.models import Course, Enrollment
+
+        course_ids = request.data.get('courses') or []
+        student_ids = request.data.get('assigned_students') or []
+        batch_ids = request.data.get('assigned_batches') or []
+
+        eligible_user_ids = set()
+        if course_ids:
+            eligible_user_ids |= set(
+                Enrollment.objects.filter(course_id__in=course_ids, is_active=True).values_list('user_id', flat=True)
+            )
+        if batch_ids:
+            eligible_user_ids |= set(
+                Enrollment.objects.filter(batch_id__in=batch_ids, is_active=True).values_list('user_id', flat=True)
+            )
+        eligible_user_ids |= {int(i) for i in student_ids}
+
+        return Response({
+            'eligible_count': len(eligible_user_ids),
+            'courses': list(Course.objects.filter(id__in=course_ids).values('id', 'name')),
+            'batch_count': len(batch_ids),
+            'individual_student_count': len(student_ids),
+        })
 
     @action(detail=True, methods=['post'])
     def duplicate(self, request, pk=None):

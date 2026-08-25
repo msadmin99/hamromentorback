@@ -135,8 +135,8 @@ class TestAdminSerializer(serializers.ModelSerializer):
     class Meta:
         model = Test
         fields = [
-            'id', 'title', 'description', 'difficulty', 'exam_type', 'subject', 'courses', 'duration_minutes',
-            'questions_per_page',
+            'id', 'title', 'description', 'difficulty', 'exam_type', 'subject', 'courses', 'assigned_students',
+            'assigned_batches', 'needs_course_review', 'duration_minutes', 'questions_per_page',
             'negative_marking', 'shuffle_questions', 'shuffle_options', 'max_attempts', 'solutions_visibility',
             'is_pro', 'is_new', 'price', 'access_password', 'free_preview_questions', 'academic_year', 'university',
             'scheduled_start', 'scheduled_end', 'is_draft', 'question_ids', 'questions', 'question_count', 'total_marks',

@@ -167,6 +167,17 @@ class QuestionViewSet(viewsets.ModelViewSet):
             locked_subject_ids = _locked_subject_ids(user)
             if locked_subject_ids:
                 qs = qs.exclude(subject_id__in=locked_subject_ids)
+            # Course-eligibility, independent of the subscription-lock check
+            # above: a question explicitly tagged to specific course(s) must
+            # not surface for a student not enrolled in any of them — this is
+            # what search (which has no subject-first funnel to rely on)
+            # needs to stay course-aware. Untagged/shared questions
+            # (courses empty) are unaffected, matching Subject's existing
+            # "blank = shared across courses" convention.
+            from django.db.models import Q as _Q
+
+            from courses.access import eligible_course_ids
+            qs = qs.filter(_Q(courses__isnull=True) | _Q(courses__id__in=eligible_course_ids(user)))
         elif getattr(user, 'admin_role', None) == 'teacher' and not user.can_manage_all_content:
             qs = qs.filter(created_by=user)
 

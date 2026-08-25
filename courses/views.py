@@ -9,17 +9,32 @@ from rest_framework.views import APIView
 from hamromentor.permissions import IsAdminRoleOrAbove, IsAdminRoleOrAboveOrReadOnly, IsSuperAdmin
 
 from .models import (
+    Batch,
     Course,
     CoursePackage,
     Enrollment,
     EnrollmentRequest,
 )
 from .serializers import (
+    BatchSerializer,
     CoursePackageSerializer,
     CourseSerializer,
     EnrollmentRequestSerializer,
     EnrollmentSerializer,
 )
+
+
+class BatchViewSet(viewsets.ModelViewSet):
+    queryset = Batch.objects.select_related('course').all()
+    serializer_class = BatchSerializer
+    permission_classes = [IsAdminRoleOrAboveOrReadOnly]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        course_id = self.request.query_params.get('course')
+        if course_id:
+            qs = qs.filter(course_id=course_id)
+        return qs
 
 
 class CourseViewSet(viewsets.ModelViewSet):
@@ -190,7 +205,7 @@ class DashboardStatsView(APIView):
             'total_questions': Question.objects.count(),
             'live_right_now': [
                 {
-                    'course': ', '.join(c.name for c in t.courses.all()) or 'All courses',
+                    'course': ', '.join(c.name for c in t.courses.all()) or 'Unassigned',
                     'label': t.title,
                     'exam_date': t.scheduled_start.date() if t.scheduled_start else None,
                 }

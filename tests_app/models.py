@@ -58,7 +58,17 @@ class Test(models.Model):
     subject = models.ForeignKey(Subject, on_delete=models.SET_NULL, null=True, blank=True, related_name='tests')
     courses = models.ManyToManyField(
         'courses.Course', blank=True, related_name='mapped_tests',
-        help_text='Which subcourse(s) this exam is assigned to. Blank = visible to every enrolled student (unscoped).',
+        help_text='Which subcourse(s) this exam is assigned to. Blank = visible to no one until assigned (see '
+                   'needs_course_review for the one-time legacy exception), NOT "visible to everyone" — that '
+                   'opt-out-by-omission default was the root cause of exams leaking across unrelated courses.',
+    )
+    assigned_students = models.ManyToManyField(
+        settings.AUTH_USER_MODEL, blank=True, related_name='assigned_tests',
+        help_text='Individual students explicitly granted access regardless of course/batch assignment.',
+    )
+    assigned_batches = models.ManyToManyField(
+        'courses.Batch', blank=True, related_name='assigned_tests',
+        help_text='Specific course cohort(s) (e.g. "2082 Batch") granted access, independent of the broader courses assignment.',
     )
 
     questions = models.ManyToManyField(Question, through='TestQuestion', related_name='tests')
@@ -94,9 +104,18 @@ class Test(models.Model):
     scheduled_end = models.DateTimeField(null=True, blank=True)
 
     is_draft = models.BooleanField(
+        default=True,
+        help_text='On (the default for every new exam) = only visible to staff — an admin/teacher must explicitly '
+                   'assign courses/students/batches and publish before students can see it. Off = visible to '
+                   'eligible students per the courses/assigned_students/assigned_batches assignment below.',
+    )
+    needs_course_review = models.BooleanField(
         default=False,
-        help_text='On = only visible to staff (e.g. still being assembled via Import & Create Test, or now managed '
-                   'through Exam Sessions). Off = visible to every eligible student, same as before this field existed.',
+        help_text='Set only by the one-time migration that introduced default-deny access control, for legacy '
+                   'exams that were published with no course assignment and could not be safely auto-mapped to '
+                   'exactly one course. While True, this exam keeps its pre-migration "visible to everyone" '
+                   'behavior so no existing access is silently revoked — an admin should assign real courses and '
+                   'clear this flag. Never set for exams created after this feature shipped.',
     )
 
     # --- Reschedule / Exam Versioning ---

@@ -2,6 +2,7 @@ from django.urls import path
 from rest_framework.routers import DefaultRouter
 
 from .views import (
+    BatchViewSet,
     CoursePackageViewSet,
     CourseViewSet,
     DashboardStatsView,
@@ -14,6 +15,7 @@ from .views import (
 router = DefaultRouter()
 router.register('courses', CourseViewSet, basename='course')
 router.register('course-packages', CoursePackageViewSet, basename='course-package')
+router.register('batches', BatchViewSet, basename='batch')
 router.register('enrollments', EnrollmentViewSet, basename='enrollment')
 router.register('enrollment-requests', EnrollmentRequestViewSet, basename='enrollment-request')
 

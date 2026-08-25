@@ -720,3 +720,34 @@ class RecomputeQuestionDifficultyCommandTests(TestCase):
         self.assertEqual(self.question.actual_difficulty, 'very_hard')
         self.assertEqual(self.question.actual_difficulty_sample_size, 10)
         self.assertEqual(self.question.instructor_difficulty, 'hard')
+
+
+class QuestionCourseScopingTests(APITestCase):
+    """A question explicitly tagged to a course must not surface for a
+    student not enrolled in it — closes the QBank-search leak (spec item
+    19), where the frontend previously sent no ?course= at all and the
+    backend's course filter was opt-in on the client supplying one."""
+
+    def setUp(self):
+        from courses.models import Course, Enrollment
+
+        self.cee_mbbs = Course.objects.create(name='CEE-MBBS', prefix='CEEMBBSQ')
+        self.nmcle_mbbs = Course.objects.create(name='NMCLE-MBBS', prefix='NMCLEMBBSQ')
+        self.cee_student = User.objects.create_user(username='cee_q_student', email='ceeq@example.com', password='pw12345')
+        Enrollment.objects.create(user=self.cee_student, course=self.cee_mbbs)
+
+        self.subject = Subject.objects.create(name='Biology', is_free=True)
+        self.cee_question = Question.objects.create(subject=self.subject, text='CEE-MBBS only question')
+        self.cee_question.courses.set([self.cee_mbbs])
+        self.nmcle_question = Question.objects.create(subject=self.subject, text='NMCLE-MBBS only question')
+        self.nmcle_question.courses.set([self.nmcle_mbbs])
+        self.shared_question = Question.objects.create(subject=self.subject, text='Untagged shared question')
+
+        self.client.force_authenticate(user=self.cee_student)
+
+    def test_browse_excludes_other_courses_question_even_without_course_param(self):
+        resp = self.client.get('/api/questions/browse/', {'search': 'question'})
+        ids = {q['id'] for q in resp.data['results']}
+        self.assertIn(self.cee_question.id, ids)
+        self.assertIn(self.shared_question.id, ids)
+        self.assertNotIn(self.nmcle_question.id, ids)

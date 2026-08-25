@@ -394,8 +394,14 @@ class TeacherCoursePurchaseTests(BillingTestCase):
 
 
 class PastYearQuestionsAccessTests(BillingTestCase):
+    """is_draft/needs_course_review=True on every fixture here: these tests
+    exercise subscription/payment gating specifically, not course-assignment
+    (covered separately in tests_app.tests) — needs_course_review keeps
+    course-eligibility out of the way, matching how a real legacy exam would
+    behave under the migration's escape hatch (see tests_app/access.py)."""
+
     def test_pro_pyq_test_blocks_start_without_membership(self):
-        pyq_test = Test.objects.create(title='IOM 2080', exam_type='pyq', is_pro=True, university='IOM')
+        pyq_test = Test.objects.create(title='IOM 2080', exam_type='pyq', is_pro=True, university='IOM', is_draft=False, needs_course_review=True)
         resp = self.client.post(f'/api/tests/{pyq_test.id}/start/', {})
         self.assertEqual(resp.status_code, 402)
 
@@ -403,14 +409,14 @@ class PastYearQuestionsAccessTests(BillingTestCase):
         from billing.models import SubscriptionPlan
 
         pyq_plan = self._make_plan(product_type='pyq', name='PYQ 1 Year')
-        pyq_test = Test.objects.create(title='IOM 2080', exam_type='pyq', is_pro=True, university='IOM')
+        pyq_test = Test.objects.create(title='IOM 2080', exam_type='pyq', is_pro=True, university='IOM', is_draft=False, needs_course_review=True)
         Subscription.objects.create(user=self.student, plan=pyq_plan, course=self.course, product_type='pyq')
 
         resp = self.client.post(f'/api/tests/{pyq_test.id}/start/', {})
         self.assertEqual(resp.status_code, 201)
 
     def test_free_pyq_test_never_blocked(self):
-        pyq_test = Test.objects.create(title='IOM 2075 (free)', exam_type='pyq', is_pro=False, university='IOM')
+        pyq_test = Test.objects.create(title='IOM 2075 (free)', exam_type='pyq', is_pro=False, university='IOM', is_draft=False, needs_course_review=True)
         resp = self.client.post(f'/api/tests/{pyq_test.id}/start/', {})
         self.assertEqual(resp.status_code, 201)
 

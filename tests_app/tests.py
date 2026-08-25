@@ -194,3 +194,185 @@ class KpiOverviewQuestionsTodayTests(APITestCase):
     def test_zero_when_no_activity_today(self):
         resp = self.client.get('/api/performance/overview/')
         self.assertEqual(resp.data['kpis']['questions_today'], 0)
+
+
+class ExamCourseAccessControlTests(APITestCase):
+    """The restructure's own acceptance tests, made literal — Test 1-5 from
+    the spec. Confirms exam visibility/access is derived server-side from
+    real Enrollment rows, never from a client-supplied ?course= param or
+    trust in the frontend not linking to an unauthorized exam."""
+
+    def setUp(self):
+        from courses.models import Course, Enrollment
+
+        self.staff = User.objects.create_user(
+            username='staff1', email='staff1@example.com', password='pw12345', is_staff=True, admin_role='admin',
+        )
+        self.cee_mbbs = Course.objects.create(name='CEE-MBBS', prefix='CEEMBBS', program_group='CEE-UG')
+        self.nmcle_mbbs = Course.objects.create(name='NMCLE-MBBS', prefix='NMCLEMBBS', program_group='NMCLE')
+        self.nmcle_bds = Course.objects.create(name='NMCLE-BDS', prefix='NMCLEBDS', program_group='NMCLE')
+        self.nlen = Course.objects.create(name='NLEN-PCL Nursing', prefix='NLENPCL', program_group='Nursing Council')
+
+        self.cee_mbbs_student = User.objects.create_user(username='cee_student', email='cee@example.com', password='pw12345')
+        Enrollment.objects.create(user=self.cee_mbbs_student, course=self.cee_mbbs)
+        self.nmcle_mbbs_student = User.objects.create_user(username='nmcle_mbbs_student', email='nmclembbs@example.com', password='pw12345')
+        Enrollment.objects.create(user=self.nmcle_mbbs_student, course=self.nmcle_mbbs)
+        self.nmcle_bds_student = User.objects.create_user(username='nmcle_bds_student', email='nmclebds@example.com', password='pw12345')
+        Enrollment.objects.create(user=self.nmcle_bds_student, course=self.nmcle_bds)
+        self.nlen_student = User.objects.create_user(username='nlen_student', email='nlen@example.com', password='pw12345')
+        Enrollment.objects.create(user=self.nlen_student, course=self.nlen)
+
+        self.exam = Test.objects.create(title='CEE-MBBS Mock Test', exam_type='mock', is_draft=False)
+        self.exam.courses.set([self.cee_mbbs])
+
+    def _visible_ids(self, user):
+        self.client.force_authenticate(user=user)
+        resp = self.client.get('/api/tests/?exam_type=mock')
+        self.assertEqual(resp.status_code, 200)
+        return {t['id'] for t in resp.data}
+
+    def _start(self, user):
+        self.client.force_authenticate(user=user)
+        return self.client.post(f'/api/tests/{self.exam.id}/start/', {})
+
+    def test_1_assigned_course_student_sees_and_can_start_the_exam(self):
+        self.assertIn(self.exam.id, self._visible_ids(self.cee_mbbs_student))
+        resp = self._start(self.cee_mbbs_student)
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+
+    def test_2_unassigned_course_student_does_not_see_or_start_it(self):
+        self.assertNotIn(self.exam.id, self._visible_ids(self.nmcle_mbbs_student))
+        resp = self._start(self.nmcle_mbbs_student)
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_3_another_unrelated_course_student_also_excluded(self):
+        self.assertNotIn(self.exam.id, self._visible_ids(self.nmcle_bds_student))
+        resp = self._start(self.nmcle_bds_student)
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_4_adding_a_second_course_only_grants_that_course_not_others(self):
+        """Spec's Test 4 (its literal 'CEE-MBBS -> NOT VISIBLE' line
+        contradicts Test 1/the rest of the document, which requires
+        CEE-MBBS to keep seeing an exam it's assigned to — treated here as
+        a typo and implemented per the document's actual intent: adding a
+        course is additive, never revokes an existing assignment)."""
+        self.exam.courses.add(self.nmcle_mbbs)
+
+        self.assertIn(self.exam.id, self._visible_ids(self.cee_mbbs_student))
+        self.assertIn(self.exam.id, self._visible_ids(self.nmcle_mbbs_student))
+        self.assertNotIn(self.exam.id, self._visible_ids(self.nmcle_bds_student))
+        self.assertNotIn(self.exam.id, self._visible_ids(self.nlen_student))
+
+    def test_5_direct_id_access_is_denied_regardless_of_query_params(self):
+        """Copied-URL / API-tampering case — omitting ?course=, or passing a
+        DIFFERENT course's id than the student's own, must never widen
+        access. This is the fix for _start_attempt having no eligibility
+        check at all before this change."""
+        self.client.force_authenticate(user=self.nmcle_mbbs_student)
+
+        no_param_resp = self.client.get('/api/tests/?exam_type=mock')
+        self.assertNotIn(self.exam.id, {t['id'] for t in no_param_resp.data})
+
+        tampered_resp = self.client.get(f'/api/tests/?exam_type=mock&course={self.cee_mbbs.id}')
+        self.assertNotIn(self.exam.id, {t['id'] for t in tampered_resp.data})
+
+        start_resp = self._start(self.nmcle_mbbs_student)
+        self.assertEqual(start_resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_individually_assigned_student_gets_access_regardless_of_course(self):
+        self.exam.assigned_students.add(self.nmcle_bds_student)
+        resp = self._start(self.nmcle_bds_student)
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+
+    def test_batch_assigned_student_gets_access(self):
+        from courses.models import Batch, Enrollment
+
+        batch = Batch.objects.create(course=self.nmcle_bds, name='2082 Batch')
+        Enrollment.objects.filter(user=self.nmcle_bds_student, course=self.nmcle_bds).update(batch=batch)
+        self.exam.assigned_batches.add(batch)
+
+        resp = self._start(self.nmcle_bds_student)
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+
+    def test_draft_exam_is_invisible_and_unstartable_even_when_course_assigned(self):
+        self.exam.is_draft = True
+        self.exam.save(update_fields=['is_draft'])
+
+        self.assertNotIn(self.exam.id, self._visible_ids(self.cee_mbbs_student))
+        resp = self._start(self.cee_mbbs_student)
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_new_exam_defaults_to_draft(self):
+        """Root-cause fix for spec item 7 — the model default alone must
+        keep an exam invisible even if the creating code (e.g. the Admin
+        create-exam form) never explicitly sets is_draft."""
+        bare = Test.objects.create(title='Untouched default', exam_type='mock')
+        self.assertTrue(bare.is_draft)
+
+    def test_legacy_unscoped_published_exam_stays_visible_under_needs_course_review(self):
+        """The migration escape hatch — an exam that predates this feature,
+        already published with no course assignment, must not vanish."""
+        legacy = Test.objects.create(title='Legacy Exam', exam_type='mock', is_draft=False, needs_course_review=True)
+
+        self.assertIn(legacy.id, self._visible_ids(self.cee_mbbs_student))
+        self.assertIn(legacy.id, self._visible_ids(self.nmcle_mbbs_student))
+
+    def test_staff_sees_and_can_start_any_exam_including_drafts(self):
+        self.exam.is_draft = True
+        self.exam.save(update_fields=['is_draft'])
+        self.assertIn(self.exam.id, self._visible_ids(self.staff))
+        resp = self._start(self.staff)
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+
+
+class AuditExamCourseAssignmentCommandTests(APITestCase):
+    def setUp(self):
+        from courses.models import Course
+
+        self.cee_mbbs = Course.objects.create(name='CEE-MBBS', prefix='CEEMBBS2')
+        self.cee_bds = Course.objects.create(name='CEE-BDS', prefix='CEEBDS2')
+        self.subject_single = Subject.objects.create(name='Biology (single-course)')
+        self.subject_single.courses.set([self.cee_mbbs])
+        self.subject_shared = Subject.objects.create(name='Shared Subject')
+        self.subject_shared.courses.set([self.cee_mbbs, self.cee_bds])
+        self.subject_none = Subject.objects.create(name='No-course Subject')
+
+    def test_dry_run_makes_no_changes(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        unambiguous = Test.objects.create(title='Unambiguous', exam_type='mock', is_draft=False, subject=self.subject_single)
+        call_command('audit_exam_course_assignment', stdout=StringIO())
+
+        unambiguous.refresh_from_db()
+        self.assertEqual(unambiguous.courses.count(), 0)
+        self.assertFalse(unambiguous.needs_course_review)
+
+    def test_apply_maps_unambiguous_subject_and_flags_the_rest(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        unambiguous = Test.objects.create(title='Unambiguous', exam_type='mock', is_draft=False, subject=self.subject_single)
+        ambiguous_shared = Test.objects.create(title='Ambiguous shared', exam_type='mock', is_draft=False, subject=self.subject_shared)
+        ambiguous_no_subject = Test.objects.create(title='No subject', exam_type='mock', is_draft=False)
+        already_scoped = Test.objects.create(title='Already scoped', exam_type='mock', is_draft=False)
+        already_scoped.courses.set([self.cee_mbbs])
+
+        call_command('audit_exam_course_assignment', '--apply', stdout=StringIO())
+
+        unambiguous.refresh_from_db()
+        self.assertEqual(list(unambiguous.courses.values_list('id', flat=True)), [self.cee_mbbs.id])
+        self.assertFalse(unambiguous.needs_course_review)
+
+        ambiguous_shared.refresh_from_db()
+        self.assertEqual(ambiguous_shared.courses.count(), 0)
+        self.assertTrue(ambiguous_shared.needs_course_review)
+
+        ambiguous_no_subject.refresh_from_db()
+        self.assertTrue(ambiguous_no_subject.needs_course_review)
+
+        already_scoped.refresh_from_db()
+        self.assertFalse(already_scoped.needs_course_review)
+        self.assertEqual(list(already_scoped.courses.values_list('id', flat=True)), [self.cee_mbbs.id])

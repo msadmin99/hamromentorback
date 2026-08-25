@@ -1,11 +1,24 @@
 from rest_framework import serializers
 
 from .models import (
+    Batch,
     Course,
     CoursePackage,
     Enrollment,
     EnrollmentRequest,
 )
+
+
+class BatchSerializer(serializers.ModelSerializer):
+    course_name = serializers.CharField(source='course.name', read_only=True)
+    student_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Batch
+        fields = ['id', 'course', 'course_name', 'name', 'is_active', 'student_count']
+
+    def get_student_count(self, obj):
+        return obj.enrollments.filter(is_active=True).count()
 
 
 class CoursePackageSerializer(serializers.ModelSerializer):
@@ -42,13 +55,14 @@ class EnrollmentSerializer(serializers.ModelSerializer):
     course_name = serializers.CharField(source='course.name', read_only=True)
     course_prefix = serializers.CharField(source='course.prefix', read_only=True)
     course_program_group = serializers.CharField(source='course.program_group', read_only=True)
+    batch_name = serializers.CharField(source='batch.name', read_only=True, default=None)
     active_devices = serializers.SerializerMethodField()
 
     class Meta:
         model = Enrollment
         fields = [
             'id', 'user', 'student_name', 'email', 'course', 'course_name', 'course_prefix', 'course_program_group',
-            'package', 'access_type', 'student_code', 'is_active', 'enrolled_at', 'expires_at',
+            'package', 'batch', 'batch_name', 'access_type', 'student_code', 'is_active', 'enrolled_at', 'expires_at',
             'active_devices',
         ]
 

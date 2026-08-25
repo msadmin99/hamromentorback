@@ -26,6 +26,24 @@ class Course(models.Model):
         return self.name
 
 
+class Batch(models.Model):
+    """A named cohort within one course (e.g. "2082 Batch") — lets an exam be
+    assigned to a specific intake instead of the whole course. Membership is
+    per-Enrollment (see Enrollment.batch below), not a separate M2M, since a
+    batch only ever makes sense in the context of one specific course
+    enrollment."""
+    course = models.ForeignKey(Course, on_delete=models.CASCADE, related_name='batches')
+    name = models.CharField(max_length=100, help_text='e.g. "2082 Batch"')
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ['course', 'name']
+        unique_together = ('course', 'name')
+
+    def __str__(self):
+        return f'{self.course.name} — {self.name}'
+
+
 class CoursePackage(models.Model):
     course = models.ForeignKey(Course, on_delete=models.CASCADE, related_name='packages')
     name = models.CharField(max_length=150)
@@ -43,6 +61,10 @@ class Enrollment(models.Model):
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='enrollments')
     course = models.ForeignKey(Course, on_delete=models.CASCADE, related_name='enrollments')
     package = models.ForeignKey(CoursePackage, on_delete=models.SET_NULL, null=True, blank=True)
+    batch = models.ForeignKey(
+        Batch, on_delete=models.SET_NULL, null=True, blank=True, related_name='enrollments',
+        help_text='Which intake/cohort of this course the student belongs to — used for batch-scoped exam assignment.',
+    )
     access_type = models.CharField(max_length=10, choices=ACCESS_CHOICES, default='free')
     student_code = models.CharField(max_length=20, unique=True, blank=True)
     is_active = models.BooleanField(default=True)
