@@ -46,6 +46,36 @@ def _course_scoped(qs, user, *, courses_lookup):
     return qs.filter(Q(**{isnull_lookup: True}) | Q(**{in_lookup: course_ids})).distinct()
 
 
+def _question_course_scoped(qs, user):
+    """Question-specific eligibility filter — NOT the same as _course_scoped
+    above. Question.courses is an optional, admin-facing narrowing field
+    ("a question can be shared across courses") that is, in real production
+    data, unpopulated on every single question — confirmed via
+    CourseSerializer.get_question_count returning 0 for every course after
+    this was live. Treating a blank Question.courses as unconditionally
+    'shared' (the same rule that's correct for Subject, which IS populated
+    for every real subject) would mean this filter restricts nothing at
+    all: every question in the platform would remain visible to every
+    student regardless of course, exactly the residual "Physics/Chemistry
+    still appear in CEE-PG practice" leak this whole audit exists to close.
+    The actually-populated, reliable per-course signal for a question is
+    its Subject's `courses` — so a question with no explicit tag of its own
+    inherits its subject's scope; an explicit Question.courses tag (if a
+    future admin workflow starts setting one) still overrides/narrows it."""
+    if user and user.is_authenticated and user.is_staff:
+        return qs
+    from django.db.models import Q as Q_
+
+    from courses.access import eligible_course_ids
+
+    course_ids = eligible_course_ids(user)
+    return qs.filter(
+        Q_(courses__id__in=course_ids)
+        | Q_(courses__isnull=True, subject__courses__id__in=course_ids)
+        | Q_(courses__isnull=True, subject__courses__isnull=True)
+    ).distinct()
+
+
 class SubjectViewSet(viewsets.ModelViewSet):
     queryset = Subject.objects.all().prefetch_related('courses')
     permission_classes = [IsStaffOrReadOnlyExcludingTeacherWrites]
@@ -195,7 +225,7 @@ class QuestionViewSet(viewsets.ModelViewSet):
             locked_subject_ids = _locked_subject_ids(user)
             if locked_subject_ids:
                 qs = qs.exclude(subject_id__in=locked_subject_ids)
-            qs = _course_scoped(qs, user, courses_lookup='courses')
+            qs = _question_course_scoped(qs, user)
         elif getattr(user, 'admin_role', None) == 'teacher' and not user.can_manage_all_content:
             qs = qs.filter(created_by=user)
 
@@ -416,7 +446,7 @@ class QuestionViewSet(viewsets.ModelViewSet):
         subject = request.query_params.get('subject')
         course = request.query_params.get('course')
 
-        question_qs = _course_scoped(Question.objects.all(), user, courses_lookup='courses')
+        question_qs = _question_course_scoped(Question.objects.all(), user)
         locked = _locked_subject_ids(user)
         if locked:
             question_qs = question_qs.exclude(subject_id__in=locked)
@@ -590,9 +620,9 @@ class QuestionViewSet(viewsets.ModelViewSet):
         user = request.user
         data = request.data
 
-        qs = _course_scoped(
+        qs = _question_course_scoped(
             Question.objects.all().select_related('subject', 'chapter').prefetch_related('options'),
-            user, courses_lookup='courses',
+            user,
         )
         locked = _locked_subject_ids(user)
         if locked:

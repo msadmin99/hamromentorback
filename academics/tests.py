@@ -834,10 +834,18 @@ class CompleteCourseScopingAuditTests(APITestCase):
         self.no_enrollment_student = User.objects.create_user(username='audit_none', email='audit_none@example.com', password='pw12345')
 
         def _subject_with_question(name, course):
+            # Question.courses is deliberately left BLANK here — matching
+            # real production data, where every Subject is explicitly
+            # course-scoped but no Question has ever had its own `courses`
+            # tag set. A question must inherit its subject's course scope
+            # when its own `courses` is blank (see
+            # academics.views._question_course_scoped) — this is the exact
+            # shape of the reported "Physics/Chemistry still appear in
+            # CEE-PG practice" bug, which explicit Question-level tagging
+            # (as in QuestionCourseScopingTests) would not have caught.
             subject = Subject.objects.create(name=name, is_free=True)
             subject.courses.set([course])
             question = Question.objects.create(subject=subject, text=f'{name} question 1')
-            question.courses.set([course])
             return subject, question
 
         self.physics, self.physics_q = _subject_with_question('Physics Audit', self.cee_ug)
@@ -916,6 +924,20 @@ class CompleteCourseScopingAuditTests(APITestCase):
             '/api/questions/practice-session/', {'count': 50, 'subject': self.physics.slug}, format='json',
         )
         self.assertEqual(resp.data, [])
+
+    def test_question_with_blank_courses_inherits_subject_course_scope(self):
+        """The exact real-data shape: every fixture question in this class
+        has a BLANK Question.courses (like every real question in
+        production) and relies entirely on inheriting its Subject's
+        courses. If a question with blank `courses` were ever treated as
+        unconditionally shared (the bug this test guards against), this
+        entire test class's course isolation would silently stop meaning
+        anything, since production has zero Question-level course tags."""
+        self.assertFalse(self.physics_q.courses.exists())
+        self.client.force_authenticate(user=self.cee_pg_student)
+        resp = self.client.post('/api/questions/practice-session/', {'count': 50}, format='json')
+        ids = {q['id'] for q in resp.data}
+        self.assertNotIn(self.physics_q.id, ids)
 
     # -- QBank dashboard -----------------------------------------------------
 
