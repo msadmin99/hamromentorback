@@ -376,3 +376,79 @@ class AuditExamCourseAssignmentCommandTests(APITestCase):
         already_scoped.refresh_from_db()
         self.assertFalse(already_scoped.needs_course_review)
         self.assertEqual(list(already_scoped.courses.values_list('id', flat=True)), [self.cee_mbbs.id])
+
+
+class AdminExamCreateEditApiTests(APITestCase):
+    """Regression coverage for the Admin exam-management Create/Edit form's
+    actual API calls — TestAdminSerializer.create()/update() must pop EVERY
+    M2M field (courses, assigned_students, assigned_batches) out of
+    validated_data before touching the instance, since Django raises
+    TypeError on both `Model(**kwargs)` and plain `setattr()` for M2M
+    fields. A prior version of this serializer only popped `courses`,
+    silently 500ing on every save once assigned_students/assigned_batches
+    were added to Meta.fields but not to create()/update() — caught here by
+    exercising the real endpoint, not just constructing Test objects
+    directly via the ORM the way the access-control tests above do."""
+
+    def setUp(self):
+        from courses.models import Course
+
+        self.staff = User.objects.create_user(
+            username='examstaff', email='examstaff@example.com', password='pw12345', is_staff=True, admin_role='admin',
+        )
+        self.student = User.objects.create_user(username='examstudent', email='examstudent@example.com', password='pw12345')
+        self.course = Course.objects.create(name='CEE-MBBS API Test', prefix='CEEAPITEST')
+        self.client.force_authenticate(user=self.staff)
+
+    def _payload(self, **overrides):
+        payload = {
+            'title': 'API Test Exam', 'exam_type': 'mock', 'courses': [self.course.id],
+            'assigned_students': [self.student.id], 'assigned_batches': [], 'is_draft': False,
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_create_with_courses_and_assigned_students_succeeds(self):
+        resp = self.client.post('/api/tests/', self._payload(), format='json')
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+
+        test = Test.objects.get(pk=resp.data['id'])
+        self.assertEqual(list(test.courses.values_list('id', flat=True)), [self.course.id])
+        self.assertEqual(list(test.assigned_students.values_list('id', flat=True)), [self.student.id])
+
+    def test_edit_updates_courses_and_assigned_students(self):
+        test = Test.objects.create(title='To edit', exam_type='mock')
+
+        resp = self.client.patch(f'/api/tests/{test.id}/', self._payload(), format='json')
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        test.refresh_from_db()
+        self.assertEqual(list(test.courses.values_list('id', flat=True)), [self.course.id])
+        self.assertEqual(list(test.assigned_students.values_list('id', flat=True)), [self.student.id])
+
+    def test_edit_clears_assignment_when_set_to_empty(self):
+        test = Test.objects.create(title='To clear', exam_type='mock')
+        test.courses.set([self.course])
+        test.assigned_students.set([self.student])
+
+        resp = self.client.patch(f'/api/tests/{test.id}/', self._payload(courses=[], assigned_students=[], is_draft=True), format='json')
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        test.refresh_from_db()
+        self.assertEqual(test.courses.count(), 0)
+        self.assertEqual(test.assigned_students.count(), 0)
+
+    def test_edit_without_touching_assignment_fields_leaves_them_unchanged(self):
+        """A PATCH that omits courses/assigned_students/assigned_batches
+        entirely (e.g. a partial update from some other future caller)
+        must not wipe existing assignment — matches the `is not None` guard
+        in TestAdminSerializer.update()."""
+        test = Test.objects.create(title='Partial patch', exam_type='mock')
+        test.courses.set([self.course])
+
+        resp = self.client.patch(f'/api/tests/{test.id}/', {'title': 'Partial patch — renamed'}, format='json')
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        test.refresh_from_db()
+        self.assertEqual(test.title, 'Partial patch — renamed')
+        self.assertEqual(list(test.courses.values_list('id', flat=True)), [self.course.id])

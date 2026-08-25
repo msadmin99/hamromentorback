@@ -159,12 +159,18 @@ class TestAdminSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         questions = validated_data.pop('selected_questions', [])
         courses = validated_data.pop('courses', [])
+        assigned_students = validated_data.pop('assigned_students', [])
+        assigned_batches = validated_data.pop('assigned_batches', [])
         request = self.context.get('request')
         if request and request.user.is_authenticated:
             validated_data['created_by'] = request.user
         test = Test.objects.create(**validated_data)
         if courses:
             test.courses.set(courses)
+        if assigned_students:
+            test.assigned_students.set(assigned_students)
+        if assigned_batches:
+            test.assigned_batches.set(assigned_batches)
         for i, q in enumerate(questions):
             TestQuestion.objects.create(test=test, question=q, order=i)
         return test
@@ -172,11 +178,17 @@ class TestAdminSerializer(serializers.ModelSerializer):
     def update(self, instance, validated_data):
         questions = validated_data.pop('selected_questions', None)
         courses = validated_data.pop('courses', None)
+        assigned_students = validated_data.pop('assigned_students', None)
+        assigned_batches = validated_data.pop('assigned_batches', None)
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
         instance.save()
         if courses is not None:
             instance.courses.set(courses)
+        if assigned_students is not None:
+            instance.assigned_students.set(assigned_students)
+        if assigned_batches is not None:
+            instance.assigned_batches.set(assigned_batches)
         if questions is not None:
             TestQuestion.objects.filter(test=instance).delete()
             for i, q in enumerate(questions):
