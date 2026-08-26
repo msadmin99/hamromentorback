@@ -89,9 +89,25 @@ class Topic(models.Model):
         return self.name
 
 
+class ReferenceBook(models.Model):
+    """Small lookup table backing Question.reference_book — avoids the same
+    book being typed (and misspelled) differently across thousands of
+    questions. Distinct from Question.references (generic JSON list of
+    supplementary papers/videos/links), which is untouched by this."""
+    name = models.CharField(max_length=255, unique=True)
+    author = models.CharField(max_length=255, blank=True)
+
+    class Meta:
+        ordering = ['name']
+
+    def __str__(self):
+        return self.name
+
+
 class Question(models.Model):
     DIFFICULTY_CHOICES = [
-        ('easy', 'Easy'), ('medium', 'Medium'), ('hard', 'Hard'), ('very_hard', 'Very Hard'),
+        ('very_easy', 'Very Easy'), ('easy', 'Easy'), ('medium', 'Moderate'),
+        ('hard', 'Difficult'), ('very_hard', 'Very Difficult'),
     ]
     QUESTION_TYPE_CHOICES = [
         ('conceptual', 'Conceptual'), ('recall', 'Recall'), ('clinical', 'Clinical'),
@@ -142,8 +158,24 @@ class Question(models.Model):
     references = models.JSONField(
         default=list, blank=True,
         help_text='Book citations, paper links, or YouTube links backing the explanation — '
-                   'each entry is {type: book|paper|video|link, label, url}.',
+                   'each entry is {type: book|paper|video|link, label, url}. Supplementary only — '
+                   'see reference_book below for the single structured primary citation.',
     )
+    key_takeaway = models.TextField(blank=True, help_text='One high-yield exam point shown after the explanation.')
+
+    reference_book = models.ForeignKey(
+        ReferenceBook, on_delete=models.SET_NULL, null=True, blank=True, related_name='questions',
+        help_text='Primary structured citation for this question — rendered in its own Reference card.',
+    )
+    reference_edition = models.CharField(max_length=50, blank=True)
+    reference_chapter = models.CharField(max_length=255, blank=True)
+    reference_page = models.CharField(max_length=50, blank=True, help_text='e.g. "245" or "245-247".')
+    reference_url = models.URLField(blank=True)
+
+    # Live incremental stats — updated by academics.services.record_question_result()
+    # on every answer, never recomputed from a full table scan at read time.
+    total_attempts = models.PositiveIntegerField(default=0, help_text='Distinct students with a current answer recorded. Not per-attempt.')
+    correct_attempts = models.PositiveIntegerField(default=0, help_text='Of total_attempts, how many are currently correct.')
 
     marks = models.DecimalField(max_digits=5, decimal_places=2, default=1)
     negative_marks = models.DecimalField(max_digits=5, decimal_places=2, default=0.25)
@@ -229,6 +261,11 @@ class Option(models.Model):
     latex = models.TextField(blank=True)
     is_correct = models.BooleanField(default=False)
     order = models.PositiveIntegerField(default=0)
+    explanation = models.TextField(blank=True, help_text='Why this option is right/wrong — shown per-option after submission.')
+
+    # pick_count is the raw, live-updated count backing pick_percentage
+    # (recomputed alongside it in record_question_result — see Question.total_attempts).
+    pick_count = models.PositiveIntegerField(default=0, help_text='Distinct students currently selecting this option.')
     pick_percentage = models.PositiveIntegerField(default=0, help_text='% of students who picked this option')
 
     class Meta:
@@ -297,6 +334,7 @@ class QuestionEvent(models.Model):
     question = models.ForeignKey(Question, on_delete=models.CASCADE, related_name='events')
     is_correct = models.BooleanField()
     source = models.CharField(max_length=10, choices=SOURCE_CHOICES)
+    time_taken_seconds = models.PositiveIntegerField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -313,13 +351,18 @@ class QuestionBankConfig(models.Model):
     min_attempts_for_difficulty = models.PositiveIntegerField(
         default=30, help_text='A question needs at least this many attempts before actual_difficulty is computed. Below this, actual_difficulty stays blank.',
     )
-    easy_min_pct = models.PositiveIntegerField(default=75, help_text='% correct at or above this = Easy.')
-    medium_min_pct = models.PositiveIntegerField(default=55, help_text='% correct at or above this (and below Easy) = Medium.')
-    hard_min_pct = models.PositiveIntegerField(default=30, help_text='% correct at or above this (and below Medium) = Hard. Below this = Very Hard.')
+    very_easy_min_pct = models.PositiveIntegerField(default=90, help_text='% correct at or above this = Very Easy.')
+    easy_min_pct = models.PositiveIntegerField(default=75, help_text='% correct at or above this (and below Very Easy) = Easy.')
+    medium_min_pct = models.PositiveIntegerField(default=50, help_text='% correct at or above this (and below Easy) = Moderate.')
+    hard_min_pct = models.PositiveIntegerField(default=30, help_text='% correct at or above this (and below Moderate) = Difficult. Below this = Very Difficult.')
     mastered_min_pct = models.PositiveIntegerField(default=80, help_text="Student's own accuracy on a question at/above this (with >=2 attempts) = Mastered.")
     weak_max_pct = models.PositiveIntegerField(default=40, help_text="Student's own accuracy on a question at/below this = Weak.")
     revision_interval_correct_days = models.PositiveIntegerField(default=7)
     revision_interval_incorrect_days = models.PositiveIntegerField(default=1)
+    min_attempts_for_option_stats = models.PositiveIntegerField(
+        default=5, help_text='A question needs at least this many recorded students before option percentages / '
+                              '"X% got this right" are shown. Below this, a privacy-safe message is shown instead.',
+    )
 
     class Meta:
         verbose_name = 'Question Bank settings'
@@ -339,6 +382,61 @@ class QuestionBankConfig(models.Model):
     def load(cls):
         obj, _ = cls.objects.get_or_create(pk=1)
         return obj
+
+
+class QuestionReport(models.Model):
+    """A student flagging a problem with a question — reviewed by staff via
+    a dedicated admin queue (Admin/src/app/question-reports/), never shown
+    to other students. Course/exam eligibility is enforced at creation time
+    (QuestionViewSet.report() only allows reporting a question the reporter
+    can already see via the normal course-scoped get_queryset()), not
+    re-checked here — a report about content the student later loses access
+    to should still be reviewable by staff."""
+    REASON_CHOICES = [
+        ('incorrect_answer', 'Incorrect answer'),
+        ('incorrect_explanation', 'Incorrect explanation'),
+        ('ambiguous', 'Ambiguous question'),
+        ('typo', 'Typographical error'),
+        ('outdated', 'Outdated information'),
+        ('poor_image', 'Poor image'),
+        ('other', 'Other'),
+    ]
+    STATUS_CHOICES = [('open', 'Open'), ('reviewed', 'Reviewed'), ('dismissed', 'Dismissed')]
+
+    question = models.ForeignKey(Question, on_delete=models.CASCADE, related_name='reports')
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='question_reports')
+    reason = models.CharField(max_length=25, choices=REASON_CHOICES)
+    comment = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='open')
+    reviewed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='+',
+    )
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [models.Index(fields=['status', '-created_at'])]
+
+    def __str__(self):
+        return f'{self.get_reason_display()} — {self.question_id}'
+
+
+class QuestionDifficultyRating(models.Model):
+    """A student's own subjective difficulty rating — deliberately kept
+    separate from Question.actual_difficulty (computed objectively from
+    real correct/incorrect data by recompute_question_difficulty). One row
+    per (question, user); re-rating updates rather than duplicates."""
+    RATING_CHOICES = [('easy', 'Easy'), ('moderate', 'Moderate'), ('difficult', 'Difficult')]
+
+    question = models.ForeignKey(Question, on_delete=models.CASCADE, related_name='difficulty_ratings')
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='+')
+    rating = models.CharField(max_length=10, choices=RATING_CHOICES)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ('question', 'user')
 
 
 class ImportBatch(models.Model):

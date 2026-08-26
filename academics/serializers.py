@@ -3,7 +3,7 @@ from rest_framework import serializers
 from courses.models import Course
 from media_library.serializers import resolve_image_data
 
-from .models import Chapter, Option, Question, QuestionAttempt, Subject, Topic
+from .models import Chapter, Option, Question, QuestionAttempt, QuestionReport, ReferenceBook, Subject, Topic
 
 
 class TopicSerializer(serializers.ModelSerializer):
@@ -105,22 +105,34 @@ class SubjectDetailSerializer(SubjectListSerializer):
 
 
 class OptionSerializer(serializers.ModelSerializer):
+    """Public, pre-submission shape — deliberately excludes pick_percentage
+    (and is_correct, already excluded) so a student never receives answer
+    statistics before they've actually submitted an answer. The `answer`
+    action attaches percentages to its own response instead, not to this
+    serializer, once the student has actually answered."""
     image_data = serializers.SerializerMethodField()
 
     class Meta:
         model = Option
-        fields = ['id', 'text', 'image', 'image_data', 'latex', 'order', 'pick_percentage']
+        fields = ['id', 'text', 'image', 'image_data', 'latex', 'order']
 
     def get_image_data(self, obj):
         return resolve_image_data(obj.image_asset, obj.image)
 
 
 class OptionAdminSerializer(serializers.ModelSerializer):
+    """Used by QuestionAdminSerializer (staff editing) and
+    QuestionResultSerializer (student post-submission Test Mode review) —
+    both contexts where revealing is_correct/pick_percentage/explanation
+    is correct, unlike the public pre-submission OptionSerializer above."""
     image_data = serializers.SerializerMethodField()
 
     class Meta:
         model = Option
-        fields = ['id', 'text', 'image', 'image_asset', 'image_data', 'latex', 'order', 'pick_percentage', 'is_correct']
+        fields = [
+            'id', 'text', 'image', 'image_asset', 'image_data', 'latex', 'order',
+            'explanation', 'pick_count', 'pick_percentage', 'is_correct',
+        ]
 
     def get_image_data(self, obj):
         return resolve_image_data(obj.image_asset, obj.image)
@@ -131,6 +143,7 @@ class QuestionSerializer(serializers.ModelSerializer):
     options = OptionSerializer(many=True, read_only=True)
     subject_name = serializers.CharField(source='subject.name', read_only=True)
     chapter_name = serializers.CharField(source='chapter.name', read_only=True)
+    topic_name = serializers.CharField(source='topic.name', read_only=True)
     image_data = serializers.SerializerMethodField()
     is_bookmarked = serializers.SerializerMethodField()
     mastery_status = serializers.SerializerMethodField()
@@ -141,7 +154,8 @@ class QuestionSerializer(serializers.ModelSerializer):
         model = Question
         fields = [
             'id', 'public_id', 'text', 'image', 'image_data', 'latex', 'marks', 'negative_marks',
-            'year', 'subject', 'subject_name', 'chapter', 'chapter_name', 'topic', 'options', 'is_bookmarked',
+            'year', 'subject', 'subject_name', 'chapter', 'chapter_name', 'topic', 'topic_name',
+            'options', 'is_bookmarked',
             'instructor_difficulty', 'actual_difficulty', 'question_type', 'tags',
             'mastery_status', 'is_incorrect', 'is_revision_due',
         ]
@@ -175,24 +189,36 @@ class QuestionSerializer(serializers.ModelSerializer):
         return due <= timezone.now()
 
 
+class ReferenceBookSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ReferenceBook
+        fields = ['id', 'name', 'author']
+
+
 class QuestionAdminSerializer(serializers.ModelSerializer):
     options = OptionAdminSerializer(many=True)
     created_by_name = serializers.SerializerMethodField()
     image_data = serializers.SerializerMethodField()
     explanation_image_data = serializers.SerializerMethodField()
+    reference_book_name = serializers.CharField(source='reference_book.name', read_only=True, default='')
 
     class Meta:
         model = Question
         fields = [
             'id', 'public_id', 'text', 'image', 'image_asset', 'image_data', 'latex',
             'explanation', 'explanation_image', 'explanation_image_asset', 'explanation_image_data',
-            'explanation_latex', 'explanation_video_url', 'references',
+            'explanation_latex', 'explanation_video_url', 'references', 'key_takeaway',
+            'reference_book', 'reference_book_name', 'reference_edition', 'reference_chapter',
+            'reference_page', 'reference_url',
             'marks', 'negative_marks', 'remarks', 'year', 'past_exam_years',
             'subject', 'chapter', 'topic', 'courses', 'options', 'created_by_name',
             'instructor_difficulty', 'actual_difficulty', 'actual_difficulty_sample_size',
-            'question_type', 'tags',
+            'question_type', 'tags', 'total_attempts', 'correct_attempts',
         ]
-        read_only_fields = ['public_id', 'actual_difficulty', 'actual_difficulty_sample_size']
+        read_only_fields = [
+            'public_id', 'actual_difficulty', 'actual_difficulty_sample_size',
+            'total_attempts', 'correct_attempts',
+        ]
 
     def get_created_by_name(self, obj):
         if not obj.created_by_id:
@@ -236,23 +262,33 @@ class QuestionAdminSerializer(serializers.ModelSerializer):
 class AnswerSubmitSerializer(serializers.Serializer):
     option_id = serializers.IntegerField(required=False, allow_null=True)
     bookmark = serializers.BooleanField(required=False, default=False)
+    time_taken_seconds = serializers.IntegerField(required=False, allow_null=True, min_value=0)
 
 
 class QuestionResultSerializer(serializers.ModelSerializer):
+    """Post-submission review shape (Test Mode result screen, and the
+    shared piece of QuestionViewSet.answer()'s own response) — safe to
+    reveal is_correct/pick_percentage/key_takeaway/reference here, since
+    the student has already answered (or the test is already submitted)."""
     options = OptionAdminSerializer(many=True, read_only=True)
     subject_name = serializers.CharField(source='subject.name', read_only=True)
     selected_option_id = serializers.SerializerMethodField()
     is_correct = serializers.SerializerMethodField()
     image_data = serializers.SerializerMethodField()
     explanation_image_data = serializers.SerializerMethodField()
+    reference_book_name = serializers.CharField(source='reference_book.name', read_only=True, default='')
+    stats_available = serializers.SerializerMethodField()
+    students_correct_percent = serializers.SerializerMethodField()
 
     class Meta:
         model = Question
         fields = [
             'id', 'public_id', 'text', 'image', 'image_data', 'latex',
             'explanation', 'explanation_image', 'explanation_image_data', 'explanation_latex',
-            'explanation_video_url', 'references',
+            'explanation_video_url', 'references', 'key_takeaway',
+            'reference_book_name', 'reference_edition', 'reference_chapter', 'reference_page', 'reference_url',
             'subject_name', 'options', 'selected_option_id', 'is_correct',
+            'stats_available', 'students_correct_percent',
         ]
 
     def get_image_data(self, obj):
@@ -265,7 +301,59 @@ class QuestionResultSerializer(serializers.ModelSerializer):
         attempt = self.context.get('attempt_map', {}).get(obj.id)
         return attempt.selected_option_id if attempt else None
 
+    def _min_attempts(self):
+        # Passed in via context by the caller (avoids one QuestionBankConfig
+        # lookup per question in a list of dozens) — falls back to loading
+        # it directly for any caller that doesn't set it.
+        if 'min_attempts_for_option_stats' in self.context:
+            return self.context['min_attempts_for_option_stats']
+        from .models import QuestionBankConfig
+        return QuestionBankConfig.load().min_attempts_for_option_stats
+
+    def get_stats_available(self, obj):
+        return obj.total_attempts >= self._min_attempts()
+
+    def get_students_correct_percent(self, obj):
+        if obj.total_attempts < self._min_attempts():
+            return None
+        return round(obj.correct_attempts / obj.total_attempts * 100)
+
     def get_is_correct(self, obj):
         attempt = self.context.get('attempt_map', {}).get(obj.id)
         return attempt.is_correct if attempt else False
+
+
+class QuestionReportSerializer(serializers.ModelSerializer):
+    """Student-facing create shape (question/user set server-side in the
+    view, never trusted from the client) and staff-facing review shape —
+    reason/comment/status only, no student identity fields at all here;
+    the admin queue surfaces `reporter_role` instead (see
+    QuestionReportViewSet), never a name/email/ID."""
+
+    class Meta:
+        model = QuestionReport
+        fields = ['id', 'question', 'reason', 'comment', 'status', 'created_at']
+        # `question` is set by the view from the URL's pk (via get_object(),
+        # which already enforces course-eligibility) — never trust a
+        # client-supplied question id here, and don't require one either.
+        read_only_fields = ['id', 'question', 'status', 'created_at']
+
+
+class QuestionReportAdminSerializer(serializers.ModelSerializer):
+    question_text = serializers.CharField(source='question.text', read_only=True)
+    question_public_id = serializers.CharField(source='question.public_id', read_only=True)
+    reviewed_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = QuestionReport
+        fields = [
+            'id', 'question', 'question_text', 'question_public_id', 'reason', 'comment',
+            'status', 'created_at', 'reviewed_by_name', 'reviewed_at',
+        ]
+        read_only_fields = ['id', 'question', 'reason', 'comment', 'created_at', 'reviewed_by_name', 'reviewed_at']
+
+    def get_reviewed_by_name(self, obj):
+        if not obj.reviewed_by_id:
+            return ''
+        return obj.reviewed_by.first_name or obj.reviewed_by.email
 

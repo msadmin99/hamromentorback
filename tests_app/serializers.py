@@ -308,6 +308,7 @@ class SubmitAnswerSerializer(serializers.Serializer):
     question_id = serializers.IntegerField()
     option_id = serializers.IntegerField(required=False, allow_null=True)
     mark_for_review = serializers.BooleanField(required=False, default=False)
+    time_taken_seconds = serializers.IntegerField(required=False, allow_null=True, min_value=0)
 
 
 class TestAttemptSummarySerializer(serializers.ModelSerializer):
@@ -381,4 +382,9 @@ class TestResultSerializer(serializers.ModelSerializer):
         elif filter_type == 'correct':
             questions = [q for q in questions if attempt_map[q.id].is_correct]
 
-        return QuestionResultSerializer(questions, many=True, context={'attempt_map': attempt_map}).data
+        from academics.models import QuestionBankConfig
+        context = {
+            'attempt_map': attempt_map,
+            'min_attempts_for_option_stats': QuestionBankConfig.load().min_attempts_for_option_stats,
+        }
+        return QuestionResultSerializer(questions, many=True, context=context).data

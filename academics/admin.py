@@ -1,6 +1,9 @@
 from django.contrib import admin
 
-from .models import Chapter, Option, Question, QuestionAttempt, QuestionBankConfig, QuestionEvent, Subject, Topic
+from .models import (
+    Chapter, Option, Question, QuestionAttempt, QuestionBankConfig, QuestionDifficultyRating,
+    QuestionEvent, QuestionReport, ReferenceBook, Subject, Topic,
+)
 
 
 class ChapterInline(admin.TabularInline):
@@ -62,3 +65,24 @@ class QuestionBankConfigAdmin(admin.ModelAdmin):
 
     def has_delete_permission(self, request, obj=None):
         return False
+
+
+@admin.register(ReferenceBook)
+class ReferenceBookAdmin(admin.ModelAdmin):
+    list_display = ('name', 'author')
+    search_fields = ('name', 'author')
+
+
+@admin.register(QuestionReport)
+class QuestionReportAdmin(admin.ModelAdmin):
+    """The Next.js Admin panel's Question Reports page is the primary
+    review workflow — this is a debugging/backstop view."""
+    list_display = ('question', 'reason', 'status', 'created_at', 'reviewed_by')
+    list_filter = ('status', 'reason')
+    readonly_fields = ('question', 'user', 'reason', 'comment', 'created_at')
+
+
+@admin.register(QuestionDifficultyRating)
+class QuestionDifficultyRatingAdmin(admin.ModelAdmin):
+    list_display = ('question', 'user', 'rating', 'created_at')
+    list_filter = ('rating',)

@@ -451,6 +451,7 @@ class SubmitAnswerView(APIView):
                 'selected_option': selected_option,
                 'is_correct': is_correct,
                 'is_marked_for_review': data.get('mark_for_review', False),
+                'time_taken_seconds': data.get('time_taken_seconds'),
             },
         )
         return Response({'saved': True})
@@ -484,7 +485,10 @@ class SubmitTestView(APIView):
                 # still deciding) — this is the platform-wide feed into Weak/Mastered/
                 # Mistake Bank alongside QBank practice. Additive only: doesn't touch
                 # Answer/TestAttempt/scoring above.
-                record_question_result(request.user, q, answer.is_correct, source='test', selected_option=answer.selected_option)
+                record_question_result(
+                    request.user, q, answer.is_correct, source='test',
+                    selected_option=answer.selected_option, time_taken_seconds=answer.time_taken_seconds,
+                )
 
         attempt.score = round(score, 2)
         attempt.accuracy = round((correct / answered) * 100, 2) if answered else 0

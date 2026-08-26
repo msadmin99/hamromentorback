@@ -278,6 +278,7 @@ class Answer(models.Model):
     selected_option = models.ForeignKey('academics.Option', on_delete=models.SET_NULL, null=True, blank=True)
     is_correct = models.BooleanField(default=False)
     is_marked_for_review = models.BooleanField(default=False)
+    time_taken_seconds = models.PositiveIntegerField(null=True, blank=True)
 
     class Meta:
         unique_together = ('attempt', 'question')

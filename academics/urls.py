@@ -17,7 +17,9 @@ from .views import (
     ChapterViewSet,
     QuestionExcelImportView,
     QuestionExcelTemplateView,
+    QuestionReportViewSet,
     QuestionViewSet,
+    ReferenceBookViewSet,
     SubjectViewSet,
     TopicViewSet,
 )
@@ -27,6 +29,8 @@ router.register('subjects', SubjectViewSet, basename='subject')
 router.register('chapters', ChapterViewSet, basename='chapter')
 router.register('topics', TopicViewSet, basename='topic')
 router.register('questions', QuestionViewSet, basename='question')
+router.register('reference-books', ReferenceBookViewSet, basename='reference-book')
+router.register('question-reports', QuestionReportViewSet, basename='question-report')
 
 urlpatterns = [
     path('questions-excel/template/', QuestionExcelTemplateView.as_view(), name='question-excel-template'),

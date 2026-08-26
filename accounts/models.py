@@ -67,11 +67,12 @@ class User(AbstractUser):
 # Admin/Super-Admin only regardless of what's saved in RolePermission.
 EDITOR_ALLOWED_FEATURES = [
     'question_bank', 'question_entry', 'video_lectures', 'test_series', 'daily_live_exam', 'self_mock_test', 'mock_test',
+    'question_reports',
 ]
 
 ALL_FEATURES = [
     'dashboard', 'courses', 'question_bank', 'question_entry', 'video_lectures', 'daily_practice', 'students',
-    'test_series', 'self_mock_test', 'enrollment_requests', 'daily_live_exam', 'mock_test',
+    'test_series', 'self_mock_test', 'enrollment_requests', 'question_reports', 'daily_live_exam', 'mock_test',
     'website_settings', 'advanced', 'billing', 'teacher_applications', 'marketplace_courses',
 ]
 

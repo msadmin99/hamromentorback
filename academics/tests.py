@@ -9,7 +9,10 @@ from rest_framework.test import APITestCase
 
 from academics.import_dedup import existing_texts_for_subject, find_duplicate, normalize_option_set, normalize_text
 from academics.importers.docx_parser import parse_docx
-from academics.models import Chapter, ImportBatch, ImportRow, Option, Question, QuestionAttempt, Subject, Topic
+from academics.models import (
+    Chapter, ImportBatch, ImportRow, Option, Question, QuestionAttempt, QuestionBankConfig,
+    QuestionDifficultyRating, QuestionEvent, QuestionReport, ReferenceBook, Subject, Topic,
+)
 from core.models import DeletionAuditLog
 from tests_app.models import Test, TestAttempt, TestQuestion
 
@@ -986,3 +989,226 @@ class CompleteCourseScopingAuditTests(APITestCase):
         resp = self.client.get(f'/api/topics/?chapter={chapter.id}')
         ids = {t['id'] for t in resp.data}
         self.assertNotIn(topic.id, ids)
+
+
+class RecordQuestionResultStatMathTests(TestCase):
+    """Question.total_attempts/correct_attempts and Option.pick_count/
+    pick_percentage must reflect one vote per distinct student — a retry
+    moves the vote, it never adds another — per the signed-delta design in
+    academics.services.record_question_result. This is what keeps "X% of
+    students got this right" honest instead of inflating on every retry."""
+
+    def setUp(self):
+        self.subject = Subject.objects.create(name='Stats Subject')
+        self.question = Question.objects.create(subject=self.subject, text='Stats question')
+        self.opt_a = Option.objects.create(question=self.question, text='A', is_correct=True, order=1)
+        self.opt_b = Option.objects.create(question=self.question, text='B', is_correct=False, order=2)
+        self.student1 = User.objects.create_user(username='stats1', email='stats1@example.com', password='pw12345')
+        self.student2 = User.objects.create_user(username='stats2', email='stats2@example.com', password='pw12345')
+
+    def test_first_attempt_increments_totals_and_pick_count(self):
+        from academics.services import record_question_result
+
+        record_question_result(self.student1, self.question, True, source='qbank', selected_option=self.opt_a)
+
+        self.question.refresh_from_db()
+        self.opt_a.refresh_from_db()
+        self.assertEqual(self.question.total_attempts, 1)
+        self.assertEqual(self.question.correct_attempts, 1)
+        self.assertEqual(self.opt_a.pick_count, 1)
+        self.assertEqual(self.opt_a.pick_percentage, 100)
+
+    def test_reanswer_same_option_does_not_double_count(self):
+        from academics.services import record_question_result
+
+        record_question_result(self.student1, self.question, True, source='qbank', selected_option=self.opt_a)
+        record_question_result(self.student1, self.question, True, source='qbank', selected_option=self.opt_a)
+
+        self.question.refresh_from_db()
+        self.opt_a.refresh_from_db()
+        self.assertEqual(self.question.total_attempts, 1)
+        self.assertEqual(self.opt_a.pick_count, 1)
+
+    def test_reanswer_different_option_moves_the_vote_not_adds_one(self):
+        from academics.services import record_question_result
+
+        record_question_result(self.student1, self.question, False, source='qbank', selected_option=self.opt_b)
+        record_question_result(self.student1, self.question, True, source='qbank', selected_option=self.opt_a)
+
+        self.question.refresh_from_db()
+        self.opt_a.refresh_from_db()
+        self.opt_b.refresh_from_db()
+        self.assertEqual(self.question.total_attempts, 1)
+        self.assertEqual(self.question.correct_attempts, 1)
+        self.assertEqual(self.opt_a.pick_count, 1)
+        self.assertEqual(self.opt_b.pick_count, 0)
+
+    def test_percentages_sum_to_approximately_100_across_students(self):
+        from academics.services import record_question_result
+
+        record_question_result(self.student1, self.question, True, source='qbank', selected_option=self.opt_a)
+        record_question_result(self.student2, self.question, False, source='qbank', selected_option=self.opt_b)
+
+        self.question.refresh_from_db()
+        self.opt_a.refresh_from_db()
+        self.opt_b.refresh_from_db()
+        self.assertEqual(self.question.total_attempts, 2)
+        self.assertEqual(self.question.correct_attempts, 1)
+        total_pct = self.opt_a.pick_percentage + self.opt_b.pick_percentage
+        self.assertIn(total_pct, (99, 100, 101))  # rounding tolerance
+
+    def test_time_taken_seconds_recorded_on_question_event(self):
+        from academics.services import record_question_result
+
+        record_question_result(
+            self.student1, self.question, True, source='qbank',
+            selected_option=self.opt_a, time_taken_seconds=42,
+        )
+
+        event = QuestionEvent.objects.get(user=self.student1, question=self.question)
+        self.assertEqual(event.time_taken_seconds, 42)
+
+
+class AnswerActionStatsVisibilityTests(APITestCase):
+    """The 'don't reveal stats before submission' / 'privacy-safe below a
+    minimum sample size' rules from the QBank redesign spec."""
+
+    def setUp(self):
+        self.subject = Subject.objects.create(name='Answer Stats Subject', is_free=True)
+        self.question = Question.objects.create(subject=self.subject, text='Answer stats question')
+        self.opt_correct = Option.objects.create(question=self.question, text='Right', is_correct=True, order=1)
+        self.opt_wrong = Option.objects.create(question=self.question, text='Wrong', is_correct=False, order=2)
+        self.student = User.objects.create_user(username='ansstats', email='ansstats@example.com', password='pw12345')
+        self.client.force_authenticate(user=self.student)
+
+    def test_pre_submission_question_detail_never_includes_pick_percentage(self):
+        resp = self.client.get(f'/api/questions/{self.question.id}/')
+        for opt in resp.data['options']:
+            self.assertNotIn('pick_percentage', opt)
+            self.assertNotIn('is_correct', opt)
+
+    def test_answer_response_privacy_safe_below_threshold(self):
+        resp = self.client.post(f'/api/questions/{self.question.id}/answer/', {'option_id': self.opt_correct.id}, format='json')
+        self.assertFalse(resp.data['stats_available'])
+        self.assertIsNone(resp.data['students_correct_percent'])
+        for opt in resp.data['options']:
+            self.assertIsNone(opt['pick_percentage'])
+
+    def test_answer_response_shows_stats_at_or_above_threshold(self):
+        config = QuestionBankConfig.load()
+        config.min_attempts_for_option_stats = 1
+        config.save()
+
+        resp = self.client.post(f'/api/questions/{self.question.id}/answer/', {'option_id': self.opt_correct.id}, format='json')
+        self.assertTrue(resp.data['stats_available'])
+        self.assertEqual(resp.data['students_correct_percent'], 100)
+        percentages = {opt['id']: opt['pick_percentage'] for opt in resp.data['options']}
+        self.assertEqual(percentages[self.opt_correct.id], 100)
+
+    def test_answer_response_includes_key_takeaway_and_structured_reference(self):
+        book = ReferenceBook.objects.create(name='Robbins & Cotran')
+        self.question.key_takeaway = 'High yield point'
+        self.question.reference_book = book
+        self.question.reference_edition = '10th'
+        self.question.reference_chapter = 'Hemodynamic Disorders'
+        self.question.reference_page = '123'
+        self.question.save()
+
+        resp = self.client.post(f'/api/questions/{self.question.id}/answer/', {'option_id': self.opt_correct.id}, format='json')
+        self.assertEqual(resp.data['key_takeaway'], 'High yield point')
+        self.assertEqual(resp.data['reference_book_name'], 'Robbins & Cotran')
+        self.assertEqual(resp.data['reference_edition'], '10th')
+        self.assertEqual(resp.data['reference_chapter'], 'Hemodynamic Disorders')
+        self.assertEqual(resp.data['reference_page'], '123')
+
+
+class QuestionReportTests(APITestCase):
+    def setUp(self):
+        self.subject = Subject.objects.create(name='Report Subject', is_free=True)
+        self.question = Question.objects.create(subject=self.subject, text='Report question')
+        self.student = User.objects.create_user(username='reporter', email='reporter@example.com', password='pw12345')
+        self.staff = User.objects.create_user(
+            username='report_staff', email='report_staff@example.com', password='pw12345', is_staff=True, admin_role='admin',
+        )
+
+    def test_student_can_report_a_visible_question(self):
+        self.client.force_authenticate(user=self.student)
+        resp = self.client.post(
+            f'/api/questions/{self.question.id}/report/',
+            {'reason': 'incorrect_answer', 'comment': 'The marked answer looks wrong.'},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        report = QuestionReport.objects.get()
+        self.assertEqual(report.user, self.student)
+        self.assertEqual(report.question, self.question)
+        self.assertEqual(report.status, 'open')
+
+    def test_student_cannot_report_a_question_from_an_unrelated_course(self):
+        from courses.models import Course
+
+        other_course = Course.objects.create(name='Report Other Course', prefix='REPORTOTHER')
+        self.subject.courses.set([other_course])  # now scoped away from self.student (no enrollment anywhere)
+        self.client.force_authenticate(user=self.student)
+
+        resp = self.client.post(f'/api/questions/{self.question.id}/report/', {'reason': 'other'}, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_report_list_is_admin_only(self):
+        self.client.force_authenticate(user=self.student)
+        resp = self.client.get('/api/question-reports/')
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_admin_can_list_and_resolve_reports(self):
+        QuestionReport.objects.create(question=self.question, user=self.student, reason='typo', comment='x')
+        self.client.force_authenticate(user=self.staff)
+
+        list_resp = self.client.get('/api/question-reports/?status=open')
+        self.assertEqual(len(list_resp.data), 1)
+
+        report_id = list_resp.data[0]['id']
+        patch_resp = self.client.patch(f'/api/question-reports/{report_id}/', {'status': 'reviewed'}, format='json')
+        self.assertEqual(patch_resp.status_code, status.HTTP_200_OK)
+        report = QuestionReport.objects.get(pk=report_id)
+        self.assertEqual(report.status, 'reviewed')
+        self.assertEqual(report.reviewed_by, self.staff)
+        self.assertIsNotNone(report.reviewed_at)
+
+    def test_report_never_exposes_student_identity_fields(self):
+        QuestionReport.objects.create(question=self.question, user=self.student, reason='typo')
+        self.client.force_authenticate(user=self.staff)
+        resp = self.client.get('/api/question-reports/')
+        keys = set(resp.data[0].keys())
+        self.assertFalse(keys & {'user', 'user_email', 'user_name', 'student_email', 'student_name'})
+
+
+class DifficultyRatingTests(APITestCase):
+    def setUp(self):
+        self.subject = Subject.objects.create(name='Difficulty Rating Subject', is_free=True)
+        self.question = Question.objects.create(subject=self.subject, text='Difficulty rating question')
+        self.student = User.objects.create_user(username='rater', email='rater@example.com', password='pw12345')
+        self.client.force_authenticate(user=self.student)
+
+    def test_rate_difficulty_creates_then_updates_on_rerate(self):
+        resp1 = self.client.post(f'/api/questions/{self.question.id}/rate-difficulty/', {'rating': 'easy'}, format='json')
+        self.assertEqual(resp1.status_code, status.HTTP_200_OK)
+        self.assertEqual(QuestionDifficultyRating.objects.count(), 1)
+
+        resp2 = self.client.post(f'/api/questions/{self.question.id}/rate-difficulty/', {'rating': 'difficult'}, format='json')
+        self.assertEqual(resp2.status_code, status.HTTP_200_OK)
+        self.assertEqual(QuestionDifficultyRating.objects.count(), 1)
+        rating = QuestionDifficultyRating.objects.get()
+        self.assertEqual(rating.rating, 'difficult')
+
+    def test_invalid_rating_rejected(self):
+        resp = self.client.post(f'/api/questions/{self.question.id}/rate-difficulty/', {'rating': 'nonsense'}, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_rate_difficulty_respects_course_scoping(self):
+        from courses.models import Course
+
+        other_course = Course.objects.create(name='Rating Other Course', prefix='RATEOTHER')
+        self.subject.courses.set([other_course])
+
+        resp = self.client.post(f'/api/questions/{self.question.id}/rate-difficulty/', {'rating': 'easy'}, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)

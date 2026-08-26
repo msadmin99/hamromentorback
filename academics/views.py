@@ -11,12 +11,18 @@ from rest_framework.views import APIView
 from hamromentor.permissions import IsStaffOrReadOnly, IsStaffOrReadOnlyExcludingTeacherWrites
 
 from .excel import import_workbook, template_response
-from .models import Chapter, Option, Question, QuestionAttempt, QuestionEvent, Subject, Topic
+from .models import (
+    Chapter, Option, Question, QuestionAttempt, QuestionBankConfig, QuestionDifficultyRating,
+    QuestionEvent, QuestionReport, ReferenceBook, Subject, Topic,
+)
 from .serializers import (
     AnswerSubmitSerializer,
     ChapterSerializer,
     QuestionAdminSerializer,
+    QuestionReportAdminSerializer,
+    QuestionReportSerializer,
     QuestionSerializer,
+    ReferenceBookSerializer,
     SubjectDetailSerializer,
     SubjectListSerializer,
     TopicSerializer,
@@ -380,6 +386,7 @@ class QuestionViewSet(viewsets.ModelViewSet):
         serializer = AnswerSubmitSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         option_id = serializer.validated_data.get('option_id')
+        time_taken_seconds = serializer.validated_data.get('time_taken_seconds')
 
         selected_option = None
         is_correct = False
@@ -391,9 +398,36 @@ class QuestionViewSet(viewsets.ModelViewSet):
             # bookmark to False on every plain answer (bool("False") is True, and
             # the serializer's bookmark default is always present in
             # validated_data even when the client never sent the key).
-            record_question_result(request.user, question, is_correct, source='qbank', selected_option=selected_option)
+            record_question_result(
+                request.user, question, is_correct, source='qbank',
+                selected_option=selected_option, time_taken_seconds=time_taken_seconds,
+            )
+            # record_question_result updates Question.total_attempts/correct_attempts
+            # and Option.pick_count/pick_percentage via .update() on the DB rows
+            # directly (for atomicity under concurrent answers) — the in-memory
+            # `question`/its .options here predate that write, so re-fetch fresh.
+            question.refresh_from_db(fields=['total_attempts', 'correct_attempts'])
 
         correct_option = question.options.filter(is_correct=True).first()
+        config = QuestionBankConfig.load()
+        stats_available = bool(option_id) and question.total_attempts >= config.min_attempts_for_option_stats
+
+        options_payload = None
+        if option_id:
+            # Option.objects.filter(...), not question.options.all() — the
+            # latter reuses this queryset's .prefetch_related('options')
+            # cache from before record_question_result() just updated
+            # pick_count/pick_percentage via .update(), which would silently
+            # serve stale (pre-answer) percentages.
+            options_payload = [
+                {
+                    'id': opt.id,
+                    'pick_percentage': opt.pick_percentage if stats_available else None,
+                    'explanation': opt.explanation,
+                }
+                for opt in Option.objects.filter(question_id=question.id).order_by('order')
+            ]
+
         return Response({
             'is_correct': is_correct,
             'correct_option_id': correct_option.id if correct_option else None,
@@ -402,6 +436,17 @@ class QuestionViewSet(viewsets.ModelViewSet):
             'explanation_latex': question.explanation_latex,
             'explanation_video_url': question.explanation_video_url,
             'references': question.references,
+            'key_takeaway': question.key_takeaway,
+            'reference_book_name': question.reference_book.name if question.reference_book_id else '',
+            'reference_edition': question.reference_edition,
+            'reference_chapter': question.reference_chapter,
+            'reference_page': question.reference_page,
+            'reference_url': question.reference_url,
+            'options': options_payload,
+            'stats_available': stats_available,
+            'students_correct_percent': (
+                round(question.correct_attempts / question.total_attempts * 100) if stats_available else None
+            ),
         })
 
     @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
@@ -423,6 +468,37 @@ class QuestionViewSet(viewsets.ModelViewSet):
             defaults={'is_bookmarked': is_bookmarked},
         )
         return Response({'is_bookmarked': is_bookmarked})
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
+    def report(self, request, pk=None):
+        """Flag a problem with a question for staff review
+        (Admin/src/app/question-reports/). self.get_object() already runs
+        through get_queryset()'s course-eligibility filter, so a student
+        can only report a question they're legitimately allowed to see —
+        no separate authorization check needed here."""
+        question = self.get_object()
+        serializer = QuestionReportSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        report = QuestionReport.objects.create(
+            question=question, user=request.user,
+            reason=serializer.validated_data['reason'],
+            comment=serializer.validated_data.get('comment', ''),
+        )
+        return Response(QuestionReportSerializer(report).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['post'], url_path='rate-difficulty', permission_classes=[IsAuthenticated])
+    def rate_difficulty(self, request, pk=None):
+        """A student's own subjective difficulty rating — separate from the
+        objectively-computed Question.actual_difficulty. Re-rating updates
+        the same row rather than accumulating duplicates."""
+        question = self.get_object()
+        rating = request.data.get('rating')
+        if rating not in dict(QuestionDifficultyRating.RATING_CHOICES):
+            return Response({'detail': 'Invalid rating.'}, status=status.HTTP_400_BAD_REQUEST)
+        QuestionDifficultyRating.objects.update_or_create(
+            question=question, user=request.user, defaults={'rating': rating},
+        )
+        return Response({'rating': rating})
 
     @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
     def browse(self, request):
@@ -699,3 +775,36 @@ class QuestionExcelImportView(APIView):
         except Exception as exc:  # noqa: BLE001
             return Response({'detail': f'Could not read that file: {exc}'}, status=status.HTTP_400_BAD_REQUEST)
         return Response(summary)
+
+
+class ReferenceBookViewSet(viewsets.ModelViewSet):
+    """Small admin-managed lookup table backing Question.reference_book —
+    read-only (list/retrieve) for anyone, since it's just book names/authors
+    with no course-scoping concern; writes are staff-only."""
+    queryset = ReferenceBook.objects.all()
+    serializer_class = ReferenceBookSerializer
+    permission_classes = [IsStaffOrReadOnly]
+
+
+class QuestionReportViewSet(viewsets.ModelViewSet):
+    """Admin-only review queue for student-submitted QuestionReports
+    (Admin/src/app/question-reports/). Never exposed to students — creation
+    happens exclusively through QuestionViewSet.report(), not here."""
+    queryset = QuestionReport.objects.select_related('question', 'reviewed_by').all()
+    serializer_class = QuestionReportAdminSerializer
+    permission_classes = [IsAdminUser]
+    http_method_names = ['get', 'patch', 'head', 'options']
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        status_param = self.request.query_params.get('status')
+        if status_param:
+            qs = qs.filter(status=status_param)
+        return qs
+
+    def perform_update(self, serializer):
+        new_status = self.request.data.get('status')
+        extra = {}
+        if new_status in ('reviewed', 'dismissed'):
+            extra = {'reviewed_by': self.request.user, 'reviewed_at': timezone.now()}
+        serializer.save(**extra)
