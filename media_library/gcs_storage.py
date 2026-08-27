@@ -45,6 +45,21 @@ def public_url(object_key):
     return f'https://storage.googleapis.com/{settings.MEDIA_GCS_PUBLIC_BUCKET}/{object_key}'
 
 
+@lru_cache(maxsize=1)
+def _iam_signing_credentials():
+    """Separate from _client()'s own credentials on purpose — google-cloud-
+    storage mints/caches its client credentials scoped narrowly for GCS
+    operations, which the IAM Credentials API's signBlob call then rejects
+    with ACCESS_TOKEN_SCOPE_INSUFFICIENT (confirmed live in production: the
+    very first fix attempt here, reusing client._credentials, traded the
+    original AttributeError for exactly this 403). Signing needs its own
+    credentials fetched with the broad cloud-platform scope."""
+    import google.auth
+
+    credentials, _project = google.auth.default(scopes=['https://www.googleapis.com/auth/cloud-platform'])
+    return credentials
+
+
 def signed_url(bucket_name, object_key, expires_seconds=3600):
     """For private assets that need temporary browser access (e.g. an
     admin previewing an unpublished question's image, or a payment
@@ -53,17 +68,16 @@ def signed_url(bucket_name, object_key, expires_seconds=3600):
     blob.generate_signed_url() needs a private key to sign with by
     default — fine with a service-account JSON key file, but Cloud Run's
     attached service account is Application Default Credentials backed by
-    the metadata server, which "just contains a token" (see the exact
-    AttributeError this used to raise, confirmed live in production: every
-    "View screenshot" click was silently 500ing). The fix Google documents
-    for exactly this environment: sign via the IAM Credentials API's
-    signBlob using the current credentials' own access token, rather than
-    a local private key. Requires the runtime service account to have
+    the metadata server, which "just contains a token" (confirmed live in
+    production — every "View screenshot" click was silently 500ing on the
+    resulting AttributeError). The fix Google documents for exactly this
+    environment: sign via the IAM Credentials API's signBlob using a
+    cloud-platform-scoped access token, rather than a local private key.
+    Requires the runtime service account to have
     roles/iam.serviceAccountTokenCreator on itself.
     """
-    client = _client()
     blob = _bucket(bucket_name).blob(object_key)
-    credentials = client._credentials
+    credentials = _iam_signing_credentials()
     if not credentials.valid:
         from google.auth.transport import requests as google_auth_requests
         credentials.refresh(google_auth_requests.Request())

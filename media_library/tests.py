@@ -183,33 +183,40 @@ class SignedUrlComputeEngineCredentialsTests(TestCase):
     nothing": Cloud Run's attached service account has no private key —
     blob.generate_signed_url() raises AttributeError with plain Compute
     Engine credentials ("just contains a token"), confirmed live in
-    production. gcs_storage.signed_url() must sign via the IAM Credentials
-    API (service_account_email + access_token) instead whenever the
-    credentials don't carry a private key of their own."""
+    production. A first fix attempt (reusing the storage client's own
+    credentials) traded that for a 403 ACCESS_TOKEN_SCOPE_INSUFFICIENT,
+    also confirmed live — the storage client's credentials are scoped
+    narrowly for GCS, not broad enough for the IAM signBlob call.
+    gcs_storage.signed_url() must fetch its own cloud-platform-scoped
+    credentials via _iam_signing_credentials() and sign through the IAM
+    Credentials API (service_account_email + access_token)."""
 
-    def _mock_client_with_compute_engine_credentials(self, mock_client_fn):
+    def setUp(self):
+        from media_library import gcs_storage
+
+        gcs_storage._iam_signing_credentials.cache_clear()
+
+    def _mock_bucket(self, mock_bucket_fn):
         from unittest.mock import MagicMock
 
+        mock_blob = MagicMock()
+        mock_blob.generate_signed_url.return_value = 'https://signed.example/payment_screenshots/proof.jpg'
+        mock_bucket_fn.return_value.blob.return_value = mock_blob
+        return mock_blob
+
+    @patch('media_library.gcs_storage._iam_signing_credentials')
+    @patch('media_library.gcs_storage._bucket')
+    def test_signs_via_iam_access_token_with_compute_engine_credentials(self, mock_bucket_fn, mock_credentials_fn):
+        from unittest.mock import MagicMock
+
+        from media_library import gcs_storage
+
+        mock_blob = self._mock_bucket(mock_bucket_fn)
         credentials = MagicMock()
         credentials.valid = True
         credentials.token = 'fake-access-token'
         credentials.service_account_email = 'default-sa@example.iam.gserviceaccount.com'
-
-        client = MagicMock()
-        client._credentials = credentials
-        mock_bucket = MagicMock()
-        mock_blob = MagicMock()
-        mock_blob.generate_signed_url.return_value = 'https://signed.example/payment_screenshots/proof.jpg'
-        mock_bucket.blob.return_value = mock_blob
-        client.bucket.return_value = mock_bucket
-        mock_client_fn.return_value = client
-        return mock_blob
-
-    @patch('media_library.gcs_storage._client')
-    def test_signs_via_iam_access_token_with_compute_engine_credentials(self, mock_client_fn):
-        from media_library import gcs_storage
-
-        mock_blob = self._mock_client_with_compute_engine_credentials(mock_client_fn)
+        mock_credentials_fn.return_value = credentials
 
         url = gcs_storage.signed_url('private-bucket', 'payment_screenshots/proof.jpg', expires_seconds=300)
 
@@ -219,8 +226,9 @@ class SignedUrlComputeEngineCredentialsTests(TestCase):
             service_account_email='default-sa@example.iam.gserviceaccount.com', access_token='fake-access-token',
         )
 
-    @patch('media_library.gcs_storage._client')
-    def test_falls_back_to_default_signing_without_a_service_account_email(self, mock_client_fn):
+    @patch('media_library.gcs_storage._iam_signing_credentials')
+    @patch('media_library.gcs_storage._bucket')
+    def test_falls_back_to_default_signing_without_a_service_account_email(self, mock_bucket_fn, mock_credentials_fn):
         """A local key-file-backed credential (e.g. a developer's own gcloud
         ADC) has no service_account_email attribute at all — must not break
         the normal case that already worked."""
@@ -228,14 +236,11 @@ class SignedUrlComputeEngineCredentialsTests(TestCase):
 
         from media_library import gcs_storage
 
+        mock_blob = self._mock_bucket(mock_bucket_fn)
+        mock_blob.generate_signed_url.return_value = 'https://signed.example/normal.jpg'
         credentials = MagicMock(spec=['valid'])
         credentials.valid = True
-        client = MagicMock()
-        client._credentials = credentials
-        mock_blob = MagicMock()
-        mock_blob.generate_signed_url.return_value = 'https://signed.example/normal.jpg'
-        client.bucket.return_value.blob.return_value = mock_blob
-        mock_client_fn.return_value = client
+        mock_credentials_fn.return_value = credentials
 
         url = gcs_storage.signed_url('private-bucket', 'normal.jpg')
 
