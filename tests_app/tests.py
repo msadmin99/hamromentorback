@@ -400,6 +400,49 @@ class ExamCourseAccessControlTests(APITestCase):
         resp = self.client.post(f'/api/tests/{other_course_exam.id}/start/', {})
         self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
 
+    def test_published_and_assigned_exam_is_visible_across_all_four_exam_types(self):
+        """The exact matrix from the exam-visibility regression report: a
+        published exam assigned to Course A must be visible to a Course A
+        student, hidden from a Course B student and an unenrolled student,
+        and never visible at all while still a draft — proven independently
+        for mock/daily/grand/pyq, since all four share the identical
+        visible_test_queryset() code path (only ?exam_type= differs)."""
+        for exam_type in ('mock', 'daily', 'grand', 'pyq'):
+            extra = {'academic_year': '2025-26', 'university': 'IOM'} if exam_type == 'pyq' else {}
+            exam_a = Test.objects.create(title=f'{exam_type} A', exam_type=exam_type, is_draft=False, **extra)
+            exam_a.courses.set([self.cee_mbbs])
+
+            # Course A student: sees it in the type-filtered list and can retrieve it directly.
+            self.client.force_authenticate(user=self.cee_mbbs_student)
+            list_ids = {t['id'] for t in self.client.get(f'/api/tests/?exam_type={exam_type}').data}
+            self.assertIn(exam_a.id, list_ids, f'{exam_type}: Course A student should see their own exam')
+            self.assertEqual(
+                self.client.get(f'/api/tests/{exam_a.id}/').status_code, status.HTTP_200_OK,
+                f'{exam_type}: Course A student should retrieve their own exam directly',
+            )
+
+            # Course B student and a fully unenrolled student: neither sees or can start it.
+            for other_student in (self.nmcle_mbbs_student, self.unenrolled_student):
+                self.client.force_authenticate(user=other_student)
+                other_list_ids = {t['id'] for t in self.client.get(f'/api/tests/?exam_type={exam_type}').data}
+                self.assertNotIn(exam_a.id, other_list_ids, f'{exam_type}: unauthorized student must not see it in the list')
+                self.assertEqual(
+                    self.client.get(f'/api/tests/{exam_a.id}/').status_code, status.HTTP_404_NOT_FOUND,
+                    f'{exam_type}: unauthorized student must not retrieve it directly',
+                )
+                start_resp = self.client.post(f'/api/tests/{exam_a.id}/start/', {})
+                self.assertEqual(start_resp.status_code, status.HTTP_403_FORBIDDEN, f'{exam_type}: unauthorized start must be blocked')
+
+            # Same course, but still a draft: invisible to everyone but staff,
+            # regardless of exam_type — this is the exact "assigned but not
+            # published" state the regression report's Demo/Demo Test exams
+            # were actually in (not a course-scoping bug).
+            exam_a_draft = Test.objects.create(title=f'{exam_type} A Draft', exam_type=exam_type, is_draft=True, **extra)
+            exam_a_draft.courses.set([self.cee_mbbs])
+            self.client.force_authenticate(user=self.cee_mbbs_student)
+            draft_list_ids = {t['id'] for t in self.client.get(f'/api/tests/?exam_type={exam_type}').data}
+            self.assertNotIn(exam_a_draft.id, draft_list_ids, f'{exam_type}: draft must stay invisible even to the assigned course')
+
 
 class AuditExamCourseAssignmentCommandTests(APITestCase):
     def setUp(self):
