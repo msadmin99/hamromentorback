@@ -163,3 +163,50 @@ class CourseQuestionCountTests(APITestCase):
         for i in range(15):
             course = Course.objects.get(prefix=f'QCS{i}')
             self.assertEqual(by_id[course.id], 1)
+
+
+class BackfillEnrollmentFromSubscriptionMigrationTests(APITestCase):
+    """Direct test of the data migration fixing "student pays, sees
+    nothing": every pre-existing Subscription (created before
+    billing.payment_service._ensure_enrollment existed) must get a matching
+    Enrollment, without duplicating or touching one that already exists."""
+
+    def test_backfill_creates_missing_enrollment_and_generates_a_student_code(self):
+        import importlib
+
+        from django.apps import apps
+
+        course = Course.objects.create(name='Backfill Course', prefix='BFC')
+        student = User.objects.create_user(username='backfill_student', email='backfill@example.com', password='pw12345')
+        plan = SubscriptionPlan.objects.create(course=course, product_type='qbank', name='Plan', price=500)
+        # Simulate the pre-fix world: a Subscription with no Enrollment —
+        # bypasses _extend_or_create_subscription deliberately, since that's
+        # now fixed and would create the Enrollment itself.
+        Subscription.objects.create(user=student, plan=plan, course=course, product_type='qbank')
+        self.assertFalse(Enrollment.objects.filter(user=student, course=course).exists())
+
+        migration_module = importlib.import_module('courses.migrations.0007_backfill_enrollment_from_subscription')
+        migration_module.backfill_enrollment_from_subscription(apps, None)
+
+        enrollment = Enrollment.objects.get(user=student, course=course)
+        self.assertTrue(enrollment.is_active)
+        self.assertEqual(enrollment.access_type, 'package')
+        self.assertTrue(enrollment.student_code)
+        self.assertTrue(enrollment.student_code.startswith('BFC'))
+
+    def test_backfill_does_not_duplicate_an_existing_enrollment(self):
+        import importlib
+
+        from django.apps import apps
+
+        course = Course.objects.create(name='Backfill Course 2', prefix='BFC2')
+        student = User.objects.create_user(username='backfill_student2', email='backfill2@example.com', password='pw12345')
+        plan = SubscriptionPlan.objects.create(course=course, product_type='qbank', name='Plan', price=500)
+        Subscription.objects.create(user=student, plan=plan, course=course, product_type='qbank')
+        Enrollment.objects.create(user=student, course=course, access_type='free', is_active=True)
+
+        migration_module = importlib.import_module('courses.migrations.0007_backfill_enrollment_from_subscription')
+        migration_module.backfill_enrollment_from_subscription(apps, None)
+
+        self.assertEqual(Enrollment.objects.filter(user=student, course=course).count(), 1)
+        self.assertEqual(Enrollment.objects.get(user=student, course=course).access_type, 'free')  # untouched

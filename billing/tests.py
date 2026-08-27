@@ -163,6 +163,44 @@ class ApprovalActivatesAccessTests(BillingTestCase):
         self.assertEqual(entry.actor, self.staff)
         self.assertTrue(NotificationLog.objects.filter(purchase_id=purchase['id'], notification_type='payment_approved').exists())
 
+    def test_approve_creates_course_enrollment_not_just_a_subscription(self):
+        """The exact "student pays, sees nothing" bug: a Subscription alone
+        is not enough — courses.access.eligible_course_ids() (which every
+        catalog visibility check in the app reads: subjects, chapters,
+        questions, tests, videos) only ever looks at Enrollment. Without
+        this, an approved paying student saw zero content anywhere."""
+        from courses.access import eligible_course_ids
+        from courses.models import Enrollment
+
+        purchase = self._create_purchase()
+        self._submit(purchase['id'])
+        self.client.force_authenticate(user=self.staff)
+
+        self.client.post(f'/api/purchases/{purchase["id"]}/approve/', {})
+
+        enrollment = Enrollment.objects.get(user=self.student, course=self.course)
+        self.assertTrue(enrollment.is_active)
+        self.assertEqual(enrollment.access_type, 'package')
+        self.assertIn(self.course.id, eligible_course_ids(self.student))
+
+    def test_approve_does_not_duplicate_an_existing_enrollment(self):
+        """A student who was already enrolled (e.g. free tier, or a prior
+        purchase for a different product under the same course) and then
+        buys another product under that same course must not get a second
+        Enrollment row — Enrollment is unique on (user, course)."""
+        from courses.models import Enrollment
+
+        Enrollment.objects.create(user=self.student, course=self.course, access_type='free', is_active=True)
+        purchase = self._create_purchase()
+        self._submit(purchase['id'])
+        self.client.force_authenticate(user=self.staff)
+
+        self.client.post(f'/api/purchases/{purchase["id"]}/approve/', {})
+
+        self.assertEqual(Enrollment.objects.filter(user=self.student, course=self.course).count(), 1)
+        enrollment = Enrollment.objects.get(user=self.student, course=self.course)
+        self.assertEqual(enrollment.access_type, 'package')  # upgraded from free, not left untouched
+
     def test_free_purchase_auto_approves_without_verification(self):
         free_plan = self._make_plan(name='Free QBank', price=0)
         resp = self.client.post('/api/purchases/', {'kind': 'subscription', 'plan_id': free_plan.id})
@@ -550,6 +588,21 @@ class ComboPlanPurchaseTests(BillingTestCase):
         mock_sub = Subscription.objects.get(user=self.student, course=self.course, product_type='mock_test')
         self.assertEqual(mock_sub.mock_test_quota, 30)
 
+    def test_combo_spanning_two_courses_enrolls_the_student_in_both(self):
+        from courses.access import eligible_course_ids
+
+        combo = self._make_combo([self.plan, self.other_course_plan], discount_percent=15)
+        resp = self.client.post('/api/purchases/', {'kind': 'combo', 'combo_plan_id': combo.id})
+        purchase_id = resp.data['id']
+        self._submit(purchase_id)
+        self.client.force_authenticate(user=self.staff)
+
+        self.client.post(f'/api/purchases/{purchase_id}/approve/', {})
+
+        eligible = eligible_course_ids(self.student)
+        self.assertIn(self.course.id, eligible)
+        self.assertIn(self.other_course.id, eligible)
+
     def test_free_combo_auto_approves_and_activates(self):
         free_plan_a = self._make_plan(product_type='daily_test', name='Free Daily', price=0)
         free_plan_b = self._make_plan(product_type='video', name='Free Video', price=0)
@@ -647,3 +700,33 @@ class PaymentMethodQRCodeURLTests(BillingTestCase):
         resp = self.client.get('/api/payment-methods/', HTTP_X_FORWARDED_PROTO='https')
         method = next(m for m in resp.data if m['id'] == self.method.id)
         self.assertTrue(method['qr_code_image'].startswith('https://'), method['qr_code_image'])
+
+
+class GrantAccessCreatesEnrollmentTests(BillingTestCase):
+    """The third (and least visible) path that used to skip Enrollment
+    entirely — an admin manually granting access or a scholarship, with no
+    Purchase row at all, reuses the same _extend_or_create_subscription()
+    that purchase approval does."""
+
+    def test_manual_grant_creates_enrollment(self):
+        from courses.access import eligible_course_ids
+
+        self.client.force_authenticate(user=self.staff)
+        resp = self.client.post('/api/grant-access/', {
+            'user_id': self.student.id, 'course_id': self.course.id, 'product_type': 'qbank',
+            'duration_value': 3, 'duration_unit': 'month',
+        })
+        self.assertIn(resp.status_code, (200, 201), resp.data)
+        self.assertIn(self.course.id, eligible_course_ids(self.student))
+
+    def test_scholarship_grant_creates_enrollment(self):
+        from courses.access import eligible_course_ids
+
+        self.client.force_authenticate(user=self.staff)
+        resp = self.client.post('/api/grant-access/', {
+            'user_id': self.student.id, 'course_id': self.course.id, 'product_type': 'qbank',
+            'duration_value': 3, 'duration_unit': 'month', 'is_scholarship': True, 'reason': 'Financial hardship',
+        })
+        self.assertIn(resp.status_code, (200, 201), resp.data)
+        self.assertIn('scholarship_id', resp.data)
+        self.assertIn(self.course.id, eligible_course_ids(self.student))

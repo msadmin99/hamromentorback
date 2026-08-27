@@ -34,6 +34,26 @@ class PaymentError(ValidationError):
     and roll back the transaction like any other bug."""
 
 
+def _ensure_enrollment(user, course):
+    """A Subscription (billing: "which product you paid for") is a
+    different concept from an Enrollment (courses: "which course you're a
+    member of, used for every catalog visibility check — subjects,
+    chapters, questions, tests, videos — across the whole app"). Buying a
+    subscription previously created only the former: a student could pay,
+    get an approved Purchase, and still see zero content, because
+    courses.access.eligible_course_ids() only ever reads Enrollment. Every
+    path that grants a Subscription must also ensure the matching
+    Enrollment exists — mirrors EnrollmentRequestViewSet.approve()'s own
+    Enrollment.objects.update_or_create(...) exactly, so a paid student
+    ends up in the identical state as one an admin manually approved."""
+    from courses.models import Enrollment
+
+    Enrollment.objects.update_or_create(
+        user=user, course=course,
+        defaults={'access_type': 'package', 'is_active': True},
+    )
+
+
 def _extend_or_create_subscription(user, course, product_type, duration, plan=None, mock_test_quota=None):
     """Shared by purchase activation and the admin manual-grant/scholarship
     endpoint — extends an existing active subscription for the same
@@ -46,6 +66,8 @@ def _extend_or_create_subscription(user, course, product_type, duration, plan=No
 
     start_from = existing.expires_at if (existing and existing.expires_at and existing.expires_at > now) else now
     expires_at = start_from + duration if duration else None
+
+    _ensure_enrollment(user, course)
 
     if existing:
         existing.expires_at = expires_at
