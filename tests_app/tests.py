@@ -222,6 +222,13 @@ class ExamCourseAccessControlTests(APITestCase):
         self.nlen_student = User.objects.create_user(username='nlen_student', email='nlen@example.com', password='pw12345')
         Enrollment.objects.create(user=self.nlen_student, course=self.nlen)
 
+        # Zero Enrollment rows at all — distinct from nmcle_mbbs_student
+        # (enrolled, just in an unrelated course) and matches the exact
+        # production audit account shape (freshly registered, never enrolled).
+        self.unenrolled_student = User.objects.create_user(
+            username='unenrolled_student', email='unenrolled@example.com', password='pw12345',
+        )
+
         self.exam = Test.objects.create(title='CEE-MBBS Mock Test', exam_type='mock', is_draft=False)
         self.exam.courses.set([self.cee_mbbs])
 
@@ -322,6 +329,75 @@ class ExamCourseAccessControlTests(APITestCase):
         self.exam.save(update_fields=['is_draft'])
         self.assertIn(self.exam.id, self._visible_ids(self.staff))
         resp = self._start(self.staff)
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+
+    def test_6_unenrolled_student_cannot_see_or_start_any_exam(self):
+        """Zero Enrollment rows, not just an unrelated one — matches the
+        exact production audit scenario (a freshly registered account)."""
+        self.assertNotIn(self.exam.id, self._visible_ids(self.unenrolled_student))
+        detail_resp = self.client.get(f'/api/tests/{self.exam.id}/')
+        self.assertEqual(detail_resp.status_code, status.HTTP_404_NOT_FOUND)
+        resp = self._start(self.unenrolled_student)
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_7_needs_course_review_does_not_bypass_an_already_assigned_course(self):
+        """The exact production bug, reproduced and pinned down so it can
+        never come back: visible_test_queryset() used to OR
+        needs_course_review=True unconditionally, so a test that already
+        had real courses assigned (but was never explicitly cleared of the
+        legacy flag — nothing in the Admin exam form even shows this field,
+        see TestAdminSerializer.update()) stayed visible — title, subject,
+        exam_type, question_count, courses_detail all leaked — to every
+        student regardless of enrollment. Starting it was already correctly
+        blocked (can_access_test never had this bug); only the listing/
+        detail leak needed fixing."""
+        stale = Test.objects.create(
+            title='Daily Physics — Vectors & Scalars', exam_type='daily', is_draft=False, needs_course_review=True,
+        )
+        stale.courses.set([self.cee_mbbs])
+
+        # Assigned course: sees and can start it, same as any normal exam.
+        self.client.force_authenticate(user=self.cee_mbbs_student)
+        list_resp = self.client.get('/api/tests/?exam_type=daily')
+        self.assertIn(stale.id, {t['id'] for t in list_resp.data})
+        self.assertEqual(self.client.get(f'/api/tests/{stale.id}/').status_code, status.HTTP_200_OK)
+
+        # Unrelated course AND zero-enrollment: must not see it in the list,
+        # must not retrieve it directly, must not be able to start it.
+        for student in (self.nmcle_mbbs_student, self.unenrolled_student):
+            self.client.force_authenticate(user=student)
+            list_resp = self.client.get('/api/tests/?exam_type=daily')
+            self.assertNotIn(stale.id, {t['id'] for t in list_resp.data})
+            self.assertEqual(self.client.get(f'/api/tests/{stale.id}/').status_code, status.HTTP_404_NOT_FOUND)
+            start_resp = self.client.post(f'/api/tests/{stale.id}/start/', {})
+            self.assertEqual(start_resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_multi_course_student_sees_only_tests_from_their_own_courses(self):
+        from courses.models import Enrollment
+
+        multi_student = User.objects.create_user(username='multi_student', email='multi@example.com', password='pw12345')
+        Enrollment.objects.create(user=multi_student, course=self.cee_mbbs)
+        Enrollment.objects.create(user=multi_student, course=self.nmcle_bds)
+
+        nmcle_mbbs_only_exam = Test.objects.create(title='NMCLE-MBBS Only Mock', exam_type='mock', is_draft=False)
+        nmcle_mbbs_only_exam.courses.set([self.nmcle_mbbs])
+
+        visible = self._visible_ids(multi_student)
+        self.assertIn(self.exam.id, visible)  # cee_mbbs — one of their two enrolled courses
+        self.assertNotIn(nmcle_mbbs_only_exam.id, visible)  # nmcle_mbbs — not enrolled in this one
+
+    def test_admin_role_sees_and_can_start_every_exam_regardless_of_assignment(self):
+        """A second, explicit check beyond test_staff_... — an 'admin'-role
+        account (not just is_staff generically) retains full access after
+        this fix, matching can_access_test's own staff bypass."""
+        other_course_exam = Test.objects.create(title='NMCLE-BDS Only Mock', exam_type='mock', is_draft=False)
+        other_course_exam.courses.set([self.nmcle_bds])
+
+        visible = self._visible_ids(self.staff)
+        self.assertIn(self.exam.id, visible)
+        self.assertIn(other_course_exam.id, visible)
+        self.client.force_authenticate(user=self.staff)
+        resp = self.client.post(f'/api/tests/{other_course_exam.id}/start/', {})
         self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
 
 
@@ -425,6 +501,34 @@ class AdminExamCreateEditApiTests(APITestCase):
         test.refresh_from_db()
         self.assertEqual(list(test.courses.values_list('id', flat=True)), [self.course.id])
         self.assertEqual(list(test.assigned_students.values_list('id', flat=True)), [self.student.id])
+
+    def test_edit_assigning_courses_auto_clears_stale_needs_course_review(self):
+        """Root-cause regression for the production leak: the Admin exam
+        form never surfaces needs_course_review, so an admin assigning real
+        courses to a legacy-flagged test previously left the flag stuck at
+        True forever — the exact state that made 3 real tests visible to
+        every student regardless of enrollment. Assigning courses here must
+        clear it automatically."""
+        test = Test.objects.create(title='Legacy needing review', exam_type='mock', is_draft=False, needs_course_review=True)
+
+        resp = self.client.patch(f'/api/tests/{test.id}/', self._payload(assigned_students=[]), format='json')
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        test.refresh_from_db()
+        self.assertFalse(test.needs_course_review)
+
+    def test_edit_explicit_needs_course_review_value_is_respected(self):
+        """If a caller explicitly sends needs_course_review in the same
+        request, that explicit value wins over the auto-clear."""
+        test = Test.objects.create(title='Explicit review flag', exam_type='mock', is_draft=False, needs_course_review=True)
+
+        resp = self.client.patch(
+            f'/api/tests/{test.id}/', self._payload(assigned_students=[], needs_course_review=True), format='json',
+        )
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        test.refresh_from_db()
+        self.assertTrue(test.needs_course_review)
 
     def test_edit_clears_assignment_when_set_to_empty(self):
         test = Test.objects.create(title='To clear', exam_type='mock')

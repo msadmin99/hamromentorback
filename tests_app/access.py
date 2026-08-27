@@ -42,13 +42,24 @@ def can_access_test(user, test):
 def visible_test_queryset(user, qs):
     """Queryset-level equivalent of can_access_test, for TestViewSet.get_queryset()
     — always applied for non-staff regardless of whether a ?course= query
-    param was sent, so listing can never be widened just by omitting it."""
+    param was sent, so listing can never be widened just by omitting it.
+
+    needs_course_review must only grant visibility when the test has NO
+    courses assigned — Q(courses__isnull=True, needs_course_review=True),
+    never a bare Q(needs_course_review=True). The bare form was the exact
+    root cause of a real production leak: three tests already had 12 real
+    courses assigned (the flag was left stale — nothing in the Admin exam
+    form clears it, see TestAdminSerializer.update() below) and were still
+    showing up in the list/detail endpoints for completely unenrolled
+    students, because the OR made the flag an unconditional bypass instead
+    of the courses-empty-only fallback can_access_test() above already
+    correctly implements. Keep these two functions' precedence identical."""
     if user and user.is_authenticated and user.is_staff:
         return qs
     qs = qs.filter(is_draft=False)
     course_ids = eligible_course_ids(user)
     batch_ids = eligible_batch_ids(user)
-    allowed = Q(needs_course_review=True) | Q(courses__id__in=course_ids)
+    allowed = Q(courses__id__in=course_ids) | Q(courses__isnull=True, needs_course_review=True)
     if batch_ids:
         allowed |= Q(assigned_batches__id__in=batch_ids)
     if user and user.is_authenticated:

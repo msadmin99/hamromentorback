@@ -180,6 +180,15 @@ class TestAdminSerializer(serializers.ModelSerializer):
         courses = validated_data.pop('courses', None)
         assigned_students = validated_data.pop('assigned_students', None)
         assigned_batches = validated_data.pop('assigned_batches', None)
+        # needs_course_review is a one-time legacy-migration flag ("visible
+        # to everyone until an admin assigns real courses" — see the model's
+        # help_text) that the exam-management UI never surfaces, so it was
+        # never getting cleared once an admin actually assigned courses
+        # here — the real access-control bug this guards against. Auto-clear
+        # it the moment this save gives the test a real assignment, unless
+        # the caller explicitly set needs_course_review itself this request.
+        if 'needs_course_review' not in validated_data and (courses or assigned_students or assigned_batches):
+            instance.needs_course_review = False
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
         instance.save()

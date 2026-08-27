@@ -98,3 +98,68 @@ class CourseQuestionCountTests(APITestCase):
         by_id = {c['id']: c['question_count'] for c in resp.data}
         self.assertEqual(by_id[self.cee_ug.id], 2)
         self.assertEqual(by_id[self.cee_pg.id], 1)
+
+    def test_question_count_handles_multi_course_tags_and_shared_subjects_without_double_counting(self):
+        """Correctness check for the annotate()-free grouped-aggregate
+        rewrite: a question directly tagged to TWO courses must count once
+        toward each (not fan out into a wrong total via the M2M join), a
+        subject shared across two courses must fan its inherited questions
+        out to both, and a directly-tagged question must never also be
+        double-counted via the subject-inheritance path."""
+        from academics.models import Question, Subject
+
+        third_course = Course.objects.create(name='NMCLE QCount', prefix='NMCLEQCOUNT')
+
+        # Directly tagged to BOTH cee_ug and cee_pg — must count once in each.
+        shared_subject = Subject.objects.create(name='Anatomy QCount Shared')
+        shared_subject.courses.set([self.cee_ug, self.cee_pg, third_course])
+        multi_tagged_q = Question.objects.create(subject=shared_subject, text='Multi-tagged Q')
+        multi_tagged_q.courses.set([self.cee_ug, self.cee_pg])  # explicit override, narrower than the subject
+
+        # Blank courses, inherits from a subject scoped to two courses at once.
+        Question.objects.create(subject=shared_subject, text='Inherited via shared subject')
+
+        resp = self.client.get('/api/courses/')
+        by_id = {c['id']: c['question_count'] for c in resp.data}
+        # cee_ug: 2 (from setUp) + multi_tagged_q (direct) + shared inherited = 4
+        self.assertEqual(by_id[self.cee_ug.id], 4)
+        # cee_pg: 1 (from setUp) + multi_tagged_q (direct) + shared inherited = 3
+        self.assertEqual(by_id[self.cee_pg.id], 3)
+        # third_course: only the shared inherited one (multi_tagged_q's own
+        # courses override excludes third_course explicitly)
+        self.assertEqual(by_id[third_course.id], 1)
+
+    def test_question_count_query_count_does_not_scale_with_number_of_courses(self):
+        """The actual N+1 regression test — was one query per course
+        (2.5s/21+ queries in production); must now stay constant regardless
+        of how many courses exist."""
+        from django.test.utils import CaptureQueriesContext
+        from django.db import connection
+        from academics.models import Question, Subject
+
+        from courses.serializers import question_counts_by_course
+
+        for i in range(15):
+            course = Course.objects.create(name=f'QCount Scale {i}', prefix=f'QCS{i}')
+            subject = Subject.objects.create(name=f'QCount Scale Subject {i}')
+            subject.courses.set([course])
+            Question.objects.create(subject=subject, text=f'QCount Scale Q{i}')
+
+        # Isolate question_counts_by_course()'s own query cost — the actual
+        # fix under test — from CourseSerializer's other fields
+        # (student_count, packages) which have their own pre-existing
+        # per-object query patterns, out of scope here (see the audit's
+        # Issue 2, scoped specifically to get_question_count).
+        with CaptureQueriesContext(connection) as ctx:
+            counts = question_counts_by_course()
+        self.assertGreaterEqual(len(counts), 17)  # 2 from setUp + 15 new, all with >=1 question
+        self.assertEqual(len(ctx.captured_queries), 2, f'{len(ctx.captured_queries)} queries — looks like N+1 again')
+
+        # And confirm the endpoint itself still returns correct, non-zero
+        # counts for the newly created courses (correctness, not query count).
+        resp = self.client.get('/api/courses/')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        by_id = {c['id']: c['question_count'] for c in resp.data}
+        for i in range(15):
+            course = Course.objects.get(prefix=f'QCS{i}')
+            self.assertEqual(by_id[course.id], 1)

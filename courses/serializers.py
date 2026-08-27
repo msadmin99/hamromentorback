@@ -1,3 +1,4 @@
+from django.db.models import Count
 from rest_framework import serializers
 
 from .models import (
@@ -7,6 +8,43 @@ from .models import (
     Enrollment,
     EnrollmentRequest,
 )
+
+
+def question_counts_by_course(course_ids=None):
+    """{course_id: question_count} for every course in one pass — 2 queries
+    total regardless of how many courses there are, replacing the previous
+    one-query-per-course loop in CourseSerializer.get_question_count (was
+    2.5s/21+ queries for GET /api/courses/). Two separate grouped-aggregate
+    queries, not a single query joining both paths: a question is counted
+    either via its own `courses` tag (path A) or, only when that's blank,
+    via its Subject's `courses` (path B, academics.views._question_course_scoped's
+    same inheritance rule) — these two paths are mutually exclusive by
+    construction (path B only ever looks at courses-blank questions), so
+    summing two independently-correct counts can't double count, and
+    avoids the multi-join fan-out that combining both paths into one
+    annotate() call would risk silently inflating.
+    """
+    from collections import defaultdict
+
+    from academics.models import Question
+
+    counts = defaultdict(int)
+
+    direct_qs = Question.objects.exclude(courses__isnull=True)
+    if course_ids is not None:
+        direct_qs = direct_qs.filter(courses__in=course_ids)
+    direct = direct_qs.values('courses').annotate(n=Count('id', distinct=True))
+    for row in direct:
+        counts[row['courses']] += row['n']
+
+    inherited_qs = Question.objects.filter(courses__isnull=True).exclude(subject__courses__isnull=True)
+    if course_ids is not None:
+        inherited_qs = inherited_qs.filter(subject__courses__in=course_ids)
+    inherited = inherited_qs.values('subject__courses').annotate(n=Count('id', distinct=True))
+    for row in inherited:
+        counts[row['subject__courses']] += row['n']
+
+    return dict(counts)
 
 
 class BatchSerializer(serializers.ModelSerializer):
@@ -45,21 +83,15 @@ class CourseSerializer(serializers.ModelSerializer):
         return obj.enrollments.filter(is_active=True).count()
 
     def get_question_count(self, obj):
-        # Was Question.objects.count() — the platform-wide total regardless
-        # of `obj`. obj.questions.count() (Question.courses' related_name)
-        # alone undercounts to 0 for every course, since Question.courses is
-        # unpopulated on every real question — only Subject.courses is
-        # actually maintained by admins. Mirrors
-        # academics.views._question_course_scoped's inheritance rule: a
-        # question with its own `courses` tag counts there; a question with
-        # none counts toward every course its Subject is scoped to.
-        from django.db.models import Q
-
-        from academics.models import Question
-
-        return Question.objects.filter(
-            Q(courses=obj) | Q(courses__isnull=True, subject__courses=obj)
-        ).distinct().count()
+        # Precomputed once for the whole list by CourseViewSet
+        # (get_serializer_context) via question_counts_by_course() — O(1)
+        # queries total instead of one per course (was 2.5s/21+ queries on
+        # GET /api/courses/). Falls back to a single-course-scoped call for
+        # any caller that doesn't inject the context (e.g. this serializer
+        # used standalone elsewhere) — still 2 queries, never N.
+        if 'question_counts' in self.context:
+            return self.context['question_counts'].get(obj.id, 0)
+        return question_counts_by_course(course_ids={obj.id}).get(obj.id, 0)
 
 
 class EnrollmentSerializer(serializers.ModelSerializer):

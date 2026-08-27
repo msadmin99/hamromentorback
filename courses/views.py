@@ -21,6 +21,7 @@ from .serializers import (
     CourseSerializer,
     EnrollmentRequestSerializer,
     EnrollmentSerializer,
+    question_counts_by_course,
 )
 
 
@@ -48,6 +49,18 @@ class CourseViewSet(viewsets.ModelViewSet):
         if not (user.is_authenticated and user.is_staff):
             qs = qs.filter(is_active=True)
         return qs
+
+    def get_serializer_context(self):
+        # Precompute every course's question_count in 2 queries total (not
+        # one query per course — see CourseSerializer.get_question_count).
+        # course_ids=None computes for every course referenced by any
+        # Question/Subject, unfiltered by is_active — a few extra unused
+        # dict entries for inactive courses cost nothing (the serializer
+        # only ever looks up the courses actually being rendered) and this
+        # avoids a third query just to first collect this page's IDs.
+        context = super().get_serializer_context()
+        context['question_counts'] = question_counts_by_course()
+        return context
 
     def destroy(self, request, *args, **kwargs):
         """Permanent delete — blocked if students are enrolled or hold a
