@@ -71,6 +71,17 @@ DEBUG = os.environ.get('DJANGO_DEBUG', 'True') == 'True'
 
 ALLOWED_HOSTS = ['*']
 
+# Cloud Run terminates TLS at its own load balancer and forwards requests to
+# this container over plain HTTP, setting X-Forwarded-Proto to indicate the
+# original scheme. Without this, request.is_secure() is always False here,
+# so every absolute URL Django builds (request.build_absolute_uri(), and
+# every ImageField/FileField serialized through a DRF serializer with
+# request context — e.g. PaymentMethod.qr_code_image, Question.explanation_image,
+# Video.play_url) comes out as http://, which browsers block as mixed
+# content on the https:// frontend — the exact cause of the payment QR
+# code not rendering.
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+
 
 # Application definition
 
@@ -212,6 +223,18 @@ STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
 
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
+
+# Cloud Run's local disk is ephemeral — wiped on every new revision deploy,
+# container restart, or when traffic scales to a different instance — so a
+# plain ImageField/FileField saved with Django's default FileSystemStorage
+# (payment QR codes, payment screenshots, banners, thumbnails, profile
+# photos — anything not already routed through media_library's MediaAsset
+# pipeline) can silently 404 for users within hours of being uploaded. Falls
+# back to local storage when MEDIA_GCS_PUBLIC_BUCKET isn't configured
+# (local dev/tests), matching every other MEDIA_GCS_* setting's "blank in
+# local dev" convention above.
+if MEDIA_GCS_PUBLIC_BUCKET:
+    DEFAULT_FILE_STORAGE = 'media_library.django_storage.PublicGCSStorage'
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/4.2/ref/settings/#default-auto-field

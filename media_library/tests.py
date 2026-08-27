@@ -118,3 +118,61 @@ class MediaAssetDetailViewDeleteTests(APITestCase):
         resp = self.client.delete(f'/api/media/{uuid.uuid4()}/')
 
         self.assertEqual(resp.status_code, 404)
+
+
+class PublicGCSStorageTests(TestCase):
+    """The Django Storage adapter fixing the "payment QR code / any plain
+    ImageField upload silently disappears on the next Cloud Run deploy"
+    bug — Cloud Run's local disk is ephemeral, so anything saved with the
+    default FileSystemStorage isn't durable in production."""
+
+    @override_settings(MEDIA_GCS_PUBLIC_BUCKET='public-bucket')
+    @patch('media_library.gcs_storage._bucket')
+    @patch('media_library.gcs_storage.upload_bytes')
+    def test_save_uploads_to_the_public_bucket(self, mock_upload, mock_bucket):
+        from django.core.files.base import ContentFile
+
+        from media_library.django_storage import PublicGCSStorage
+
+        # Storage.save() calls get_available_name() -> exists() first (name-
+        # collision check) before _save() — not under test here, so just
+        # make it report "doesn't exist yet" via the same _bucket() call
+        # exists()/size() go through.
+        mock_bucket.return_value.blob.return_value.exists.return_value = False
+
+        storage = PublicGCSStorage()
+        name = storage.save('payment_method_qr/fonepay.png', ContentFile(b'fake-png-bytes', name='fonepay.png'))
+
+        self.assertEqual(name, 'payment_method_qr/fonepay.png')
+        mock_upload.assert_called_once()
+        bucket_arg, key_arg, data_arg, content_type_arg = mock_upload.call_args[0]
+        self.assertEqual(bucket_arg, 'public-bucket')
+        self.assertEqual(key_arg, 'payment_method_qr/fonepay.png')
+        self.assertEqual(data_arg, b'fake-png-bytes')
+
+    @override_settings(MEDIA_GCS_PUBLIC_BUCKET='public-bucket')
+    def test_url_is_always_https_direct_to_gcs(self):
+        from media_library.django_storage import PublicGCSStorage
+
+        url = PublicGCSStorage().url('payment_method_qr/fonepay.png')
+
+        self.assertEqual(url, 'https://storage.googleapis.com/public-bucket/payment_method_qr/fonepay.png')
+        self.assertTrue(url.startswith('https://'))
+
+    @override_settings(MEDIA_GCS_PUBLIC_BUCKET='public-bucket')
+    @patch('media_library.gcs_storage.delete_object')
+    def test_delete_removes_from_the_public_bucket(self, mock_delete):
+        from media_library.django_storage import PublicGCSStorage
+
+        PublicGCSStorage().delete('payment_method_qr/fonepay.png')
+
+        mock_delete.assert_called_once_with('public-bucket', 'payment_method_qr/fonepay.png')
+
+    def test_default_file_storage_falls_back_to_local_disk_without_a_bucket_configured(self):
+        """MEDIA_GCS_PUBLIC_BUCKET is blank in local dev/CI (matching every
+        other MEDIA_GCS_* setting's convention) — settings.py must not force
+        GCS storage (and a real google-cloud-storage client) in that case."""
+        from django.conf import settings
+
+        self.assertEqual(settings.MEDIA_GCS_PUBLIC_BUCKET, '')
+        self.assertEqual(getattr(settings, 'DEFAULT_FILE_STORAGE', ''), 'django.core.files.storage.FileSystemStorage')

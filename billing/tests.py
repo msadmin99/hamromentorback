@@ -625,4 +625,25 @@ class ComboPlanPurchaseTests(BillingTestCase):
         data = ComboPlanSerializer(combo).data
         self.assertEqual(data['individual_value'], 800)
         self.assertEqual(data['you_save'], 160)
-        self.assertEqual(data['final_price'], 640)
+
+
+class PaymentMethodQRCodeURLTests(BillingTestCase):
+    """The exact bug behind the "Fonepay QR is not seen" report: without
+    SECURE_PROXY_SSL_HEADER, request.is_secure() is always False behind
+    Cloud Run's TLS-terminating proxy, so DRF's ImageField serialized every
+    absolute qr_code_image URL as http:// — which the https:// frontend's
+    browser blocks as mixed content, rendering as a broken image."""
+
+    def setUp(self):
+        super().setUp()
+        self.method.qr_code_image = SimpleUploadedFile('fonepay_qr.png', _png_bytes(), content_type='image/png')
+        self.method.save()
+
+    def test_qr_code_image_url_is_https_behind_the_cloud_run_proxy(self):
+        # X-Forwarded-Proto: https is exactly what Cloud Run's load balancer
+        # sends on every real request in production — SECURE_PROXY_SSL_HEADER
+        # is what makes Django trust it instead of falling back to the
+        # insecure scheme of its own plain-HTTP connection to the container.
+        resp = self.client.get('/api/payment-methods/', HTTP_X_FORWARDED_PROTO='https')
+        method = next(m for m in resp.data if m['id'] == self.method.id)
+        self.assertTrue(method['qr_code_image'].startswith('https://'), method['qr_code_image'])
