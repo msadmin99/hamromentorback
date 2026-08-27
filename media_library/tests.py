@@ -176,3 +176,68 @@ class PublicGCSStorageTests(TestCase):
 
         self.assertEqual(settings.MEDIA_GCS_PUBLIC_BUCKET, '')
         self.assertEqual(getattr(settings, 'DEFAULT_FILE_STORAGE', ''), 'django.core.files.storage.FileSystemStorage')
+
+
+class SignedUrlComputeEngineCredentialsTests(TestCase):
+    """The exact bug behind "clicking View on a payment screenshot does
+    nothing": Cloud Run's attached service account has no private key —
+    blob.generate_signed_url() raises AttributeError with plain Compute
+    Engine credentials ("just contains a token"), confirmed live in
+    production. gcs_storage.signed_url() must sign via the IAM Credentials
+    API (service_account_email + access_token) instead whenever the
+    credentials don't carry a private key of their own."""
+
+    def _mock_client_with_compute_engine_credentials(self, mock_client_fn):
+        from unittest.mock import MagicMock
+
+        credentials = MagicMock()
+        credentials.valid = True
+        credentials.token = 'fake-access-token'
+        credentials.service_account_email = 'default-sa@example.iam.gserviceaccount.com'
+
+        client = MagicMock()
+        client._credentials = credentials
+        mock_bucket = MagicMock()
+        mock_blob = MagicMock()
+        mock_blob.generate_signed_url.return_value = 'https://signed.example/payment_screenshots/proof.jpg'
+        mock_bucket.blob.return_value = mock_blob
+        client.bucket.return_value = mock_bucket
+        mock_client_fn.return_value = client
+        return mock_blob
+
+    @patch('media_library.gcs_storage._client')
+    def test_signs_via_iam_access_token_with_compute_engine_credentials(self, mock_client_fn):
+        from media_library import gcs_storage
+
+        mock_blob = self._mock_client_with_compute_engine_credentials(mock_client_fn)
+
+        url = gcs_storage.signed_url('private-bucket', 'payment_screenshots/proof.jpg', expires_seconds=300)
+
+        self.assertEqual(url, 'https://signed.example/payment_screenshots/proof.jpg')
+        mock_blob.generate_signed_url.assert_called_once_with(
+            version='v4', expiration=300, method='GET',
+            service_account_email='default-sa@example.iam.gserviceaccount.com', access_token='fake-access-token',
+        )
+
+    @patch('media_library.gcs_storage._client')
+    def test_falls_back_to_default_signing_without_a_service_account_email(self, mock_client_fn):
+        """A local key-file-backed credential (e.g. a developer's own gcloud
+        ADC) has no service_account_email attribute at all — must not break
+        the normal case that already worked."""
+        from unittest.mock import MagicMock
+
+        from media_library import gcs_storage
+
+        credentials = MagicMock(spec=['valid'])
+        credentials.valid = True
+        client = MagicMock()
+        client._credentials = credentials
+        mock_blob = MagicMock()
+        mock_blob.generate_signed_url.return_value = 'https://signed.example/normal.jpg'
+        client.bucket.return_value.blob.return_value = mock_blob
+        mock_client_fn.return_value = client
+
+        url = gcs_storage.signed_url('private-bucket', 'normal.jpg')
+
+        self.assertEqual(url, 'https://signed.example/normal.jpg')
+        mock_blob.generate_signed_url.assert_called_once_with(version='v4', expiration=3600, method='GET')

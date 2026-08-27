@@ -47,6 +47,30 @@ def public_url(object_key):
 
 def signed_url(bucket_name, object_key, expires_seconds=3600):
     """For private assets that need temporary browser access (e.g. an
-    admin previewing an unpublished question's image)."""
+    admin previewing an unpublished question's image, or a payment
+    screenshot on the Payments verification page).
+
+    blob.generate_signed_url() needs a private key to sign with by
+    default — fine with a service-account JSON key file, but Cloud Run's
+    attached service account is Application Default Credentials backed by
+    the metadata server, which "just contains a token" (see the exact
+    AttributeError this used to raise, confirmed live in production: every
+    "View screenshot" click was silently 500ing). The fix Google documents
+    for exactly this environment: sign via the IAM Credentials API's
+    signBlob using the current credentials' own access token, rather than
+    a local private key. Requires the runtime service account to have
+    roles/iam.serviceAccountTokenCreator on itself.
+    """
+    client = _client()
     blob = _bucket(bucket_name).blob(object_key)
+    credentials = client._credentials
+    if not credentials.valid:
+        from google.auth.transport import requests as google_auth_requests
+        credentials.refresh(google_auth_requests.Request())
+    service_account_email = getattr(credentials, 'service_account_email', None)
+    if service_account_email and service_account_email != 'default':
+        return blob.generate_signed_url(
+            version='v4', expiration=expires_seconds, method='GET',
+            service_account_email=service_account_email, access_token=credentials.token,
+        )
     return blob.generate_signed_url(version='v4', expiration=expires_seconds, method='GET')
