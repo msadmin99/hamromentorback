@@ -306,6 +306,60 @@ class KpiOverviewQuestionsTodayTests(APITestCase):
         self.assertEqual(resp.data['kpis']['questions_today'], 0)
 
 
+class CardStatusInProgressTests(APITestCase):
+    """Daily/Mock Test pages redesign: card_status must distinguish
+    'in_progress' (started, not yet submitted) from 'available' (never
+    started) so the status tabs and Continue-Test CTA are accurate."""
+
+    def setUp(self):
+        from courses.models import Course, Enrollment
+
+        self.course = Course.objects.create(name='In Progress Course', prefix='IPCOURSE')
+        self.student = User.objects.create_user(username='ip_student', email='ip_student@example.com', password='pw12345')
+        Enrollment.objects.create(user=self.student, course=self.course)
+        self.subject = Subject.objects.create(name='In Progress Subject')
+        self.q1 = Question.objects.create(subject=self.subject, text='IP Q1', marks=1, negative_marks=0)
+        self.q2 = Question.objects.create(subject=self.subject, text='IP Q2', marks=1, negative_marks=0)
+        self.test = Test.objects.create(title='In Progress Test', exam_type='mock', is_draft=False)
+        self.test.courses.set([self.course])
+        TestQuestion.objects.create(test=self.test, question=self.q1, order=0)
+        TestQuestion.objects.create(test=self.test, question=self.q2, order=1)
+        self.client.force_authenticate(user=self.student)
+
+    def test_never_started_test_is_available_not_in_progress(self):
+        resp = self.client.get('/api/tests/?exam_type=mock')
+        row = next(r for r in resp.data if r['id'] == self.test.id)
+        self.assertEqual(row['card_status'], 'available')
+        self.assertIsNone(row['in_progress_answered_count'])
+
+    def test_started_but_unsubmitted_attempt_is_in_progress_with_real_answered_count(self):
+        attempt = TestAttempt.objects.create(user=self.student, test=self.test, status='in_progress')
+        Answer.objects.create(attempt=attempt, question=self.q1)
+
+        resp = self.client.get('/api/tests/?exam_type=mock')
+
+        row = next(r for r in resp.data if r['id'] == self.test.id)
+        self.assertEqual(row['card_status'], 'in_progress')
+        self.assertEqual(row['in_progress_answered_count'], 1)
+
+    def test_submitted_attempt_is_completed_not_in_progress(self):
+        TestAttempt.objects.create(user=self.student, test=self.test, status='submitted', score=1)
+
+        resp = self.client.get('/api/tests/?exam_type=mock')
+
+        row = next(r for r in resp.data if r['id'] == self.test.id)
+        self.assertEqual(row['card_status'], 'completed')
+
+    def test_another_students_in_progress_attempt_does_not_leak(self):
+        other = User.objects.create_user(username='ip_other', email='ip_other@example.com', password='pw12345')
+        TestAttempt.objects.create(user=other, test=self.test, status='in_progress')
+
+        resp = self.client.get('/api/tests/?exam_type=mock')
+
+        row = next(r for r in resp.data if r['id'] == self.test.id)
+        self.assertEqual(row['card_status'], 'available')
+
+
 class ExamCourseAccessControlTests(APITestCase):
     """The restructure's own acceptance tests, made literal — Test 1-5 from
     the spec. Confirms exam visibility/access is derived server-side from

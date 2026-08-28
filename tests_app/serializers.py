@@ -23,6 +23,7 @@ class TestListSerializer(serializers.ModelSerializer):
     card_status = serializers.SerializerMethodField()
     attempts_used = serializers.SerializerMethodField()
     created_by_name = serializers.SerializerMethodField()
+    in_progress_answered_count = serializers.SerializerMethodField()
 
     exam_template_id = serializers.IntegerField(source='exam_template.id', read_only=True, default=None)
     exam_code = serializers.CharField(source='exam_template.exam_code', read_only=True, default=None)
@@ -34,7 +35,7 @@ class TestListSerializer(serializers.ModelSerializer):
             'question_count', 'total_marks', 'is_pro', 'is_new', 'price', 'max_attempts',
             'academic_year', 'university', 'scheduled_start', 'scheduled_end', 'status', 'best_score',
             'courses_detail', 'card_status', 'attempts_used', 'created_by_name', 'created_at',
-            'is_draft', 'exam_template_id', 'exam_code', 'version_number',
+            'is_draft', 'exam_template_id', 'exam_code', 'version_number', 'in_progress_answered_count',
         ]
 
     def get_created_by_name(self, obj):
@@ -69,12 +70,35 @@ class TestListSerializer(serializers.ModelSerializer):
             return 0
         return obj.attempts.filter(user=request.user).count()
 
+    def _in_progress_attempt(self, obj):
+        user = self.context.get('request').user if self.context.get('request') else None
+        if not user or not user.is_authenticated:
+            return None
+        # Cached on the instance per request — get_card_status() and
+        # get_in_progress_answered_count() both need this and DRF calls
+        # SerializerMethodFields independently, so without this every row
+        # would run the same attempt lookup twice.
+        cache_attr = '_in_progress_attempt_cache'
+        if not hasattr(obj, cache_attr):
+            setattr(obj, cache_attr, obj.attempts.filter(user=user, status='in_progress').order_by('-start_time').first())
+        return getattr(obj, cache_attr)
+
+    def get_in_progress_answered_count(self, obj):
+        attempt = self._in_progress_attempt(obj)
+        return attempt.answers.count() if attempt else None
+
     def get_card_status(self, obj):
-        """Available / Upcoming / Completed / Missed — for the dashboard exam card."""
+        """Available / Upcoming / Completed / Missed / In Progress — for the
+        dashboard exam card. In Progress (a real TestAttempt exists but
+        hasn't been submitted yet) previously fell through to 'available',
+        which showed 'Start Test' instead of 'Continue Test' and lost the
+        distinction the new status tabs need."""
         now = timezone.now()
         has_attempted = self.get_best_score(obj) is not None
         if has_attempted:
             return 'completed'
+        if self._in_progress_attempt(obj):
+            return 'in_progress'
         if obj.scheduled_start and obj.scheduled_start > now:
             return 'upcoming'
         if obj.scheduled_end and obj.scheduled_end < now:
