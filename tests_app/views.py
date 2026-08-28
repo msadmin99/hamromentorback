@@ -235,6 +235,7 @@ class TestViewSet(viewsets.ModelViewSet):
         status_param = self.request.query_params.get('status')
         standalone = self.request.query_params.get('standalone')
         access = self.request.query_params.get('access')
+        difficulty = self.request.query_params.get('difficulty')
         if exam_type:
             qs = qs.filter(exam_type__in=exam_type.split(','))
         if subject:
@@ -243,6 +244,8 @@ class TestViewSet(viewsets.ModelViewSet):
             qs = qs.filter(academic_year=year)
         if university:
             qs = qs.filter(university=university)
+        if difficulty:
+            qs = qs.filter(difficulty=difficulty)
         if program:
             qs = qs.filter(courses__program_group=program)
         if search:
@@ -281,17 +284,28 @@ class TestViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'])
     def universities(self, request):
-        """Distinct conducting institutions (IOM, MOE, BPKIHS, KU, ...) available for Past Year
+        """Conducting institutions (IOM, MOE, BPKIHS, KU, ...) available for Past Year
         Question sets — the top-level grouping on the student Past Year Questions page,
-        optionally scoped to a course."""
+        optionally scoped to a course. Each entry carries real, computed years-available
+        and paper-count numbers (the "Choose a University" cards need these) — sole
+        caller is Frontend/src/app/past-year-questions/page.js, confirmed via repo-wide
+        grep, so this shape change is safe (no other consumer expects the old flat
+        array of strings)."""
         # .order_by() clears Test's default ordering (['-scheduled_start', '-created_at']) —
         # without it, Django has to include those fields in the SELECT to satisfy the implicit
         # ORDER BY on a .distinct() query, so DISTINCT ends up operating over
         # (university, scheduled_start, created_at) instead of just university, and silently
         # stops deduplicating the moment two rows share a university but differ in timestamp.
         qs = self.get_queryset().filter(exam_type='pyq').exclude(university='').order_by()
-        universities = sorted(qs.values_list('university', flat=True).distinct())
-        return Response(universities)
+        names = sorted(qs.values_list('university', flat=True).distinct())
+        return Response([
+            {
+                'name': name,
+                'years_available': qs.filter(university=name).exclude(academic_year='').values('academic_year').distinct().count(),
+                'paper_count': qs.filter(university=name).count(),
+            }
+            for name in names
+        ])
 
     @action(detail=False, methods=['get'])
     def years(self, request):
@@ -301,6 +315,75 @@ class TestViewSet(viewsets.ModelViewSet):
         qs = self.get_queryset().filter(exam_type='pyq').exclude(academic_year='').order_by()
         years = sorted(qs.values_list('academic_year', flat=True).distinct(), reverse=True)
         return Response(years)
+
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def recommended(self, request):
+        """Which single Daily/Mock/Grand Test to feature on that exam type's
+        'Recommended For You' hero — real, computed picks only, no
+        editorial/admin flag. Frontend follows up with GET /tests/{id}/ for
+        full detail (price/access/etc.); this only decides *which* test."""
+        from django.db.models import Count, Q
+
+        exam_type = request.query_params.get('exam_type')
+        if exam_type not in ('daily', 'mock', 'grand'):
+            return Response({'detail': 'exam_type must be one of: daily, mock, grand.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = request.user
+        course = request.query_params.get('course')
+        course_id = int(course) if course else None
+
+        now = timezone.now()
+        base_qs = self.get_queryset().filter(exam_type=exam_type)
+        available_qs = base_qs.filter(
+            Q(scheduled_start__isnull=True) | Q(scheduled_start__lte=now)
+        ).filter(
+            Q(scheduled_end__isnull=True) | Q(scheduled_end__gte=now)
+        )
+        attempted_test_ids = set(TestAttempt.objects.filter(user=user, test__exam_type=exam_type).values_list('test_id', flat=True))
+
+        if exam_type == 'daily':
+            not_attempted = available_qs.exclude(id__in=attempted_test_ids)
+            for row in performance.subject_breakdown(user, course_id):
+                if row['attempted'] < 3:
+                    continue
+                match = not_attempted.filter(subject_id=row['subject_id']).first()
+                if match:
+                    return Response({
+                        'test_id': match.id, 'reason': 'weak_subject', 'weak_area': row['subject_name'],
+                        'accuracy_pct': row['accuracy'], 'question_count': match.question_count, 'attempted_count': None,
+                    })
+            fallback = not_attempted.order_by('created_at').first()
+            if not fallback:
+                return Response({'test_id': None})
+            return Response({
+                'test_id': fallback.id, 'reason': 'new', 'weak_area': None,
+                'accuracy_pct': None, 'question_count': fallback.question_count, 'attempted_count': None,
+            })
+
+        if exam_type == 'mock':
+            top = available_qs.annotate(qc=Count('questions', distinct=True)).order_by('-qc', 'created_at').first()
+            if not top:
+                return Response({'test_id': None})
+            attempted_count = TestAttempt.objects.filter(test=top).values('user').distinct().count()
+            return Response({
+                'test_id': top.id, 'reason': 'most_comprehensive', 'weak_area': None,
+                'accuracy_pct': None, 'question_count': top.question_count, 'attempted_count': attempted_count,
+            })
+
+        # grand — most-attempted available Grand Test, oldest-first tiebreak
+        # (also the natural fallback when nothing has been attempted yet).
+        top = (
+            available_qs.annotate(attempt_count=Count('attempts__user', distinct=True))
+            .order_by('-attempt_count', 'created_at')
+            .first()
+        )
+        if not top:
+            return Response({'test_id': None})
+        return Response({
+            'test_id': top.id, 'reason': 'most_attempted', 'weak_area': None,
+            'accuracy_pct': None, 'question_count': top.question_count,
+            'attempted_count': TestAttempt.objects.filter(test=top).values('user').distinct().count(),
+        })
 
     @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
     def start(self, request, pk=None):

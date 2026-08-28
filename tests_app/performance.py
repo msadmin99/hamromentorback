@@ -223,9 +223,19 @@ def _combined_question_state(user, course=None):
     """
     state = {}  # question_id -> {'is_correct': bool, 'when': datetime}
 
+    # A Question with blank `courses` inherits its Subject's course scope
+    # (the platform-wide convention — see academics.views._question_course_scoped
+    # and this same fallback already used by CompleteCourseScopingAuditTests'
+    # fixtures) — matching only `question__courses__id=course` silently
+    # dropped every such question's attempt history whenever a course was
+    # passed, zeroing out subject_breakdown()/topic_mastery() for the
+    # common real-production case of subject-inherited (not directly
+    # tagged) questions.
+    course_q = Q(question__courses__id=course) | Q(question__courses__isnull=True, question__subject__courses__id=course)
+
     qa_qs = QuestionAttempt.objects.filter(user=user).values('question_id', 'is_correct', 'answered_at')
     if course:
-        qa_qs = qa_qs.filter(question__courses__id=course)
+        qa_qs = qa_qs.filter(course_q)
     for row in qa_qs:
         state[row['question_id']] = {'is_correct': row['is_correct'], 'when': row['answered_at']}
 
@@ -234,7 +244,7 @@ def _combined_question_state(user, course=None):
         .values('question_id', 'is_correct', 'attempt__end_time', 'attempt__start_time')
     )
     if course:
-        ans_qs = ans_qs.filter(question__courses__id=course)
+        ans_qs = ans_qs.filter(course_q)
     for row in ans_qs:
         when = row['attempt__end_time'] or row['attempt__start_time']
         existing = state.get(row['question_id'])

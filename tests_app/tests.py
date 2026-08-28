@@ -996,3 +996,136 @@ class SavedExamViewApiTests(APITestCase):
         resp = self.client.get('/api/saved-exam-views/')
 
         self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class DifficultyFilterTests(APITestCase):
+    def test_difficulty_filter_scopes_tests_returned(self):
+        easy = Test.objects.create(title='Easy Daily', exam_type='daily', is_draft=False, difficulty='easy')
+        hard = Test.objects.create(title='Hard Daily', exam_type='daily', is_draft=False, difficulty='hard')
+        staff = User.objects.create_user(username='diff_staff', email='diff_staff@example.com', password='pw12345', is_staff=True, admin_role='admin')
+        self.client.force_authenticate(user=staff)
+
+        resp = self.client.get('/api/tests/?difficulty=easy')
+
+        ids = {t['id'] for t in resp.data}
+        self.assertIn(easy.id, ids)
+        self.assertNotIn(hard.id, ids)
+
+
+class RecommendedTestEndpointTests(APITestCase):
+    """Student exam-pages redesign: GET /tests/recommended/?exam_type=daily|mock|grand
+    picks a real featured test per type — no editorial flag, no fabricated
+    numbers."""
+
+    def setUp(self):
+        from courses.models import Course, Enrollment
+
+        self.course = Course.objects.create(name='Recommend Course', prefix='RECRSE')
+        self.student = User.objects.create_user(username='rec_student', email='rec_student@example.com', password='pw12345')
+        Enrollment.objects.create(user=self.student, course=self.course)
+        self.client.force_authenticate(user=self.student)
+
+    def test_invalid_exam_type_is_rejected(self):
+        resp = self.client.get('/api/tests/recommended/?exam_type=pyq')
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_requires_auth(self):
+        self.client.force_authenticate(user=None)
+        resp = self.client.get('/api/tests/recommended/?exam_type=daily')
+        self.assertEqual(resp.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_returns_null_when_no_tests_available(self):
+        resp = self.client.get(f'/api/tests/recommended/?exam_type=daily&course={self.course.id}')
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsNone(resp.data['test_id'])
+
+    def test_daily_matches_weakest_subject_with_enough_attempts(self):
+        from academics.services import record_question_result
+
+        weak_subject = Subject.objects.create(name='Weak Subject Rec')
+        weak_subject.courses.set([self.course])
+        strong_subject = Subject.objects.create(name='Strong Subject Rec')
+        strong_subject.courses.set([self.course])
+
+        weak_daily = Test.objects.create(title='Weak Subject Daily', exam_type='daily', is_draft=False, subject=weak_subject)
+        weak_daily.courses.set([self.course])
+        strong_daily = Test.objects.create(title='Strong Subject Daily', exam_type='daily', is_draft=False, subject=strong_subject)
+        strong_daily.courses.set([self.course])
+
+        for i in range(4):
+            q = Question.objects.create(subject=weak_subject, text=f'Weak Q{i}')
+            record_question_result(self.student, q, i == 0, source='qbank')  # 1/4 correct
+        for i in range(4):
+            q = Question.objects.create(subject=strong_subject, text=f'Strong Q{i}')
+            record_question_result(self.student, q, True, source='qbank')  # 4/4 correct
+
+        resp = self.client.get(f'/api/tests/recommended/?exam_type=daily&course={self.course.id}')
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data['test_id'], weak_daily.id)
+        self.assertEqual(resp.data['weak_area'], 'Weak Subject Rec')
+        self.assertEqual(resp.data['reason'], 'weak_subject')
+
+    def test_daily_falls_back_to_oldest_unattempted_test_with_no_performance_data(self):
+        older = Test.objects.create(title='Older Daily Rec', exam_type='daily', is_draft=False)
+        older.courses.set([self.course])
+        newer = Test.objects.create(title='Newer Daily Rec', exam_type='daily', is_draft=False)
+        newer.courses.set([self.course])
+
+        resp = self.client.get(f'/api/tests/recommended/?exam_type=daily&course={self.course.id}')
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data['test_id'], older.id)
+        self.assertEqual(resp.data['reason'], 'new')
+
+    def test_mock_picks_the_test_with_the_most_questions(self):
+        small = Test.objects.create(title='Small Mock Rec', exam_type='mock', is_draft=False)
+        small.courses.set([self.course])
+        big = Test.objects.create(title='Big Mock Rec', exam_type='mock', is_draft=False)
+        big.courses.set([self.course])
+        subject = Subject.objects.create(name='Mock Rec Subject')
+        for i in range(3):
+            q = Question.objects.create(subject=subject, text=f'Big Mock Q{i}')
+            TestQuestion.objects.create(test=big, question=q, order=i)
+        q = Question.objects.create(subject=subject, text='Small Mock Q0')
+        TestQuestion.objects.create(test=small, question=q, order=0)
+
+        resp = self.client.get(f'/api/tests/recommended/?exam_type=mock&course={self.course.id}')
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data['test_id'], big.id)
+        self.assertEqual(resp.data['reason'], 'most_comprehensive')
+        self.assertEqual(resp.data['question_count'], 3)
+
+    def test_grand_picks_the_most_attempted_test(self):
+        popular = Test.objects.create(title='Popular Grand Rec', exam_type='grand', is_draft=False)
+        popular.courses.set([self.course])
+        quiet = Test.objects.create(title='Quiet Grand Rec', exam_type='grand', is_draft=False)
+        quiet.courses.set([self.course])
+        other_student = User.objects.create_user(username='rec_other', email='rec_other@example.com', password='pw12345')
+        TestAttempt.objects.create(user=self.student, test=popular, status='submitted')
+        TestAttempt.objects.create(user=other_student, test=popular, status='submitted')
+        TestAttempt.objects.create(user=self.student, test=quiet, status='submitted')
+
+        resp = self.client.get(f'/api/tests/recommended/?exam_type=grand&course={self.course.id}')
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data['test_id'], popular.id)
+        self.assertEqual(resp.data['attempted_count'], 2)
+
+
+class UniversitiesEnrichmentTests(APITestCase):
+    def test_universities_returns_years_available_and_paper_count(self):
+        staff = User.objects.create_user(username='uni_staff', email='uni_staff@example.com', password='pw12345', is_staff=True, admin_role='admin')
+        Test.objects.create(title='IOM 2020', exam_type='pyq', is_draft=False, university='IOM', academic_year='2020')
+        Test.objects.create(title='IOM 2021', exam_type='pyq', is_draft=False, university='IOM', academic_year='2021')
+        Test.objects.create(title='KU 2020', exam_type='pyq', is_draft=False, university='KU', academic_year='2020')
+        self.client.force_authenticate(user=staff)
+
+        resp = self.client.get('/api/tests/universities/')
+
+        by_name = {row['name']: row for row in resp.data}
+        self.assertEqual(by_name['IOM']['years_available'], 2)
+        self.assertEqual(by_name['IOM']['paper_count'], 2)
+        self.assertEqual(by_name['KU']['years_available'], 1)
+        self.assertEqual(by_name['KU']['paper_count'], 1)
