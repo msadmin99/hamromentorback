@@ -5,7 +5,7 @@ from rest_framework.test import APITestCase
 
 from academics.models import Option, Question, QuestionAttempt, QuestionEvent, Subject
 from core.models import DeletionAuditLog
-from tests_app.models import ExamSession, ExamTemplate, SavedExamView, Test, TestAttempt, TestQuestion
+from tests_app.models import Answer, ExamSession, ExamTemplate, SavedExamView, Test, TestAttempt, TestQuestion
 
 User = get_user_model()
 
@@ -158,6 +158,116 @@ class SubmitTestFeedsQuestionPerformanceTests(APITestCase):
         self.assertEqual(qa.incorrect_count, 1)
         sources = set(QuestionEvent.objects.filter(user=self.student, question=self.question).values_list('source', flat=True))
         self.assertEqual(sources, {'qbank', 'test'})
+
+
+class MarkForReviewViewTests(APITestCase):
+    """Test Player redesign: mark-for-review must be settable independently
+    of answer() (a real bug fix, not just UI — the old flow lost the mark
+    entirely if the student never also answered that question), and must
+    never blank an existing answer."""
+
+    def setUp(self):
+        self.student = User.objects.create_user(username='mfr_student', email='mfr_student@example.com', password='pw12345')
+        self.subject = Subject.objects.create(name='Mark Review Subject')
+        self.question = Question.objects.create(subject=self.subject, text='Mark Review Q1', marks=1, negative_marks=0)
+        self.correct = Option.objects.create(question=self.question, text='Right', is_correct=True)
+        self.wrong = Option.objects.create(question=self.question, text='Wrong', is_correct=False)
+        self.test = Test.objects.create(title='Mark Review Test', exam_type='mock')
+        TestQuestion.objects.create(test=self.test, question=self.question)
+        self.attempt = TestAttempt.objects.create(user=self.student, test=self.test, status='in_progress')
+        self.client.force_authenticate(user=self.student)
+
+    def test_marking_a_never_answered_question_creates_a_row_with_no_option(self):
+        resp = self.client.post(f'/api/attempts/{self.attempt.id}/mark-review/', {'question_id': self.question.id, 'marked': True})
+
+        self.assertEqual(resp.status_code, 200)
+        answer = Answer.objects.get(attempt=self.attempt, question=self.question)
+        self.assertTrue(answer.is_marked_for_review)
+        self.assertIsNone(answer.selected_option_id)
+
+    def test_marking_an_already_answered_question_does_not_blank_the_answer(self):
+        self.client.post(f'/api/attempts/{self.attempt.id}/answer/', {'question_id': self.question.id, 'option_id': self.correct.id})
+
+        resp = self.client.post(f'/api/attempts/{self.attempt.id}/mark-review/', {'question_id': self.question.id, 'marked': True})
+
+        self.assertEqual(resp.status_code, 200)
+        answer = Answer.objects.get(attempt=self.attempt, question=self.question)
+        self.assertTrue(answer.is_marked_for_review)
+        self.assertEqual(answer.selected_option_id, self.correct.id)
+        self.assertTrue(answer.is_correct)
+
+    def test_unmarking_clears_the_flag_without_touching_the_answer(self):
+        self.client.post(f'/api/attempts/{self.attempt.id}/answer/', {'question_id': self.question.id, 'option_id': self.wrong.id})
+        self.client.post(f'/api/attempts/{self.attempt.id}/mark-review/', {'question_id': self.question.id, 'marked': True})
+
+        resp = self.client.post(f'/api/attempts/{self.attempt.id}/mark-review/', {'question_id': self.question.id, 'marked': False})
+
+        self.assertEqual(resp.status_code, 200)
+        answer = Answer.objects.get(attempt=self.attempt, question=self.question)
+        self.assertFalse(answer.is_marked_for_review)
+        self.assertEqual(answer.selected_option_id, self.wrong.id)
+
+    def test_requires_question_id(self):
+        resp = self.client.post(f'/api/attempts/{self.attempt.id}/mark-review/', {'marked': True})
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_cannot_mark_on_a_submitted_attempt(self):
+        self.attempt.status = 'submitted'
+        self.attempt.save()
+
+        resp = self.client.post(f'/api/attempts/{self.attempt.id}/mark-review/', {'question_id': self.question.id, 'marked': True})
+
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_requires_auth(self):
+        self.client.force_authenticate(user=None)
+        resp = self.client.post(f'/api/attempts/{self.attempt.id}/mark-review/', {'question_id': self.question.id, 'marked': True})
+        self.assertEqual(resp.status_code, status.HTTP_401_UNAUTHORIZED)
+
+
+class AttemptDetailRestoresProgressTests(APITestCase):
+    """Test Player redesign: reopening an in-progress attempt must restore
+    previously-saved answers/marks/bookmarks — the second real bug fix
+    (state used to start blank on every page mount)."""
+
+    def setUp(self):
+        self.student = User.objects.create_user(username='restore_student', email='restore_student@example.com', password='pw12345')
+        self.subject = Subject.objects.create(name='Restore Subject')
+        self.q1 = Question.objects.create(subject=self.subject, text='Restore Q1', marks=1, negative_marks=0)
+        self.q1_correct = Option.objects.create(question=self.q1, text='Right', is_correct=True)
+        Option.objects.create(question=self.q1, text='Wrong', is_correct=False)
+        self.q2 = Question.objects.create(subject=self.subject, text='Restore Q2', marks=1, negative_marks=0)
+        self.test = Test.objects.create(title='Restore Test', exam_type='mock', shuffle_questions=False)
+        TestQuestion.objects.create(test=self.test, question=self.q1, order=0)
+        TestQuestion.objects.create(test=self.test, question=self.q2, order=1)
+        self.attempt = TestAttempt.objects.create(user=self.student, test=self.test, status='in_progress')
+        self.client.force_authenticate(user=self.student)
+
+    def test_get_attempt_returns_previously_saved_answers_and_marks(self):
+        self.client.post(f'/api/attempts/{self.attempt.id}/answer/', {'question_id': self.q1.id, 'option_id': self.q1_correct.id})
+        self.client.post(f'/api/attempts/{self.attempt.id}/mark-review/', {'question_id': self.q2.id, 'marked': True})
+
+        resp = self.client.get(f'/api/attempts/{self.attempt.id}/')
+
+        self.assertEqual(resp.status_code, 200)
+        answers = resp.data['answers']
+        self.assertEqual(answers[self.q1.id]['option_id'], self.q1_correct.id)
+        self.assertFalse(answers[self.q1.id]['is_marked_for_review'])
+        self.assertIsNone(answers[self.q2.id]['option_id'])
+        self.assertTrue(answers[self.q2.id]['is_marked_for_review'])
+
+    def test_get_attempt_returns_no_answers_before_any_are_saved(self):
+        resp = self.client.get(f'/api/attempts/{self.attempt.id}/')
+        self.assertEqual(resp.data['answers'], {})
+
+    def test_question_reflects_a_bookmark_made_from_qbank(self):
+        self.client.post(f'/api/questions/{self.q1.id}/bookmark/', {'bookmark': True})
+
+        resp = self.client.get(f'/api/attempts/{self.attempt.id}/')
+
+        questions_by_id = {q['id']: q for q in resp.data['questions']}
+        self.assertTrue(questions_by_id[self.q1.id]['is_bookmarked'])
+        self.assertFalse(questions_by_id[self.q2.id]['is_bookmarked'])
 
 
 class KpiOverviewQuestionsTodayTests(APITestCase):

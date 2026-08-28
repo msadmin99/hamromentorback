@@ -86,11 +86,21 @@ class QuestionForAttemptSerializer(serializers.ModelSerializer):
     from academics.serializers import OptionSerializer as _OptionSerializer
     options = OptionSerializer(many=True, read_only=True)
     subject_name = serializers.CharField(source='subject.name', read_only=True)
+    is_bookmarked = serializers.SerializerMethodField()
 
     class Meta:
         from academics.models import Question
         model = Question
-        fields = ['id', 'public_id', 'text', 'image', 'latex', 'marks', 'negative_marks', 'subject_name', 'options']
+        fields = ['id', 'public_id', 'text', 'image', 'latex', 'marks', 'negative_marks', 'subject_name', 'options', 'is_bookmarked']
+
+    def get_is_bookmarked(self, obj):
+        # Same Question/QuestionAttempt.is_bookmarked a QBank bookmark sets —
+        # bulk-fetched once by TestAttemptSerializer.get_questions() into
+        # context['bookmarked_question_ids'], not annotated here (this
+        # queryset comes from obj.test.questions.all(), not
+        # QuestionViewSet.get_queryset(), so no per-request annotation to
+        # rely on) — avoids an N+1 bookmark lookup per question.
+        return obj.id in self.context.get('bookmarked_question_ids', set())
 
 
 class TestDetailSerializer(TestListSerializer):
@@ -314,6 +324,7 @@ class StartTestSerializer(serializers.Serializer):
 
 class TestAttemptSerializer(serializers.ModelSerializer):
     questions = serializers.SerializerMethodField()
+    answers = serializers.SerializerMethodField()
     test_title = serializers.CharField(source='test.title', read_only=True)
     duration_minutes = serializers.IntegerField(source='test.duration_minutes', read_only=True)
     questions_per_page = serializers.IntegerField(source='test.questions_per_page', read_only=True)
@@ -324,7 +335,7 @@ class TestAttemptSerializer(serializers.ModelSerializer):
         model = TestAttempt
         fields = [
             'id', 'test', 'test_title', 'duration_minutes', 'questions_per_page', 'attempt_number',
-            'start_time', 'status', 'questions', 'preview_only', 'session', 'session_name',
+            'start_time', 'status', 'questions', 'answers', 'preview_only', 'session', 'session_name',
         ]
 
     def get_preview_only(self, obj):
@@ -339,7 +350,28 @@ class TestAttemptSerializer(serializers.ModelSerializer):
             random.shuffle(qs)
         if self.get_preview_only(obj):
             qs = qs[:obj.test.free_preview_questions]
-        return QuestionForAttemptSerializer(qs, many=True, context=self.context).data
+
+        request = self.context.get('request')
+        user = request.user if request else None
+        bookmarked_question_ids = set()
+        if user and user.is_authenticated:
+            from academics.models import QuestionAttempt
+            bookmarked_question_ids = set(
+                QuestionAttempt.objects.filter(
+                    user=user, question_id__in=[q.id for q in qs], is_bookmarked=True,
+                ).values_list('question_id', flat=True)
+            )
+        context = {**self.context, 'bookmarked_question_ids': bookmarked_question_ids}
+        return QuestionForAttemptSerializer(qs, many=True, context=context).data
+
+    def get_answers(self, obj):
+        """Previously-saved answers/marks for this in-progress attempt — the
+        frontend restores answered/marked-for-review state from this on
+        load instead of starting blank on every page mount/refresh."""
+        return {
+            a.question_id: {'option_id': a.selected_option_id, 'is_marked_for_review': a.is_marked_for_review}
+            for a in obj.answers.all()
+        }
 
 
 class SubmitAnswerSerializer(serializers.Serializer):

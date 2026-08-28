@@ -705,6 +705,29 @@ class SubmitAnswerView(APIView):
         return Response({'saved': True})
 
 
+class MarkForReviewView(APIView):
+    """Toggle 'mark for review' independently of answer() — a dedicated,
+    narrow action for the same reason QuestionViewSet.bookmark/confidence
+    are: SubmitAnswerView's update_or_create sets selected_option/is_correct
+    unconditionally from its payload, so calling it with no option_id just
+    to toggle this flag would silently blank an already-selected answer.
+    Safe to call before, during, or after answering."""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, attempt_id):
+        attempt = get_object_or_404(TestAttempt, pk=attempt_id, user=request.user, status='in_progress')
+        question_id = request.data.get('question_id')
+        marked = request.data.get('marked') in (True, 'true', 'True', '1', 1)
+        if not question_id:
+            return Response({'detail': 'question_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        get_object_or_404(attempt.test.questions, pk=question_id)
+        Answer.objects.update_or_create(
+            attempt=attempt, question_id=question_id,
+            defaults={'is_marked_for_review': marked},
+        )
+        return Response({'is_marked_for_review': marked})
+
+
 class SubmitTestView(APIView):
     permission_classes = [IsAuthenticated]
 
