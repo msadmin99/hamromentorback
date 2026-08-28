@@ -305,6 +305,12 @@ class QuestionAttempt(models.Model):
     last_result = models.BooleanField(null=True, blank=True, help_text='Mirrors is_correct — kept as an explicit, nullable field for New (never attempted, still attempts_count=0) vs Incorrect.')
     mastery_status = models.CharField(max_length=15, choices=MASTERY_CHOICES, default='new')
     revision_due_at = models.DateTimeField(null=True, blank=True)
+    CONFIDENCE_CHOICES = [('guess', 'Guess'), ('unsure', 'Unsure'), ('confident', 'Confident')]
+    confidence = models.CharField(
+        max_length=10, choices=CONFIDENCE_CHOICES, blank=True,
+        help_text='How sure the student felt about their latest answer, self-reported in QBank practice only '
+                   '(never asked in Test Mode). Used to surface "confident but incorrect" as a likely misconception.',
+    )
 
     class Meta:
         ordering = ['-answered_at']

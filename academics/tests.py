@@ -576,6 +576,60 @@ class QuestionAnswerRecordsPerformanceTests(APITestCase):
         self.assertTrue(attempt.is_bookmarked)
 
 
+class AnswerConfidenceTests(APITestCase):
+    """QBank homepage redesign: post-answer 'how confident were you?'
+    (guess/unsure/confident), self-reported, QBank-only — must never be
+    touched by Test Mode submissions (see record_question_result's source
+    param elsewhere)."""
+
+    def setUp(self):
+        self.student = User.objects.create_user(username='student1', email='student1@example.com', password='pw12345')
+        self.subject = Subject.objects.create(name='Physics')
+        self.question = Question.objects.create(subject=self.subject, text='2+2=?')
+        self.correct_option = Option.objects.create(question=self.question, text='4', is_correct=True)
+        self.client.force_authenticate(user=self.student)
+
+    def test_confidence_is_persisted_on_answer(self):
+        self.client.post(
+            f'/api/questions/{self.question.id}/answer/',
+            {'option_id': self.correct_option.id, 'confidence': 'confident'},
+        )
+
+        attempt = QuestionAttempt.objects.get(user=self.student, question=self.question)
+        self.assertEqual(attempt.confidence, 'confident')
+
+    def test_confidence_is_optional_and_defaults_blank(self):
+        resp = self.client.post(f'/api/questions/{self.question.id}/answer/', {'option_id': self.correct_option.id})
+
+        self.assertEqual(resp.status_code, 200)
+        attempt = QuestionAttempt.objects.get(user=self.student, question=self.question)
+        self.assertEqual(attempt.confidence, '')
+
+    def test_invalid_confidence_value_is_rejected(self):
+        resp = self.client.post(
+            f'/api/questions/{self.question.id}/answer/',
+            {'option_id': self.correct_option.id, 'confidence': 'not-a-real-choice'},
+        )
+
+        self.assertEqual(resp.status_code, 400)
+
+    def test_confidence_action_sets_confidence_without_double_counting_attempts(self):
+        """The post-result confidence prompt hits this dedicated action, not
+        `answer` again — must never bump attempts_count/mastery_status."""
+        self.client.post(f'/api/questions/{self.question.id}/answer/', {'option_id': self.correct_option.id})
+
+        resp = self.client.post(f'/api/questions/{self.question.id}/confidence/', {'confidence': 'guess'})
+
+        self.assertEqual(resp.status_code, 200)
+        attempt = QuestionAttempt.objects.get(user=self.student, question=self.question)
+        self.assertEqual(attempt.confidence, 'guess')
+        self.assertEqual(attempt.attempts_count, 1)
+
+    def test_confidence_action_rejects_invalid_value(self):
+        resp = self.client.post(f'/api/questions/{self.question.id}/confidence/', {'confidence': 'sort-of'})
+        self.assertEqual(resp.status_code, 400)
+
+
 class QuestionDashboardEndpointTests(APITestCase):
     def setUp(self):
         self.student = User.objects.create_user(username='student1', email='student1@example.com', password='pw12345')
@@ -602,6 +656,31 @@ class QuestionDashboardEndpointTests(APITestCase):
         self.assertEqual(resp.data['incorrect'], 1)
         self.assertEqual(resp.data['mastered'], 1)
         self.assertEqual(resp.data['weak'], 1)
+
+    def test_dashboard_reports_topics_practiced_and_qbank_study_time(self):
+        from academics.services import record_question_result
+
+        chapter = Chapter.objects.create(subject=self.subject, name='Mechanics')
+        topic = Topic.objects.create(chapter=chapter, name='Kinematics')
+        self.q1.topic = topic
+        self.q1.save()
+
+        record_question_result(self.student, self.q1, True, source='qbank', time_taken_seconds=30)
+        record_question_result(self.student, self.q2, False, source='qbank', time_taken_seconds=45)
+
+        resp = self.client.get('/api/questions/dashboard/')
+
+        self.assertEqual(resp.data['topics_practiced'], 1)
+        self.assertEqual(resp.data['study_seconds'], 75)
+
+    def test_dashboard_study_time_excludes_test_mode_time(self):
+        from academics.services import record_question_result
+
+        record_question_result(self.student, self.q1, True, source='test', time_taken_seconds=999)
+
+        resp = self.client.get('/api/questions/dashboard/')
+
+        self.assertEqual(resp.data['study_seconds'], 0)
 
     def test_dashboard_requires_auth(self):
         self.client.force_authenticate(user=None)
@@ -807,6 +886,91 @@ class SubjectCourseScopingTests(APITestCase):
         new_subject_suggestions = [s for s in resp.data['suggestions'] if s.get('type') == 'new_subject']
         for s in new_subject_suggestions:
             self.assertNotEqual(s['subject_id'], self.physics.id)
+
+
+class SubjectPercentPracticedTests(APITestCase):
+    """QBank homepage redesign: SubjectGrid needs a question-level %
+    practiced (attempted_count/question_count), distinct from the existing
+    chapter-level solved_modules/module_count."""
+
+    def setUp(self):
+        self.student = User.objects.create_user(username='pct_student', email='pct_student@example.com', password='pw12345')
+        self.subject = Subject.objects.create(name='Percent Practiced Subject')
+        self.q1 = Question.objects.create(subject=self.subject, text='Q1')
+        self.q2 = Question.objects.create(subject=self.subject, text='Q2')
+        self.q3 = Question.objects.create(subject=self.subject, text='Q3')
+        self.q4 = Question.objects.create(subject=self.subject, text='Q4')
+        self.client.force_authenticate(user=self.student)
+
+    def test_percent_practiced_matches_attempted_over_total(self):
+        from academics.services import record_question_result
+
+        record_question_result(self.student, self.q1, True, source='qbank')
+        record_question_result(self.student, self.q2, False, source='qbank')
+
+        resp = self.client.get('/api/subjects/')
+        row = next(s for s in resp.data if s['id'] == self.subject.id)
+
+        self.assertEqual(row['attempted_count'], 2)
+        self.assertEqual(row['question_count'], 4)
+        self.assertEqual(row['percent_practiced'], 50)
+
+    def test_percent_practiced_is_zero_for_a_subject_with_no_questions(self):
+        empty_subject = Subject.objects.create(name='Empty Percent Subject')
+
+        resp = self.client.get('/api/subjects/')
+        row = next(s for s in resp.data if s['id'] == empty_subject.id)
+
+        self.assertEqual(row['percent_practiced'], 0)
+
+    def test_percent_practiced_is_zero_for_anonymous_user(self):
+        self.client.force_authenticate(user=None)
+        resp = self.client.get('/api/subjects/')
+        row = next(s for s in resp.data if s['id'] == self.subject.id)
+        self.assertEqual(row['percent_practiced'], 0)
+
+
+class RecommendedTopSuggestionEnrichmentTests(APITestCase):
+    """QBank homepage redesign: the top /questions/recommended/ suggestion
+    needs accuracy_pct/question_count/estimated_minutes for the 'Your Next
+    Practice' hero card's accuracy ring + '~N min' + 'N Questions'."""
+
+    def setUp(self):
+        self.student = User.objects.create_user(username='next_practice_student', email='next_practice@example.com', password='pw12345')
+        self.subject = Subject.objects.create(name='Cardiovascular Physiology')
+        self.topic = Topic.objects.create(chapter=Chapter.objects.create(subject=self.subject, name='Heart'), name='Cardiac Cycle')
+        self.client.force_authenticate(user=self.student)
+
+    def test_top_suggestion_carries_normalized_hero_card_fields(self):
+        from academics.services import record_question_result
+
+        # 3+ attempts on this subject, mostly wrong, so it becomes the
+        # weakest subject and produces a 'revise_topic' or 'improve_subject'
+        # top suggestion with a real weak_count/accuracy behind it.
+        questions = [Question.objects.create(subject=self.subject, topic=self.topic, text=f'Q{i}') for i in range(5)]
+        for i, q in enumerate(questions):
+            record_question_result(self.student, q, i == 0, source='qbank')
+
+        resp = self.client.get('/api/questions/recommended/')
+
+        self.assertEqual(resp.status_code, 200)
+        top = resp.data['suggestions'][0]
+        self.assertIn('question_count', top)
+        self.assertIn('accuracy_pct', top)
+        self.assertIn('estimated_minutes', top)
+        if top['question_count']:
+            self.assertGreaterEqual(top['estimated_minutes'], 5)
+
+    def test_fallback_suggestion_has_no_crash_on_missing_counts(self):
+        """A brand-new student with no attempts gets the 'start_new'
+        fallback, which has no count — must not raise a TypeError computing
+        estimated_minutes from None."""
+        resp = self.client.get('/api/questions/recommended/')
+
+        self.assertEqual(resp.status_code, 200)
+        top = resp.data['suggestions'][0]
+        self.assertEqual(top['type'], 'start_new')
+        self.assertIsNone(top['estimated_minutes'])
 
 
 class CompleteCourseScopingAuditTests(APITestCase):

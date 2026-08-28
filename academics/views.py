@@ -1,4 +1,4 @@
-from django.db.models import Count, Exists, OuterRef
+from django.db.models import Count, Exists, OuterRef, Sum
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import status, viewsets
@@ -387,6 +387,7 @@ class QuestionViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         option_id = serializer.validated_data.get('option_id')
         time_taken_seconds = serializer.validated_data.get('time_taken_seconds')
+        confidence = serializer.validated_data.get('confidence') or None
 
         selected_option = None
         is_correct = False
@@ -400,7 +401,7 @@ class QuestionViewSet(viewsets.ModelViewSet):
             # validated_data even when the client never sent the key).
             record_question_result(
                 request.user, question, is_correct, source='qbank',
-                selected_option=selected_option, time_taken_seconds=time_taken_seconds,
+                selected_option=selected_option, time_taken_seconds=time_taken_seconds, confidence=confidence,
             )
             # record_question_result updates Question.total_attempts/correct_attempts
             # and Option.pick_count/pick_percentage via .update() on the DB rows
@@ -468,6 +469,24 @@ class QuestionViewSet(viewsets.ModelViewSet):
             defaults={'is_bookmarked': is_bookmarked},
         )
         return Response({'is_bookmarked': is_bookmarked})
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
+    def confidence(self, request, pk=None):
+        """Self-reported 'how confident were you?' (guess/unsure/confident),
+        set AFTER the student has already seen their answer result — a
+        second call to `answer` itself would double-count attempts_count via
+        record_question_result(), so this is a separate, narrow action that
+        only ever touches QuestionAttempt.confidence (same pattern as
+        `bookmark` above touching only is_bookmarked)."""
+        question = self.get_object()
+        value = request.data.get('confidence')
+        if value not in dict(QuestionAttempt.CONFIDENCE_CHOICES):
+            return Response({'detail': 'Invalid confidence value.'}, status=status.HTTP_400_BAD_REQUEST)
+        QuestionAttempt.objects.update_or_create(
+            user=request.user, question=question,
+            defaults={'confidence': value},
+        )
+        return Response({'confidence': value})
 
     @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
     def report(self, request, pk=None):
@@ -554,6 +573,20 @@ class QuestionViewSet(viewsets.ModelViewSet):
         correct = attempt_qs.filter(last_result=True).count()
         incorrect = attempt_qs.filter(last_result=False).count()
         accuracy = round(correct / attempted * 100, 2) if attempted else 0.0
+        topics_practiced = attempt_qs.exclude(question__topic__isnull=True).values('question__topic').distinct().count()
+
+        # QBank-only study time (source='qbank') — deliberately excludes Test
+        # Mode time, since this dashboard is QBank-scoped throughout; test
+        # time already has its own home in kpi_overview()'s total_study_seconds.
+        event_qs = QuestionEvent.objects.filter(user=user, source='qbank')
+        if subject:
+            event_qs = event_qs.filter(question__subject__slug=subject)
+        if course:
+            event_qs = event_qs.filter(
+                Q_course(question__courses__id=course)
+                | Q_course(question__courses__isnull=True, question__subject__courses__id=course)
+            )
+        study_seconds = event_qs.aggregate(total=Sum('time_taken_seconds'))['total'] or 0
 
         return Response({
             'total_questions': total_questions,
@@ -567,6 +600,8 @@ class QuestionViewSet(viewsets.ModelViewSet):
             'weak': attempt_qs.filter(mastery_status='weak').count(),
             'need_practice': attempt_qs.filter(mastery_status__in=['need_practice', 'learning']).count(),
             'need_revision': attempt_qs.filter(revision_due_at__lte=timezone.now()).count(),
+            'topics_practiced': topics_practiced,
+            'study_seconds': study_seconds,
         })
 
     @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
@@ -653,6 +688,7 @@ class QuestionViewSet(viewsets.ModelViewSet):
                 suggestions.append({
                     'type': 'revise_topic', 'subject_id': s['subject_id'], 'subject_name': s['subject_name'],
                     'topic_id': t['topic_id'], 'topic_name': t['topic_name'], 'count': weak_count,
+                    'accuracy': t['accuracy'],
                     'message': f"Revise {t['topic_name']} — {weak_count} weak question{'s' if weak_count != 1 else ''}",
                     'practice_params': {'subject': s['subject_id'], 'topic': t['topic_id'], 'status': 'weak'},
                 })
@@ -692,6 +728,21 @@ class QuestionViewSet(viewsets.ModelViewSet):
                 'type': 'start_new', 'message': 'Start with New Questions',
                 'practice_params': {'status': 'new'},
             })
+
+        # Normalized accuracy_pct/question_count/estimated_minutes on the TOP
+        # suggestion only — this is what the "Your Next Practice" hero card
+        # reads (accuracy ring + "~N min" + "N Questions"). Only computed for
+        # suggestions[0] since it's the only one ever rendered as the hero;
+        # the raw per-type suggestion dicts above are unchanged for every
+        # other existing caller of this endpoint.
+        top = suggestions[0]
+        top['question_count'] = top.get('count')
+        top['accuracy_pct'] = top.get('accuracy')
+        if top['question_count'] is None and top['type'] == 'improve_subject':
+            top['question_count'] = QuestionAttempt.objects.filter(
+                user=user, mastery_status__in=['weak', 'need_practice'], question__subject_id=top.get('subject_id'),
+            ).count()
+        top['estimated_minutes'] = max(5, round(top['question_count'] * 1.25)) if top['question_count'] else None
 
         return Response({'suggestions': suggestions[:4], 'note': 'Rule-based suggestions from your own performance data.'})
 

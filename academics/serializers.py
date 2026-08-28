@@ -58,12 +58,15 @@ class SubjectListSerializer(serializers.ModelSerializer):
     courses_detail = serializers.SerializerMethodField()
     courses = serializers.PrimaryKeyRelatedField(queryset=Course.objects.all(), many=True, required=False)
     has_access = serializers.SerializerMethodField()
+    attempted_count = serializers.SerializerMethodField()
+    percent_practiced = serializers.SerializerMethodField()
 
     class Meta:
         model = Subject
         fields = [
             'id', 'name', 'slug', 'prefix', 'icon', 'order', 'is_free',
             'module_count', 'solved_modules', 'question_count', 'video_count', 'courses', 'courses_detail', 'has_access',
+            'attempted_count', 'percent_practiced',
         ]
         extra_kwargs = {'slug': {'required': False}, 'prefix': {'required': False}}
 
@@ -95,6 +98,21 @@ class SubjectListSerializer(serializers.ModelSerializer):
             QuestionAttempt.objects.filter(user=user, question__subject=obj)
             .values('question__chapter').distinct().count()
         )
+
+    def get_attempted_count(self, obj):
+        """Question-level (not chapter-level) attempted count — what
+        percent_practiced is based on, distinct from solved_modules'
+        chapter-started count above."""
+        user = self.context.get('request').user if self.context.get('request') else None
+        if not user or not user.is_authenticated:
+            return 0
+        return QuestionAttempt.objects.filter(user=user, question__subject=obj).count()
+
+    def get_percent_practiced(self, obj):
+        total = self.get_question_count(obj)
+        if not total:
+            return 0
+        return round(self.get_attempted_count(obj) / total * 100)
 
 
 class SubjectDetailSerializer(SubjectListSerializer):
@@ -263,6 +281,7 @@ class AnswerSubmitSerializer(serializers.Serializer):
     option_id = serializers.IntegerField(required=False, allow_null=True)
     bookmark = serializers.BooleanField(required=False, default=False)
     time_taken_seconds = serializers.IntegerField(required=False, allow_null=True, min_value=0)
+    confidence = serializers.ChoiceField(choices=['guess', 'unsure', 'confident'], required=False, allow_blank=True)
 
 
 class QuestionResultSerializer(serializers.ModelSerializer):

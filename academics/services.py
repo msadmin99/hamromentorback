@@ -53,7 +53,7 @@ def _apply_question_stat_delta(question_id, total_delta, correct_delta, option_d
 
 
 @transaction.atomic
-def record_question_result(user, question, is_correct, source, selected_option=None, time_taken_seconds=None):
+def record_question_result(user, question, is_correct, source, selected_option=None, time_taken_seconds=None, confidence=None):
     """The one write path for "a student answered this question" — called
     from QBank practice (QuestionViewSet.answer) and from final test
     submission (SubmitTestView, once per answered question, not per
@@ -61,6 +61,9 @@ def record_question_result(user, question, is_correct, source, selected_option=N
     platform. Increments running totals (never overwrites them), recomputes
     mastery_status/revision_due_at, and appends an immutable QuestionEvent.
     Never touches is_bookmarked — that stays a separate, independent flag.
+    `confidence` is QBank-practice-only (Test Mode never passes it, so a
+    test submission never overwrites a student's last self-reported
+    confidence with a blank).
 
     Also maintains Question.total_attempts/correct_attempts and
     Option.pick_count/pick_percentage — but as one vote per distinct
@@ -87,6 +90,8 @@ def record_question_result(user, question, is_correct, source, selected_option=N
     attempt.last_result = is_correct
     if selected_option is not None:
         attempt.selected_option = selected_option
+    if confidence:
+        attempt.confidence = confidence
     attempt.mastery_status = _compute_mastery_status(attempt.attempts_count, attempt.correct_count, config)
 
     interval_days = config.revision_interval_correct_days if is_correct else config.revision_interval_incorrect_days
