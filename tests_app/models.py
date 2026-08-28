@@ -282,3 +282,21 @@ class Answer(models.Model):
 
     class Meta:
         unique_together = ('attempt', 'question')
+
+
+class SavedExamView(models.Model):
+    """A staff member's saved Exam Management filter combination (Program,
+    Exam Type, Status, search text, etc.) — restored with one click instead
+    of re-selecting the same filters every visit. `filters` is opaque JSON
+    the frontend owns the shape of; the backend only stores/scopes it."""
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='saved_exam_views')
+    name = models.CharField(max_length=100)
+    filters = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['name']
+        unique_together = ('user', 'name')
+
+    def __str__(self):
+        return f'{self.name} ({self.user})'

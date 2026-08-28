@@ -67,13 +67,22 @@ class User(AbstractUser):
 # Admin/Super-Admin only regardless of what's saved in RolePermission.
 EDITOR_ALLOWED_FEATURES = [
     'question_bank', 'question_entry', 'video_lectures', 'test_series', 'daily_live_exam', 'self_mock_test', 'mock_test',
-    'question_reports',
+    'question_reports', 'exam_schedule',
 ]
+
+# Layered under 'test_series' (which gates seeing Exam Management at all) —
+# a role can have the base feature without these, e.g. a Question Editor who
+# builds/edits exams but can't schedule sessions, archive, or delete them.
+# Chosen over a separate role hierarchy (Question Editor/Exam Manager as
+# first-class admin_role values) so the existing feature-key + RolePermission
+# system stays the single source of truth for capability differences.
+EXAM_MANAGEMENT_FEATURES = ['exam_schedule', 'exam_archive', 'exam_delete']
 
 ALL_FEATURES = [
     'dashboard', 'courses', 'question_bank', 'question_entry', 'video_lectures', 'daily_practice', 'students',
     'test_series', 'self_mock_test', 'enrollment_requests', 'question_reports', 'daily_live_exam', 'mock_test',
     'website_settings', 'advanced', 'billing', 'teacher_applications', 'marketplace_courses',
+    *EXAM_MANAGEMENT_FEATURES,
 ]
 
 # Teacher permissions are a fixed ceiling, not admin-configurable via RolePermission

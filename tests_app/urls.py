@@ -9,6 +9,7 @@ from .views import (
     ExamTypeStatsView,
     MyAttemptsView,
     PerformanceCalendarView,
+    SavedExamViewViewSet,
     StudentPerformanceOverviewView,
     SubjectPerformanceDetailView,
     SubmitAnswerView,
@@ -21,6 +22,7 @@ router = DefaultRouter()
 router.register('tests', TestViewSet, basename='test')
 router.register('exam-templates', ExamTemplateViewSet, basename='exam-template')
 router.register('exam-sessions', ExamSessionViewSet, basename='exam-session')
+router.register('saved-exam-views', SavedExamViewViewSet, basename='saved-exam-view')
 
 urlpatterns = router.urls + [
     path('attempts/mine/', MyAttemptsView.as_view(), name='my-attempts'),

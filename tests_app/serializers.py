@@ -4,7 +4,7 @@ from rest_framework import serializers
 from academics.models import Question
 from academics.serializers import OptionSerializer, QuestionResultSerializer
 
-from .models import Answer, ExamSession, ExamTemplate, Test, TestAttempt, TestQuestion
+from .models import Answer, ExamSession, ExamTemplate, SavedExamView, Test, TestAttempt, TestQuestion
 
 
 def _staff_name(user):
@@ -239,12 +239,14 @@ class ExamTemplateSerializer(serializers.ModelSerializer):
     version_count = serializers.SerializerMethodField()
     latest_session = serializers.SerializerMethodField()
     total_participants = serializers.SerializerMethodField()
+    status = serializers.SerializerMethodField()
+    courses_detail = serializers.SerializerMethodField()
 
     class Meta:
         model = ExamTemplate
         fields = [
             'id', 'exam_code', 'title', 'exam_type', 'created_by_name', 'created_at',
-            'version_count', 'latest_session', 'total_participants',
+            'version_count', 'latest_session', 'total_participants', 'status', 'courses_detail',
         ]
 
     def get_created_by_name(self, obj):
@@ -252,6 +254,9 @@ class ExamTemplateSerializer(serializers.ModelSerializer):
 
     def get_version_count(self, obj):
         return obj.versions.count()
+
+    def _latest_version(self, obj):
+        return obj.versions.order_by('-version_number', '-created_at').first()
 
     def get_latest_session(self, obj):
         latest = obj.sessions.order_by('-start_datetime').first()
@@ -261,6 +266,30 @@ class ExamTemplateSerializer(serializers.ModelSerializer):
 
     def get_total_participants(self, obj):
         return TestAttempt.objects.filter(session__exam_template=obj).values('user').distinct().count()
+
+    def get_status(self, obj):
+        """Published / Draft / Scheduled for the exam-management table badge
+        — mirrors the same latest-version-draft + upcoming-session logic
+        tests_app.views._exam_stats() uses for counting, so the badge shown
+        per row always agrees with the Exam Stats card's totals."""
+        latest_version = self._latest_version(obj)
+        if not latest_version or latest_version.is_draft:
+            return 'draft'
+        if obj.sessions.filter(status__in=['scheduled', 'registration_open']).exists():
+            return 'scheduled'
+        return 'published'
+
+    def get_courses_detail(self, obj):
+        latest_version = self._latest_version(obj)
+        if not latest_version:
+            return []
+        return [{'id': c.id, 'name': c.name, 'program_group': c.program_group} for c in latest_version.courses.all()]
+
+
+class SavedExamViewSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SavedExamView
+        fields = ['id', 'name', 'filters', 'created_at']
 
 
 class RescheduleSerializer(serializers.Serializer):

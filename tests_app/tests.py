@@ -5,7 +5,7 @@ from rest_framework.test import APITestCase
 
 from academics.models import Option, Question, QuestionAttempt, QuestionEvent, Subject
 from core.models import DeletionAuditLog
-from tests_app.models import ExamSession, ExamTemplate, Test, TestAttempt, TestQuestion
+from tests_app.models import ExamSession, ExamTemplate, SavedExamView, Test, TestAttempt, TestQuestion
 
 User = get_user_model()
 
@@ -714,3 +714,285 @@ class PerformanceCourseScopingTests(APITestCase):
         revise = [s for s in resp.data['recommendations']['suggestions'] if s.get('subject_id') == shared_subject.id]
         self.assertTrue(revise)
         self.assertNotEqual(revise[0]['suggested_test_id'], ug_only_test.id)
+
+
+class ExamManagementDashboardApiTests(APITestCase):
+    """The Admin Exam Management rebuild's new server-side filters
+    (?program=/?status=/?search=/?standalone=), the opt-in paginated
+    `browse` actions on TestViewSet/ExamTemplateViewSet (GET /tests/ and
+    GET /exam-templates/ themselves must stay bare-array, per the existing
+    callers this session confirmed — Frontend SingleTestSection.js and
+    Admin videos/page.js both do `.then(setTests)` on a plain array), and
+    the new /tests/stats/ aggregate endpoint."""
+
+    def setUp(self):
+        from courses.models import Course
+
+        self.staff = User.objects.create_user(
+            username='examdash_staff', email='examdash_staff@example.com', password='pw12345',
+            is_staff=True, admin_role='admin',
+        )
+        self.student = User.objects.create_user(
+            username='examdash_student', email='examdash_student@example.com', password='pw12345',
+        )
+        self.mbbs_course = Course.objects.create(name='CEE-MBBS Dash', prefix='MBBSDASH', program_group='CEE-MBBS')
+        self.pg_course = Course.objects.create(name='CEE-PG Dash', prefix='PGDASH', program_group='CEE-PG')
+
+    def test_program_filter_scopes_by_course_program_group(self):
+        mbbs_test = Test.objects.create(title='MBBS Mock Dash', exam_type='mock', is_draft=False)
+        mbbs_test.courses.set([self.mbbs_course])
+        pg_test = Test.objects.create(title='PG Mock Dash', exam_type='mock', is_draft=False)
+        pg_test.courses.set([self.pg_course])
+        self.client.force_authenticate(user=self.staff)
+
+        resp = self.client.get('/api/tests/?program=CEE-MBBS')
+
+        ids = {row['id'] for row in resp.data}
+        self.assertIn(mbbs_test.id, ids)
+        self.assertNotIn(pg_test.id, ids)
+
+    def test_search_filter_matches_title_case_insensitively(self):
+        Test.objects.create(title='Respiratory System Daily Test', exam_type='daily', is_draft=False)
+        Test.objects.create(title='Cardiology Mock', exam_type='mock', is_draft=False)
+        self.client.force_authenticate(user=self.staff)
+
+        resp = self.client.get('/api/tests/?search=respiratory')
+
+        titles = {row['title'] for row in resp.data}
+        self.assertIn('Respiratory System Daily Test', titles)
+        self.assertNotIn('Cardiology Mock', titles)
+
+    def test_status_filter_draft_vs_published(self):
+        draft = Test.objects.create(title='Draft Dash Exam', exam_type='mock', is_draft=True)
+        published = Test.objects.create(title='Published Dash Exam', exam_type='mock', is_draft=False)
+        self.client.force_authenticate(user=self.staff)
+
+        draft_ids = {row['id'] for row in self.client.get('/api/tests/?status=draft').data}
+        published_ids = {row['id'] for row in self.client.get('/api/tests/?status=published').data}
+
+        self.assertIn(draft.id, draft_ids)
+        self.assertNotIn(published.id, draft_ids)
+        self.assertIn(published.id, published_ids)
+        self.assertNotIn(draft.id, published_ids)
+
+    def test_status_filter_scheduled_matches_tests_with_an_upcoming_session(self):
+        template = ExamTemplate.objects.create(title='Scheduled Dash Exam', exam_type='mock', created_by=self.staff)
+        scheduled_test = Test.objects.create(
+            title='Scheduled Dash Exam v1', exam_type='mock', is_draft=False, exam_template=template,
+        )
+        ExamSession.objects.create(
+            exam_template=template, exam_version=scheduled_test, session_name='Session 1',
+            start_datetime=timezone.now() + timezone.timedelta(days=1),
+            end_datetime=timezone.now() + timezone.timedelta(days=1, hours=2),
+            status='scheduled', created_by=self.staff,
+        )
+        unscheduled_test = Test.objects.create(title='No Session Dash Exam', exam_type='mock', is_draft=False)
+        self.client.force_authenticate(user=self.staff)
+
+        resp = self.client.get('/api/tests/?status=scheduled')
+
+        ids = {row['id'] for row in resp.data}
+        self.assertIn(scheduled_test.id, ids)
+        self.assertNotIn(unscheduled_test.id, ids)
+
+    def test_standalone_filter_excludes_templated_exam_versions(self):
+        template = ExamTemplate.objects.create(title='Templated Dash Exam', exam_type='mock', created_by=self.staff)
+        templated_test = Test.objects.create(title='Templated Dash v1', exam_type='mock', exam_template=template)
+        standalone_test = Test.objects.create(title='Standalone Dash Exam', exam_type='mock')
+        self.client.force_authenticate(user=self.staff)
+
+        resp = self.client.get('/api/tests/?standalone=true')
+
+        ids = {row['id'] for row in resp.data}
+        self.assertIn(standalone_test.id, ids)
+        self.assertNotIn(templated_test.id, ids)
+
+    def test_bare_list_endpoint_stays_unpaginated_for_existing_callers(self):
+        """Frontend/src/components/plans/SingleTestSection.js and
+        Admin/src/app/videos/page.js both call GET /tests/ and pass the
+        response straight to setState — must stay a plain array."""
+        Test.objects.create(title='Bare List Dash Exam', exam_type='mock', is_draft=False)
+        self.client.force_authenticate(user=self.staff)
+
+        resp = self.client.get('/api/tests/')
+
+        self.assertIsInstance(resp.data, list)
+
+    def test_tests_browse_action_returns_paginated_shape(self):
+        for i in range(3):
+            Test.objects.create(title=f'Browse Dash Exam {i}', exam_type='mock', is_draft=False)
+        self.client.force_authenticate(user=self.staff)
+
+        resp = self.client.get('/api/tests/browse/?page_size=2')
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        for key in ('count', 'next', 'previous', 'results'):
+            self.assertIn(key, resp.data)
+        self.assertEqual(len(resp.data['results']), 2)
+        self.assertGreaterEqual(resp.data['count'], 3)
+
+    def test_tests_browse_action_requires_admin(self):
+        self.client.force_authenticate(user=self.student)
+
+        resp = self.client.get('/api/tests/browse/')
+
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_exam_templates_browse_action_paginates_and_filters_by_program(self):
+        mbbs_template = ExamTemplate.objects.create(title='MBBS Browse Template', exam_type='mock', created_by=self.staff)
+        mbbs_version = Test.objects.create(title='MBBS Browse Template v1', exam_type='mock', exam_template=mbbs_template)
+        mbbs_version.courses.set([self.mbbs_course])
+        pg_template = ExamTemplate.objects.create(title='PG Browse Template', exam_type='mock', created_by=self.staff)
+        pg_version = Test.objects.create(title='PG Browse Template v1', exam_type='mock', exam_template=pg_template)
+        pg_version.courses.set([self.pg_course])
+        self.client.force_authenticate(user=self.staff)
+
+        resp = self.client.get('/api/exam-templates/browse/?program=CEE-MBBS')
+
+        self.assertIn('results', resp.data)
+        ids = {row['id'] for row in resp.data['results']}
+        self.assertIn(mbbs_template.id, ids)
+        self.assertNotIn(pg_template.id, ids)
+
+    def test_stats_endpoint_counts_are_real_not_hardcoded(self):
+        draft_standalone = Test.objects.create(title='Stats Draft Standalone', exam_type='mock', is_draft=True)
+        published_standalone = Test.objects.create(title='Stats Published Standalone', exam_type='mock', is_draft=False)
+
+        template = ExamTemplate.objects.create(title='Stats Template', exam_type='mock', created_by=self.staff)
+        template_version = Test.objects.create(
+            title='Stats Template v1', exam_type='mock', is_draft=False, exam_template=template,
+        )
+        ExamSession.objects.create(
+            exam_template=template, exam_version=template_version, session_name='Stats Session',
+            start_datetime=timezone.now() + timezone.timedelta(days=1),
+            end_datetime=timezone.now() + timezone.timedelta(days=1, hours=1),
+            status='scheduled', created_by=self.staff,
+        )
+
+        question = Question.objects.create(subject=Subject.objects.create(name='Stats Dash Subject'), text='Stats Q1')
+        TestAttempt.objects.create(user=self.student, test=published_standalone, status='submitted')
+
+        self.client.force_authenticate(user=self.staff)
+        resp = self.client.get('/api/tests/stats/')
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertGreaterEqual(resp.data['total_exams'], 3)  # 2 standalone + 1 template
+        self.assertGreaterEqual(resp.data['draft_exams'], 1)
+        self.assertGreaterEqual(resp.data['published_exams'], 2)  # published standalone + published template
+        self.assertGreaterEqual(resp.data['scheduled_exams'], 1)
+        self.assertGreaterEqual(resp.data['total_questions'], 1)
+        self.assertGreaterEqual(resp.data['total_attempts'], 1)
+
+    def test_stats_endpoint_scoped_by_program_excludes_other_program(self):
+        mbbs_test = Test.objects.create(title='Stats MBBS Only', exam_type='mock', is_draft=False)
+        mbbs_test.courses.set([self.mbbs_course])
+        pg_test = Test.objects.create(title='Stats PG Only', exam_type='mock', is_draft=False)
+        pg_test.courses.set([self.pg_course])
+        self.client.force_authenticate(user=self.staff)
+
+        resp = self.client.get('/api/tests/stats/?program=CEE-MBBS')
+
+        # Exactly the MBBS-scoped standalone exam, not the PG one — proven by
+        # comparing against an unscoped call that must count strictly more.
+        unscoped = self.client.get('/api/tests/stats/').data
+        self.assertLess(resp.data['total_exams'], unscoped['total_exams'])
+
+    def test_access_filter_scopes_by_is_pro(self):
+        pro_test = Test.objects.create(title='Pro Dash Exam', exam_type='mock', is_draft=False, is_pro=True)
+        free_test = Test.objects.create(title='Free Dash Exam', exam_type='mock', is_draft=False, is_pro=False)
+        self.client.force_authenticate(user=self.staff)
+
+        pro_ids = {row['id'] for row in self.client.get('/api/tests/?access=pro').data}
+        free_ids = {row['id'] for row in self.client.get('/api/tests/?access=free').data}
+
+        self.assertIn(pro_test.id, pro_ids)
+        self.assertNotIn(free_test.id, pro_ids)
+        self.assertIn(free_test.id, free_ids)
+        self.assertNotIn(pro_test.id, free_ids)
+
+    def test_exam_templates_browse_status_filter_matches_latest_version_draft_state(self):
+        published_template = ExamTemplate.objects.create(title='Published Template Dash', exam_type='mock', created_by=self.staff)
+        Test.objects.create(title='Published Template Dash v1', exam_type='mock', is_draft=False, exam_template=published_template)
+        draft_template = ExamTemplate.objects.create(title='Draft Template Dash', exam_type='mock', created_by=self.staff)
+        Test.objects.create(title='Draft Template Dash v1', exam_type='mock', is_draft=True, exam_template=draft_template)
+        self.client.force_authenticate(user=self.staff)
+
+        published_resp = self.client.get('/api/exam-templates/browse/?status=published')
+        draft_resp = self.client.get('/api/exam-templates/browse/?status=draft')
+
+        published_ids = {row['id'] for row in published_resp.data['results']}
+        draft_ids = {row['id'] for row in draft_resp.data['results']}
+        self.assertIn(published_template.id, published_ids)
+        self.assertNotIn(draft_template.id, published_ids)
+        self.assertIn(draft_template.id, draft_ids)
+        self.assertNotIn(published_template.id, draft_ids)
+
+    def test_stats_by_program_returns_one_row_per_distinct_program(self):
+        mbbs_test = Test.objects.create(title='Stats By Program MBBS', exam_type='mock', is_draft=False)
+        mbbs_test.courses.set([self.mbbs_course])
+        pg_test = Test.objects.create(title='Stats By Program PG', exam_type='mock', is_draft=False)
+        pg_test.courses.set([self.pg_course])
+        self.client.force_authenticate(user=self.staff)
+
+        resp = self.client.get('/api/tests/stats_by_program/')
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        by_program = {row['program']: row for row in resp.data}
+        self.assertIn('CEE-MBBS', by_program)
+        self.assertIn('CEE-PG', by_program)
+        self.assertGreaterEqual(by_program['CEE-MBBS']['total_exams'], 1)
+        self.assertGreaterEqual(by_program['CEE-PG']['total_exams'], 1)
+
+    def test_stats_endpoint_requires_admin(self):
+        self.client.force_authenticate(user=self.student)
+
+        resp = self.client.get('/api/tests/stats/')
+
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class SavedExamViewApiTests(APITestCase):
+    """Per-admin saved filter combos — must never leak between admins."""
+
+    def setUp(self):
+        self.admin_a = User.objects.create_user(
+            username='saved_view_admin_a', email='saved_view_admin_a@example.com', password='pw12345',
+            is_staff=True, admin_role='admin',
+        )
+        self.admin_b = User.objects.create_user(
+            username='saved_view_admin_b', email='saved_view_admin_b@example.com', password='pw12345',
+            is_staff=True, admin_role='admin',
+        )
+        self.student = User.objects.create_user(
+            username='saved_view_student', email='saved_view_student@example.com', password='pw12345',
+        )
+
+    def test_create_and_list_own_saved_view(self):
+        self.client.force_authenticate(user=self.admin_a)
+
+        create_resp = self.client.post(
+            '/api/saved-exam-views/', {'name': 'CEE-MBBS Exams', 'filters': {'program': 'CEE-MBBS'}}, format='json',
+        )
+        self.assertEqual(create_resp.status_code, status.HTTP_201_CREATED, create_resp.data)
+
+        list_resp = self.client.get('/api/saved-exam-views/')
+        names = {row['name'] for row in list_resp.data}
+        self.assertIn('CEE-MBBS Exams', names)
+
+    def test_saved_views_are_scoped_to_the_owning_admin(self):
+        SavedExamView.objects.create(user=self.admin_a, name='Admin A View', filters={})
+        SavedExamView.objects.create(user=self.admin_b, name='Admin B View', filters={})
+        self.client.force_authenticate(user=self.admin_b)
+
+        resp = self.client.get('/api/saved-exam-views/')
+
+        names = {row['name'] for row in resp.data}
+        self.assertIn('Admin B View', names)
+        self.assertNotIn('Admin A View', names)
+
+    def test_non_admin_cannot_access_saved_views(self):
+        self.client.force_authenticate(user=self.student)
+
+        resp = self.client.get('/api/saved-exam-views/')
+
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)

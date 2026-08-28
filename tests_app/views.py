@@ -7,7 +7,8 @@ from django.utils.dateparse import parse_datetime
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound, ValidationError
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.pagination import PageNumberPagination
+from rest_framework.permissions import IsAdminUser, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -26,11 +27,12 @@ from hamromentor.permissions import IsStaffOrReadOnly
 from . import performance
 from .access import can_access_test, visible_test_queryset
 from .exam_versioning import RescheduleError, clone_test_as_new_version, create_reschedule_session
-from .models import Answer, ExamSession, ExamTemplate, Test, TestAttempt
+from .models import Answer, ExamSession, ExamTemplate, SavedExamView, Test, TestAttempt
 from .serializers import (
     ExamSessionSerializer,
     ExamTemplateSerializer,
     RescheduleSerializer,
+    SavedExamViewSerializer,
     SessionAttemptSerializer,
     StartTestSerializer,
     SubmitAnswerSerializer,
@@ -41,6 +43,17 @@ from .serializers import (
     TestListSerializer,
     TestResultSerializer,
 )
+
+
+class _ExamBrowsePagination(PageNumberPagination):
+    """Same opt-in-only precedent as academics.views._BrowsePagination —
+    GET /tests/ and GET /exam-templates/ stay bare-array-unpaginated for
+    their existing callers (student test listings, the Admin videos page,
+    the teacher course editor); the new Exam Management dashboard uses
+    these dedicated `browse` actions instead."""
+    page_size = 20
+    max_page_size = 50
+    page_size_query_param = 'page_size'
 
 
 def _start_attempt(request, test, session=None):
@@ -127,6 +140,44 @@ def _start_attempt(request, test, session=None):
     )
 
 
+def _exam_stats(program=None):
+    """'Exam' means one exam identity: either an ExamTemplate (grouping its
+    versions/sessions) or a standalone Test that's never been rescheduled —
+    matching how the list UI counts rows. Shared by TestViewSet.stats (one
+    program, or overall) and .stats_by_program (looped per program)."""
+    from django.db.models import OuterRef, Subquery
+
+    from academics.models import Question
+
+    template_qs = ExamTemplate.objects.all()
+    standalone_qs = Test.objects.filter(exam_template__isnull=True)
+    attempt_qs = TestAttempt.objects.all()
+    question_qs = Question.objects.all()
+    if program:
+        template_qs = template_qs.filter(versions__courses__program_group=program).distinct()
+        standalone_qs = standalone_qs.filter(courses__program_group=program).distinct()
+        attempt_qs = attempt_qs.filter(test__courses__program_group=program).distinct()
+        question_qs = question_qs.filter(courses__program_group=program).distinct()
+
+    latest_version_draft = Test.objects.filter(
+        exam_template=OuterRef('pk')
+    ).order_by('-version_number', '-created_at').values('is_draft')[:1]
+    template_qs = template_qs.annotate(latest_is_draft=Subquery(latest_version_draft))
+
+    published_exams = template_qs.filter(latest_is_draft=False).count() + standalone_qs.filter(is_draft=False).count()
+    draft_exams = template_qs.filter(latest_is_draft=True).count() + standalone_qs.filter(is_draft=True).count()
+    scheduled_exams = template_qs.filter(sessions__status__in=['scheduled', 'registration_open']).distinct().count()
+
+    return {
+        'total_exams': template_qs.count() + standalone_qs.count(),
+        'published_exams': published_exams,
+        'draft_exams': draft_exams,
+        'scheduled_exams': scheduled_exams,
+        'total_questions': question_qs.count(),
+        'total_attempts': attempt_qs.count(),
+    }
+
+
 class TestViewSet(viewsets.ModelViewSet):
     queryset = Test.objects.all()
     permission_classes = [IsStaffOrReadOnly]
@@ -177,6 +228,13 @@ class TestViewSet(viewsets.ModelViewSet):
         year = self.request.query_params.get('year')
         university = self.request.query_params.get('university')
         course_id = self.request.query_params.get('course')
+        # Admin Exam Management dashboard filters — additive, safe for every
+        # caller (student-facing pages simply never send them).
+        program = self.request.query_params.get('program')
+        search = self.request.query_params.get('search')
+        status_param = self.request.query_params.get('status')
+        standalone = self.request.query_params.get('standalone')
+        access = self.request.query_params.get('access')
         if exam_type:
             qs = qs.filter(exam_type__in=exam_type.split(','))
         if subject:
@@ -185,6 +243,27 @@ class TestViewSet(viewsets.ModelViewSet):
             qs = qs.filter(academic_year=year)
         if university:
             qs = qs.filter(university=university)
+        if program:
+            qs = qs.filter(courses__program_group=program)
+        if search:
+            from django.db.models import Q
+            qs = qs.filter(
+                Q(title__icontains=search)
+                | Q(exam_template__exam_code__icontains=search)
+                | Q(exam_template__title__icontains=search)
+            )
+        if status_param == 'draft':
+            qs = qs.filter(is_draft=True)
+        elif status_param == 'published':
+            qs = qs.filter(is_draft=False)
+        elif status_param == 'scheduled':
+            qs = qs.filter(sessions__status__in=['scheduled', 'registration_open'])
+        if standalone == 'true':
+            qs = qs.filter(exam_template__isnull=True)
+        if access == 'pro':
+            qs = qs.filter(is_pro=True)
+        elif access == 'free':
+            qs = qs.filter(is_pro=False)
 
         user = self.request.user
         # Always-applied, server-derived eligibility filter — never opt-in on
@@ -313,6 +392,42 @@ class TestViewSet(viewsets.ModelViewSet):
         new_test = clone_test_as_new_version(test, request.user, exam_template=None, title=f'{test.title} (Copy)')
         return Response(TestAdminSerializer(new_test, context={'request': request}).data, status=status.HTTP_201_CREATED)
 
+    @action(detail=False, methods=['get'], permission_classes=[IsAdminUser])
+    def browse(self, request):
+        """Server-paginated, server-filtered variant of GET /tests/ for the
+        Admin Exam Management dashboard (standalone, never-rescheduled exams
+        — pass ?standalone=true; template-grouped exams come from
+        ExamTemplateViewSet.browse instead). See _ExamBrowsePagination for
+        why this is a separate opt-in action rather than pagination on list()."""
+        qs = self.filter_queryset(self.get_queryset())
+        paginator = _ExamBrowsePagination()
+        page = paginator.paginate_queryset(qs, request, view=self)
+        # TestListSerializer (not TestAdminSerializer) — this is a display
+        # listing; Edit already re-fetches full TestAdminSerializer detail
+        # via GET /tests/{id}/, matching the existing openEdit() pattern.
+        serializer = TestListSerializer(page, many=True, context={'request': request})
+        return paginator.get_paginated_response(serializer.data)
+
+    @action(detail=False, methods=['get'], permission_classes=[IsAdminUser])
+    def stats(self, request):
+        """Real, non-hardcoded numbers for the Exam Stats card — aggregate
+        queries only, no per-row Python loop over exams/questions/attempts."""
+        return Response(_exam_stats(request.query_params.get('program')))
+
+    @action(detail=False, methods=['get'], permission_classes=[IsAdminUser])
+    def stats_by_program(self, request):
+        """Same numbers as stats(), grouped by Course.program_group in one
+        response — powers the per-program cards without the frontend firing
+        N sequential ?program= requests (one per card). Still N aggregate
+        queries server-side, but N = number of distinct programs (a
+        handful), never N = number of exams/questions."""
+        from courses.models import Course
+
+        programs = list(
+            Course.objects.exclude(program_group='').values_list('program_group', flat=True).distinct().order_by('program_group')
+        )
+        return Response([{'program': p, **_exam_stats(p)} for p in programs])
+
 
 def _teacher_scope(qs, user, field='created_by'):
     if user.is_authenticated and getattr(user, 'admin_role', None) == 'teacher' and not user.can_manage_all_content:
@@ -332,6 +447,31 @@ class ExamTemplateViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         qs = super().get_queryset().prefetch_related('versions', 'sessions')
+        program = self.request.query_params.get('program')
+        search = self.request.query_params.get('search')
+        exam_type = self.request.query_params.get('exam_type')
+        status_param = self.request.query_params.get('status')
+        access = self.request.query_params.get('access')
+        if program:
+            qs = qs.filter(versions__courses__program_group=program).distinct()
+        if search:
+            from django.db.models import Q
+            qs = qs.filter(Q(title__icontains=search) | Q(exam_code__icontains=search))
+        if exam_type:
+            qs = qs.filter(exam_type__in=exam_type.split(','))
+        if status_param == 'scheduled':
+            qs = qs.filter(sessions__status__in=['scheduled', 'registration_open']).distinct()
+        elif status_param in ('draft', 'published'):
+            from django.db.models import OuterRef, Subquery
+            latest_version_draft = Test.objects.filter(
+                exam_template=OuterRef('pk')
+            ).order_by('-version_number', '-created_at').values('is_draft')[:1]
+            qs = qs.annotate(latest_is_draft=Subquery(latest_version_draft))
+            qs = qs.filter(latest_is_draft=(status_param == 'draft'))
+        if access == 'pro':
+            qs = qs.filter(versions__is_pro=True).distinct()
+        elif access == 'free':
+            qs = qs.filter(versions__is_pro=False).distinct()
         return _teacher_scope(qs, self.request.user)
 
     @action(detail=True, methods=['get'])
@@ -339,6 +479,18 @@ class ExamTemplateViewSet(viewsets.ModelViewSet):
         template = self.get_object()
         sessions = template.sessions.select_related('exam_version').all()
         return Response(ExamSessionSerializer(sessions, many=True, context={'request': request}).data)
+
+    @action(detail=False, methods=['get'], permission_classes=[IsAdminUser])
+    def browse(self, request):
+        """Server-paginated, server-filtered variant of GET /exam-templates/
+        for the Admin Exam Management dashboard — the primary listing for
+        exams that have been scheduled/rescheduled at least once. See
+        _ExamBrowsePagination for why list() itself stays unpaginated."""
+        qs = self.filter_queryset(self.get_queryset())
+        paginator = _ExamBrowsePagination()
+        page = paginator.paginate_queryset(qs, request, view=self)
+        serializer = ExamTemplateSerializer(page, many=True, context={'request': request})
+        return paginator.get_paginated_response(serializer.data)
 
 
 class ExamSessionViewSet(viewsets.ModelViewSet):
@@ -408,6 +560,19 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
         session.status = 'cancelled'
         session.save(update_fields=['status'])
         return Response(ExamSessionSerializer(session, context={'request': request}).data)
+
+
+class SavedExamViewViewSet(viewsets.ModelViewSet):
+    """Per-admin saved Exam Management filter combos. Scoped strictly to the
+    requesting user — one admin's saved views are never visible to another."""
+    serializer_class = SavedExamViewSerializer
+    permission_classes = [IsAdminUser]
+
+    def get_queryset(self):
+        return SavedExamView.objects.filter(user=self.request.user)
+
+    def perform_create(self, serializer):
+        serializer.save(user=self.request.user)
 
 
 class AttemptDetailView(APIView):
