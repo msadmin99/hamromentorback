@@ -145,6 +145,26 @@ class SubmitTestFeedsQuestionPerformanceTests(APITestCase):
         self.client.post(f'/api/attempts/{self.attempt.id}/submit/')
         self.assertFalse(QuestionAttempt.objects.filter(user=self.student, question=self.question).exists())
 
+    def test_result_view_reports_total_responses_gated_by_threshold(self):
+        from academics.models import QuestionBankConfig
+
+        self.client.post(f'/api/attempts/{self.attempt.id}/answer/', {'question_id': self.question.id, 'option_id': self.correct.id})
+        self.client.post(f'/api/attempts/{self.attempt.id}/submit/')
+
+        resp = self.client.get(f'/api/attempts/{self.attempt.id}/')
+        q = resp.data['questions'][0]
+        self.assertFalse(q['stats_available'])
+        self.assertIsNone(q['total_responses'])
+
+        config = QuestionBankConfig.load()
+        config.min_attempts_for_option_stats = 1
+        config.save()
+
+        resp = self.client.get(f'/api/attempts/{self.attempt.id}/')
+        q = resp.data['questions'][0]
+        self.assertTrue(q['stats_available'])
+        self.assertEqual(q['total_responses'], 1)
+
     def test_qbank_practice_and_test_attempts_accumulate_on_the_same_row(self):
         from academics.services import record_question_result
 

@@ -1255,6 +1255,7 @@ class AnswerActionStatsVisibilityTests(APITestCase):
         resp = self.client.post(f'/api/questions/{self.question.id}/answer/', {'option_id': self.opt_correct.id}, format='json')
         self.assertFalse(resp.data['stats_available'])
         self.assertIsNone(resp.data['students_correct_percent'])
+        self.assertIsNone(resp.data['total_responses'])
         for opt in resp.data['options']:
             self.assertIsNone(opt['pick_percentage'])
 
@@ -1266,6 +1267,7 @@ class AnswerActionStatsVisibilityTests(APITestCase):
         resp = self.client.post(f'/api/questions/{self.question.id}/answer/', {'option_id': self.opt_correct.id}, format='json')
         self.assertTrue(resp.data['stats_available'])
         self.assertEqual(resp.data['students_correct_percent'], 100)
+        self.assertEqual(resp.data['total_responses'], 1)
         percentages = {opt['id']: opt['pick_percentage'] for opt in resp.data['options']}
         self.assertEqual(percentages[self.opt_correct.id], 100)
 

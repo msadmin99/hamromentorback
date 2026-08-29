@@ -448,6 +448,7 @@ class QuestionViewSet(viewsets.ModelViewSet):
             'students_correct_percent': (
                 round(question.correct_attempts / question.total_attempts * 100) if stats_available else None
             ),
+            'total_responses': question.total_attempts if stats_available else None,
         })
 
     @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])

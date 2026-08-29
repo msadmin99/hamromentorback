@@ -298,6 +298,7 @@ class QuestionResultSerializer(serializers.ModelSerializer):
     reference_book_name = serializers.CharField(source='reference_book.name', read_only=True, default='')
     stats_available = serializers.SerializerMethodField()
     students_correct_percent = serializers.SerializerMethodField()
+    total_responses = serializers.SerializerMethodField()
 
     class Meta:
         model = Question
@@ -307,7 +308,7 @@ class QuestionResultSerializer(serializers.ModelSerializer):
             'explanation_video_url', 'references', 'key_takeaway',
             'reference_book_name', 'reference_edition', 'reference_chapter', 'reference_page', 'reference_url',
             'subject_name', 'options', 'selected_option_id', 'is_correct',
-            'stats_available', 'students_correct_percent',
+            'stats_available', 'students_correct_percent', 'total_responses',
         ]
 
     def get_image_data(self, obj):
@@ -336,6 +337,11 @@ class QuestionResultSerializer(serializers.ModelSerializer):
         if obj.total_attempts < self._min_attempts():
             return None
         return round(obj.correct_attempts / obj.total_attempts * 100)
+
+    def get_total_responses(self, obj):
+        if obj.total_attempts < self._min_attempts():
+            return None
+        return obj.total_attempts
 
     def get_is_correct(self, obj):
         attempt = self.context.get('attempt_map', {}).get(obj.id)
