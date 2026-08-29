@@ -14,6 +14,7 @@ urlpatterns = [
     path('api/', include('billing.urls')),
     path('api/', include('marketplace.urls')),
     path('api/media/', include('media_library.urls')),
+    path('api/', include('smart_practice.urls')),
 ]
 
 if settings.DEBUG:

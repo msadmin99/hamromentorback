@@ -334,7 +334,7 @@ class QuestionEvent(models.Model):
     recently", which the Mistake Bank (recent mistakes, frequently repeated
     mistakes) needs and a single overwritten row can't provide. Written
     exclusively by academics.services.record_question_result()."""
-    SOURCE_CHOICES = [('qbank', 'QBank Practice'), ('test', 'Test')]
+    SOURCE_CHOICES = [('qbank', 'QBank Practice'), ('test', 'Test'), ('smart', 'Smart Practice')]
 
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='question_events')
     question = models.ForeignKey(Question, on_delete=models.CASCADE, related_name='events')

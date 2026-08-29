@@ -10,6 +10,8 @@ from rest_framework.views import APIView
 
 from hamromentor.permissions import IsStaffOrReadOnly, IsStaffOrReadOnlyExcludingTeacherWrites
 
+from .access import locked_subject_ids as _locked_subject_ids
+from .access import question_course_scoped as _question_course_scoped
 from .excel import import_workbook, template_response
 from .models import (
     Chapter, Option, Question, QuestionAttempt, QuestionBankConfig, QuestionDifficultyRating,
@@ -50,36 +52,6 @@ def _course_scoped(qs, user, *, courses_lookup):
     isnull_lookup = f'{courses_lookup}__isnull'
     in_lookup = f'{courses_lookup}__id__in'
     return qs.filter(Q(**{isnull_lookup: True}) | Q(**{in_lookup: course_ids})).distinct()
-
-
-def _question_course_scoped(qs, user):
-    """Question-specific eligibility filter — NOT the same as _course_scoped
-    above. Question.courses is an optional, admin-facing narrowing field
-    ("a question can be shared across courses") that is, in real production
-    data, unpopulated on every single question — confirmed via
-    CourseSerializer.get_question_count returning 0 for every course after
-    this was live. Treating a blank Question.courses as unconditionally
-    'shared' (the same rule that's correct for Subject, which IS populated
-    for every real subject) would mean this filter restricts nothing at
-    all: every question in the platform would remain visible to every
-    student regardless of course, exactly the residual "Physics/Chemistry
-    still appear in CEE-PG practice" leak this whole audit exists to close.
-    The actually-populated, reliable per-course signal for a question is
-    its Subject's `courses` — so a question with no explicit tag of its own
-    inherits its subject's scope; an explicit Question.courses tag (if a
-    future admin workflow starts setting one) still overrides/narrows it."""
-    if user and user.is_authenticated and user.is_staff:
-        return qs
-    from django.db.models import Q as Q_
-
-    from courses.access import eligible_course_ids
-
-    course_ids = eligible_course_ids(user)
-    return qs.filter(
-        Q_(courses__id__in=course_ids)
-        | Q_(courses__isnull=True, subject__courses__id__in=course_ids)
-        | Q_(courses__isnull=True, subject__courses__isnull=True)
-    ).distinct()
 
 
 class SubjectViewSet(viewsets.ModelViewSet):
@@ -130,16 +102,6 @@ class TopicViewSet(viewsets.ModelViewSet):
         if chapter_id:
             qs = qs.filter(chapter_id=chapter_id)
         return qs
-
-
-def _locked_subject_ids(user):
-    """Subjects this user can't currently access (Pro subject, no active
-    subscription) — staff always see everything. Shared by every Question
-    Bank view that needs to scope a queryset to what a student may browse."""
-    if user.is_authenticated and user.is_staff:
-        return []
-    from billing.access import has_qbank_access
-    return [s.id for s in Subject.objects.all() if not has_qbank_access(user, s)]
 
 
 def _status_question_ids(user, statuses, base_qs):

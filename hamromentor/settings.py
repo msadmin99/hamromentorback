@@ -103,6 +103,7 @@ INSTALLED_APPS = [
     'billing',
     'marketplace',
     'media_library',
+    'smart_practice',
 ]
 
 MIDDLEWARE = [
