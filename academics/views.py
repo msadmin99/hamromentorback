@@ -732,8 +732,16 @@ class QuestionViewSet(viewsets.ModelViewSet):
             # longer widen the base queryset past it (this action used to
             # build Question.objects.all() directly with no eligibility
             # filter at all — the actual leak behind "Physics/Chemistry
-            # still appear when practicing").
-            qs = qs.filter(courses__id=data['course'])
+            # still appear when practicing"). Must use the same
+            # Question.courses-blank-falls-back-to-Subject.courses OR
+            # pattern _question_course_scoped() already uses — a bare
+            # `courses__id=` matches almost nothing in real production
+            # data (Question.courses is unpopulated on every question),
+            # which silently zeroed out every Smart Practice tile's
+            # results whenever the request carried the student's real
+            # active course (i.e. every real browser request).
+            course_id = data['course']
+            qs = qs.filter(Q_(courses__id=course_id) | Q_(courses__isnull=True, subject__courses__id=course_id))
         if data.get('subject'):
             subject_val = data['subject']
             qs = qs.filter(subject_id=subject_val) if str(subject_val).isdigit() else qs.filter(subject__slug=subject_val)

@@ -1076,6 +1076,24 @@ class CompleteCourseScopingAuditTests(APITestCase):
         self.assertNotIn(self.physiology_q.id, ids)
         self.assertNotIn(self.anatomy_q.id, ids)
 
+    def test_practice_session_with_students_own_real_course_param_still_returns_results(self):
+        """Regression for a real production bug: passing the student's OWN
+        real, enrolled course id (exactly what the browser sends on every
+        request once a course is active — not a tampering attempt) used to
+        return zero results platform-wide, because the course filter
+        matched raw Question.courses directly, which — like every question
+        in this fixture and in real production — is blank. Must inherit
+        via Subject.courses the same way the base eligibility scoping
+        already does."""
+        self.client.force_authenticate(user=self.cee_pg_student)
+        resp = self.client.post(
+            '/api/questions/practice-session/', {'count': 50, 'course': self.cee_pg.id}, format='json',
+        )
+        ids = {q['id'] for q in resp.data}
+        self.assertIn(self.pathology_q.id, ids)
+        self.assertIn(self.physiology_q.id, ids)
+        self.assertIn(self.anatomy_q.id, ids)
+
     def test_practice_session_tampered_course_param_returns_no_ug_questions_for_pg_student(self):
         self.client.force_authenticate(user=self.cee_pg_student)
         resp = self.client.post(
