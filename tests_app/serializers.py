@@ -24,6 +24,7 @@ class TestListSerializer(serializers.ModelSerializer):
     attempts_used = serializers.SerializerMethodField()
     created_by_name = serializers.SerializerMethodField()
     in_progress_answered_count = serializers.SerializerMethodField()
+    latest_attempt_id = serializers.SerializerMethodField()
 
     exam_template_id = serializers.IntegerField(source='exam_template.id', read_only=True, default=None)
     exam_code = serializers.CharField(source='exam_template.exam_code', read_only=True, default=None)
@@ -36,6 +37,7 @@ class TestListSerializer(serializers.ModelSerializer):
             'academic_year', 'university', 'scheduled_start', 'scheduled_end', 'status', 'best_score',
             'courses_detail', 'card_status', 'attempts_used', 'created_by_name', 'created_at',
             'is_draft', 'exam_template_id', 'exam_code', 'version_number', 'in_progress_answered_count',
+            'latest_attempt_id',
         ]
 
     def get_created_by_name(self, obj):
@@ -54,12 +56,29 @@ class TestListSerializer(serializers.ModelSerializer):
             return 'ended'
         return 'live'
 
-    def get_best_score(self, obj):
+    def _best_attempt(self, obj):
+        # Cached per-instance — get_best_score() and get_latest_attempt_id()
+        # both need this same row (DRF calls SerializerMethodFields
+        # independently, so without this every card would run it twice).
         user = self.context.get('request').user if self.context.get('request') else None
-        if not user or not user.is_authenticated:
-            return None
-        best = obj.attempts.filter(user=user, status='submitted').order_by('-score').first()
+        cache_attr = '_best_attempt_cache'
+        if not hasattr(obj, cache_attr):
+            if not user or not user.is_authenticated:
+                setattr(obj, cache_attr, None)
+            else:
+                setattr(obj, cache_attr, obj.attempts.filter(user=user, status='submitted').order_by('-score').first())
+        return getattr(obj, cache_attr)
+
+    def get_best_score(self, obj):
+        best = self._best_attempt(obj)
         return float(best.score) if best else None
+
+    def get_latest_attempt_id(self, obj):
+        # The best-scoring submitted attempt's id — "Review Test" links
+        # straight to its /tests/result/{id} page instead of the generic
+        # test-detail page, which has no per-question review of its own.
+        best = self._best_attempt(obj)
+        return best.id if best else None
 
     def get_courses_detail(self, obj):
         return [{'id': c.id, 'name': c.name} for c in obj.courses.all()]

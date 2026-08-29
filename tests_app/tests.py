@@ -370,6 +370,25 @@ class CardStatusInProgressTests(APITestCase):
         row = next(r for r in resp.data if r['id'] == self.test.id)
         self.assertEqual(row['card_status'], 'completed')
 
+    def test_latest_attempt_id_points_at_the_best_scoring_submitted_attempt(self):
+        """ExamCard's 'Review Test' button links straight to
+        /tests/result/{latest_attempt_id} — it must be the same attempt
+        best_score already reports, not just any submitted attempt."""
+        TestAttempt.objects.create(user=self.student, test=self.test, status='submitted', score=1)
+        best = TestAttempt.objects.create(user=self.student, test=self.test, status='submitted', score=2)
+        TestAttempt.objects.create(user=self.student, test=self.test, status='in_progress')  # must not win
+
+        resp = self.client.get('/api/tests/?exam_type=mock')
+
+        row = next(r for r in resp.data if r['id'] == self.test.id)
+        self.assertEqual(row['best_score'], 2.0)
+        self.assertEqual(row['latest_attempt_id'], best.id)
+
+    def test_latest_attempt_id_is_null_before_any_submission(self):
+        resp = self.client.get('/api/tests/?exam_type=mock')
+        row = next(r for r in resp.data if r['id'] == self.test.id)
+        self.assertIsNone(row['latest_attempt_id'])
+
     def test_another_students_in_progress_attempt_does_not_leak(self):
         other = User.objects.create_user(username='ip_other', email='ip_other@example.com', password='pw12345')
         TestAttempt.objects.create(user=other, test=self.test, status='in_progress')
