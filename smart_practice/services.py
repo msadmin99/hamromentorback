@@ -27,27 +27,45 @@ def _test_question_order(ctx):
     return dict(TestQuestion.objects.filter(test=ctx.test).values_list('question_id', 'order'))
 
 
+def _subject_scoped_pool(ctx):
+    """ctx.expansion_pool alone is only course-scoped — for a Test whose
+    `courses` M2M spans many courses (a broadly-shared Daily/Mock/PYQ test,
+    real production data has seen tests assigned to a dozen+ courses at
+    once), that pool can be nearly the platform's entire question bank,
+    which is authorized but not remotely "from this test" any more.
+    Narrowing to the source test's own subject(s) keeps Due for
+    Review/New Questions/Bookmarked genuinely source-relevant (the spec's
+    own SUBJECT scope type) instead of silently degrading into GLOBAL —
+    the exact failure mode the whole source-aware design exists to avoid."""
+    if ctx.subject_ids:
+        return ctx.expansion_pool.filter(subject_id__in=ctx.subject_ids)
+    return ctx.expansion_pool
+
+
 def due_review_candidates(ctx, user):
+    pool = _subject_scoped_pool(ctx)
     now = timezone.now()
     due_ids = list(
-        QuestionAttempt.objects.filter(user=user, revision_due_at__lte=now, question__in=ctx.expansion_pool)
+        QuestionAttempt.objects.filter(user=user, revision_due_at__lte=now, question__in=pool)
         .order_by('revision_due_at')
         .values_list('question_id', flat=True)
     )
-    by_id = {q.id: q for q in ctx.expansion_pool.filter(id__in=due_ids)}
+    by_id = {q.id: q for q in pool.filter(id__in=due_ids)}
     return [by_id[qid] for qid in due_ids if qid in by_id]
 
 
 def new_question_candidates(ctx, user):
+    pool = _subject_scoped_pool(ctx)
     attempted_ids = QuestionAttempt.objects.filter(user=user).values_list('question_id', flat=True)
-    return list(ctx.expansion_pool.exclude(id__in=attempted_ids).order_by('?'))
+    return list(pool.exclude(id__in=attempted_ids).order_by('?'))
 
 
 def bookmarked_candidates(ctx, user):
+    pool = _subject_scoped_pool(ctx)
     bookmarked_ids = QuestionAttempt.objects.filter(
-        user=user, is_bookmarked=True, question__in=ctx.expansion_pool,
+        user=user, is_bookmarked=True, question__in=pool,
     ).values_list('question_id', flat=True)
-    return list(ctx.expansion_pool.filter(id__in=bookmarked_ids))
+    return list(pool.filter(id__in=bookmarked_ids))
 
 
 def build_candidates(ctx, mode, count, user=None):

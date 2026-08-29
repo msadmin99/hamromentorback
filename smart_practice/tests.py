@@ -368,6 +368,24 @@ class NewPracticePathModesTests(SmartPracticeTestCase):
         self.assertIn(self.q2.id, new_ids)
         self.assertIn(self.q3.id, new_ids)
 
+    def test_new_questions_excludes_other_subjects_sharing_the_same_course(self):
+        """Regression for a real production bug: a broadly-shared Test
+        (courses spanning a dozen+ courses is real production data) made
+        the course-only expansion_pool balloon to nearly the entire
+        platform's question bank for Due Review/New/Bookmarked — 26,568
+        'new questions from Digestive System' on a real account. Course
+        scoping alone isn't enough; must also narrow to the source test's
+        own subject(s)."""
+        other_subject = Subject.objects.create(name='Same Course Other Subject', is_free=True)
+        other_subject.courses.set([self.course])  # shares the course, NOT the source test's subject
+        other_q = Question.objects.create(subject=other_subject, text='Same course, different subject', marks=1, negative_marks=0)
+        Option.objects.create(question=other_q, text='A', order=0, is_correct=True)
+
+        ctx = resolve_source_scope(self.student, self.test.id)
+        new_ids = {q.id for q in new_question_candidates(ctx, self.student)}
+        self.assertNotIn(other_q.id, new_ids)
+        self.assertIn(self.q2.id, new_ids)
+
     def test_bookmarked_candidates_scoped_to_the_source_pool_only(self):
         QuestionAttempt.objects.create(user=self.student, question=self.q1, is_bookmarked=True)
         ctx = resolve_source_scope(self.student, self.test.id)
