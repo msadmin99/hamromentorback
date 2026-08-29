@@ -48,9 +48,13 @@ class SmartPracticeSession(models.Model):
     later — a session must stay explainable even if the student switches
     active course mid-session."""
     MODE_CHOICES = [
-        ('retry_mistakes', 'Retry Mistakes'),
-        ('source_weak_areas', 'Source Weak Areas'),
-        ('concept_reinforcement', 'Concept Reinforcement'),
+        ('retry_mistakes', 'Master Mistakes'),
+        ('source_weak_areas', 'Fix Weak Areas'),
+        ('concept_reinforcement', 'Strengthen Concepts'),
+        ('due_review', 'Due for Review'),
+        ('new_questions', 'New Questions'),
+        ('bookmarked', 'Bookmarked'),
+        ('ai_mixed', 'AI Mixed Practice'),
     ]
     STATUS_CHOICES = [
         ('in_progress', 'In progress'),
@@ -86,6 +90,9 @@ class SmartPracticeSessionQuestion(models.Model):
         ('source_mistake', 'Missed in source test'),
         ('source_weak_topic', 'Same weak topic, new question'),
         ('expansion_pool', 'Related concept'),
+        ('due_review', 'Due for spaced review'),
+        ('new_question', 'Never attempted before'),
+        ('bookmarked', 'Bookmarked'),
     ]
 
     session = models.ForeignKey(SmartPracticeSession, on_delete=models.CASCADE, related_name='questions')

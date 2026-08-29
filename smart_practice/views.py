@@ -10,7 +10,10 @@ from . import services
 from .access import SourceScopeError, resolve_source_scope
 from .models import SmartPracticeConfig, SmartPracticeSession
 from .serializers import SmartPracticeSessionSerializer
+from .services import bookmarked_candidates, due_review_candidates, new_question_candidates
 from .source_performance import source_missed_questions, source_topic_mastery
+
+MODE_LABELS = dict(SmartPracticeSession.MODE_CHOICES)
 
 _ERROR_STATUS = {
     'grand_test_excluded': status.HTTP_403_FORBIDDEN,
@@ -54,13 +57,24 @@ class EligibilityView(APIView):
         missed_count = source_missed_questions(ctx).count()
         topics = source_topic_mastery(ctx, config.weak_topic_accuracy_max_pct)
         weak_topic_count = sum(1 for t in topics if t['is_weak'])
+        due_count = len(due_review_candidates(ctx, request.user))
+        new_count = len(new_question_candidates(ctx, request.user))
+        bookmarked_count = len(bookmarked_candidates(ctx, request.user))
 
-        eligible = missed_count >= config.min_mistakes_to_recommend
+        # Eligible if ANY practice path has something real to offer — the
+        # old "mistakes only" gate hid the whole grid (including Due for
+        # Review / New Questions / Bookmarked) whenever a student did well,
+        # which is exactly when those other paths are still useful.
+        has_enough_mistakes = missed_count >= config.min_mistakes_to_recommend
+        eligible = has_enough_mistakes or weak_topic_count or due_count or new_count or bookmarked_count
         return Response({
-            'eligible': eligible,
-            'reason': None if eligible else 'not_enough_mistakes',
+            'eligible': bool(eligible),
+            'reason': None if eligible else 'nothing_to_practice',
             'mistake_count': missed_count,
             'weak_topic_count': weak_topic_count,
+            'due_count': due_count,
+            'new_count': new_count,
+            'bookmarked_count': bookmarked_count,
             'source': {'type': ctx.exam_type, 'id': ctx.test.id, 'title': ctx.test.title},
         })
 
@@ -85,28 +99,57 @@ class RecommendationsView(APIView):
         missed_count = source_missed_questions(ctx).count()
         topics = source_topic_mastery(ctx, config.weak_topic_accuracy_max_pct)
         weak_topics = [t for t in topics if t['is_weak']]
+        due_count = len(due_review_candidates(ctx, request.user))
+        new_count = len(new_question_candidates(ctx, request.user))
+        bookmarked_count = len(bookmarked_candidates(ctx, request.user))
+        mixed_count = min(missed_count + len(weak_topics) + due_count + new_count, config.max_questions_per_session)
 
+        # Every tile's count is real, queried data — never a fabricated
+        # placeholder. A tile is only included when there's genuinely
+        # something to practice, so "Practice Paths" never shows a dead
+        # button that returns zero questions.
         modes = []
         if missed_count:
             modes.append({
-                'mode': 'retry_mistakes',
-                'label': 'Retry Mistakes',
+                'mode': 'retry_mistakes', 'label': MODE_LABELS['retry_mistakes'], 'icon': '🔄',
                 'question_count': min(missed_count, config.max_questions_per_session),
                 'message': f"{missed_count} question{'s' if missed_count != 1 else ''} you missed in {ctx.test.title}.",
             })
         if weak_topics:
             modes.append({
-                'mode': 'source_weak_areas',
-                'label': 'Fix Weak Areas',
+                'mode': 'source_weak_areas', 'label': MODE_LABELS['source_weak_areas'], 'icon': '🎯',
                 'question_count': config.default_questions_per_session,
                 'message': f"Target {len(weak_topics)} weak topic{'s' if len(weak_topics) != 1 else ''} from {ctx.test.title}: "
                            + ', '.join(t['topic_name'] for t in weak_topics[:3] if t['topic_name']),
             })
             modes.append({
-                'mode': 'concept_reinforcement',
-                'label': 'Strengthen Concepts',
+                'mode': 'concept_reinforcement', 'label': MODE_LABELS['concept_reinforcement'], 'icon': '🧠',
                 'question_count': config.default_questions_per_session,
                 'message': f'Reinforce the concepts behind your mistakes in {ctx.test.title}.',
+            })
+        if due_count:
+            modes.append({
+                'mode': 'due_review', 'label': MODE_LABELS['due_review'], 'icon': '📅',
+                'question_count': min(due_count, config.max_questions_per_session),
+                'message': f"{due_count} question{'s' if due_count != 1 else ''} from {ctx.test.title} due for review.",
+            })
+        if new_count:
+            modes.append({
+                'mode': 'new_questions', 'label': MODE_LABELS['new_questions'], 'icon': '🆕',
+                'question_count': min(new_count, config.max_questions_per_session),
+                'message': f"{new_count} new question{'s' if new_count != 1 else ''} from {ctx.test.title} you haven't tried yet.",
+            })
+        if bookmarked_count:
+            modes.append({
+                'mode': 'bookmarked', 'label': MODE_LABELS['bookmarked'], 'icon': '⭐',
+                'question_count': min(bookmarked_count, config.max_questions_per_session),
+                'message': f"{bookmarked_count} bookmarked question{'s' if bookmarked_count != 1 else ''} from {ctx.test.title}.",
+            })
+        if mixed_count:
+            modes.append({
+                'mode': 'ai_mixed', 'label': MODE_LABELS['ai_mixed'], 'icon': '🎲',
+                'question_count': mixed_count,
+                'message': f'A balanced mix of mistakes, weak areas, review, and new questions from {ctx.test.title}.',
             })
 
         return Response({

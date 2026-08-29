@@ -1,4 +1,5 @@
 from django.contrib.auth import get_user_model
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
 
@@ -9,7 +10,15 @@ from tests_app.models import Answer, Test, TestAttempt, TestQuestion
 
 from .access import SourceScopeError, resolve_source_scope
 from .models import SmartPracticeConfig, SmartPracticeSession
-from .services import build_candidates, complete_session, create_session, record_session_answer
+from .services import (
+    bookmarked_candidates,
+    build_candidates,
+    complete_session,
+    create_session,
+    due_review_candidates,
+    new_question_candidates,
+    record_session_answer,
+)
 from .source_performance import source_missed_questions, source_topic_mastery
 
 User = get_user_model()
@@ -322,3 +331,95 @@ class EndpointTests(SmartPracticeTestCase):
         self.client.force_authenticate(user=other)
         resp = self.client.post('/api/student/smart-practice/sessions/', {'source_test_id': self.test.id, 'mode': 'retry_mistakes'})
         self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+
+class NewPracticePathModesTests(SmartPracticeTestCase):
+    """The 4 practice-path modes added for the 'PRACTICE PATHS' grid
+    (Due for Review, New Questions, Bookmarked, AI Mixed) — each must stay
+    scoped to this source's authorized expansion_pool even though the
+    underlying signal (revision_due_at, is_bookmarked, 'never attempted')
+    is a GLOBAL, platform-wide fact on QuestionAttempt."""
+
+    def test_due_review_matches_globally_due_questions_within_the_source_pool(self):
+        QuestionAttempt.objects.create(user=self.student, question=self.q1, revision_due_at=timezone.now() - timezone.timedelta(days=1))
+        QuestionAttempt.objects.create(user=self.student, question=self.q2, revision_due_at=timezone.now() + timezone.timedelta(days=5))
+
+        ctx = resolve_source_scope(self.student, self.test.id)
+        due_ids = {q.id for q in due_review_candidates(ctx, self.student)}
+        self.assertIn(self.q1.id, due_ids)
+        self.assertNotIn(self.q2.id, due_ids)
+        self.assertNotIn(self.q3.id, due_ids)
+
+    def test_due_review_excludes_a_globally_due_question_outside_the_source_pool(self):
+        other_subject = Subject.objects.create(name='Unrelated Subject DR', is_free=True)
+        other_q = Question.objects.create(subject=other_subject, text='Unrelated Q', marks=1, negative_marks=0)
+        Option.objects.create(question=other_q, text='A', order=0, is_correct=True)
+        QuestionAttempt.objects.create(user=self.student, question=other_q, revision_due_at=timezone.now() - timezone.timedelta(days=1))
+
+        ctx = resolve_source_scope(self.student, self.test.id)
+        due_ids = {q.id for q in due_review_candidates(ctx, self.student)}
+        self.assertNotIn(other_q.id, due_ids)
+
+    def test_new_questions_excludes_anything_already_attempted(self):
+        QuestionAttempt.objects.create(user=self.student, question=self.q1)
+        ctx = resolve_source_scope(self.student, self.test.id)
+        new_ids = {q.id for q in new_question_candidates(ctx, self.student)}
+        self.assertNotIn(self.q1.id, new_ids)
+        self.assertIn(self.q2.id, new_ids)
+        self.assertIn(self.q3.id, new_ids)
+
+    def test_bookmarked_candidates_scoped_to_the_source_pool_only(self):
+        QuestionAttempt.objects.create(user=self.student, question=self.q1, is_bookmarked=True)
+        ctx = resolve_source_scope(self.student, self.test.id)
+        bookmarked_ids = {q.id for q in bookmarked_candidates(ctx, self.student)}
+        self.assertEqual(bookmarked_ids, {self.q1.id})
+
+    def test_ai_mixed_returns_a_deduplicated_blend_within_the_authorized_pool(self):
+        QuestionAttempt.objects.create(user=self.student, question=self.q3, revision_due_at=timezone.now() - timezone.timedelta(days=1))
+        ctx = resolve_source_scope(self.student, self.test.id)
+        candidates = build_candidates(ctx, 'ai_mixed', 10, user=self.student)
+        ids = [q.id for q, _ in candidates]
+        self.assertEqual(len(ids), len(set(ids)))
+        expansion_ids = set(ctx.expansion_pool.values_list('id', flat=True))
+        self.assertTrue(set(ids).issubset(expansion_ids))
+        self.assertGreater(len(ids), 0)
+
+    def test_create_session_end_to_end_for_each_new_mode(self):
+        QuestionAttempt.objects.create(
+            user=self.student, question=self.q1,
+            revision_due_at=timezone.now() - timezone.timedelta(days=1), is_bookmarked=True,
+        )
+        for mode in ['due_review', 'new_questions', 'bookmarked', 'ai_mixed']:
+            session = create_session(self.student, self.test.id, mode)
+            self.assertEqual(session.mode, mode)
+            self.assertGreaterEqual(session.question_count, 0)
+
+    def test_recommendations_endpoint_includes_new_tiles_with_real_counts(self):
+        QuestionAttempt.objects.create(
+            user=self.student, question=self.q3,
+            revision_due_at=timezone.now() - timezone.timedelta(days=1), is_bookmarked=True,
+        )
+        resp = self.client.get(f'/api/student/smart-practice/recommendations/?source_test_id={self.test.id}')
+        self.assertEqual(resp.status_code, 200)
+        modes_by_key = {m['mode']: m for m in resp.data['modes']}
+        self.assertIn('due_review', modes_by_key)
+        self.assertIn('bookmarked', modes_by_key)
+        self.assertIn('ai_mixed', modes_by_key)
+        self.assertGreater(modes_by_key['due_review']['question_count'], 0)
+        self.assertGreater(modes_by_key['bookmarked']['question_count'], 0)
+
+    def test_eligibility_is_true_from_due_review_alone_even_with_zero_mistakes(self):
+        """A student who aced the test (no mistakes) but has a due-for-
+        review question in this test's pool must still see the card —
+        the old mistakes-only gate hid Due for Review/New/Bookmarked too."""
+        perfect_attempt = TestAttempt.objects.create(user=self.student, test=self.test, status='submitted', score=3)
+        Answer.objects.create(attempt=perfect_attempt, question=self.q1, selected_option=self.q1_correct, is_correct=True)
+        Answer.objects.create(attempt=perfect_attempt, question=self.q2, selected_option=self.q2_correct, is_correct=True)
+        Answer.objects.create(attempt=perfect_attempt, question=self.q3, selected_option=self.q3_correct, is_correct=True)
+        QuestionAttempt.objects.create(user=self.student, question=self.q1, revision_due_at=timezone.now() - timezone.timedelta(days=1))
+
+        resp = self.client.get(f'/api/student/smart-practice/eligibility/?source_test_id={self.test.id}')
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.data['eligible'])
+        self.assertEqual(resp.data['mistake_count'], 0)
+        self.assertGreater(resp.data['due_count'], 0)
