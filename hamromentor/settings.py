@@ -173,6 +173,20 @@ if os.environ.get('DB_NAME'):
             'HOST': os.environ.get('DB_HOST', 'localhost'),
             'PORT': os.environ.get('DB_PORT', '3306'),
             'OPTIONS': {'charset': 'utf8mb4'},
+            # Persist connections across requests instead of opening a new
+            # one every time (scalability audit finding C3) — 60s is
+            # deliberately short, not a long-lived pool: Cloud Run can
+            # freeze/recycle an idle instance at any time, so a connection
+            # kept alive too long risks being reused after it's gone stale
+            # ("MySQL server has gone away"). CONN_HEALTH_CHECKS pings a
+            # reused connection before Django trusts it, which is exactly
+            # the safety net a short-lived serverless container needs —
+            # a dead connection is discarded and reopened instead of
+            # surfacing as a 500 to the student mid-request. Both are
+            # env-overridable so this can be tuned from load-test results
+            # without a code change.
+            'CONN_MAX_AGE': int(os.environ.get('DB_CONN_MAX_AGE', '60')),
+            'CONN_HEALTH_CHECKS': True,
         }
     }
 else:
@@ -182,6 +196,38 @@ else:
             'NAME': BASE_DIR / 'db.sqlite3',
         }
     }
+
+
+# Cache (scalability audit finding: no shared cache existed anywhere in the
+# app, so even DRF's own throttle counters were per-process and effectively
+# unenforced across gunicorn workers/Cloud Run instances). This is Phase 0
+# infrastructure only — wiring the backend so it exists and is safe to use.
+# No view/service code reads or writes through it yet; that's deliberately
+# separate, later work (locked_subject_ids, the performance dashboard, etc.
+# each need their own considered cache key + invalidation + TTL, not a
+# blanket "cache everything" flip). Falls back to Django's default
+# LocMemCache in local dev (no REDIS_HOST set) exactly like DATABASES
+# above falls back to sqlite — nothing here requires Redis to run locally.
+#
+# IGNORE_EXCEPTIONS + a null CLIENT_CLASS log handler mean a Redis outage
+# degrades every cache read to a miss (silently falls through to the real
+# DB/computation) instead of turning into a 500 for students — a cache is
+# an optimization, not a dependency the app should go down without.
+if os.environ.get('REDIS_HOST'):
+    CACHES = {
+        'default': {
+            'BACKEND': 'django_redis.cache.RedisCache',
+            'LOCATION': f"redis://{os.environ['REDIS_HOST']}:{os.environ.get('REDIS_PORT', '6379')}/1",
+            'OPTIONS': {
+                'CLIENT_CLASS': 'django_redis.client.DefaultClient',
+                'IGNORE_EXCEPTIONS': True,
+                'SOCKET_CONNECT_TIMEOUT': 2,
+                'SOCKET_TIMEOUT': 2,
+            },
+        }
+    }
+    DJANGO_REDIS_IGNORE_EXCEPTIONS = True
+    DJANGO_REDIS_LOG_IGNORED_EXCEPTIONS = True
 
 
 # Password validation

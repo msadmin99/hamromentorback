@@ -14,8 +14,17 @@ steps:
       - --platform=managed
       - --allow-unauthenticated
       - --add-cloudsql-instances=hamromentor-app:us-central1:hamromentor-db-uc1
-      - --set-env-vars=DB_NAME=hamromentor,DB_USER=hamromentor_app,DB_HOST=/cloudsql/hamromentor-app:us-central1:hamromentor-db-uc1,DJANGO_DEBUG=False,GCP_PROJECT_ID=hamromentor-app,GCP_REGION=us-central1,MEDIA_GCS_PRIVATE_BUCKET=hamromentor-media-private,MEDIA_GCS_PUBLIC_BUCKET=hamromentor-media-public,CLOUD_TASKS_QUEUE=image-processing,BACKEND_INTERNAL_URL=https://api.drgutka.com,IMAGE_PROCESSING_ASYNC=True
+      # hamromentor-vpc-conn / private-ranges-only: lets Cloud Run reach the
+      # Memorystore Redis instance's private IP (10.101.211.19) without
+      # routing unrelated internet-bound traffic (GCS, Cloud Tasks, email)
+      # through the connector too.
+      - --vpc-connector=hamromentor-vpc-conn
+      - --vpc-egress=private-ranges-only
+      - --set-env-vars=DB_NAME=hamromentor,DB_USER=hamromentor_app,DB_HOST=/cloudsql/hamromentor-app:us-central1:hamromentor-db-uc1,DJANGO_DEBUG=False,GCP_PROJECT_ID=hamromentor-app,GCP_REGION=us-central1,MEDIA_GCS_PRIVATE_BUCKET=hamromentor-media-private,MEDIA_GCS_PUBLIC_BUCKET=hamromentor-media-public,CLOUD_TASKS_QUEUE=image-processing,BACKEND_INTERNAL_URL=https://api.drgutka.com,IMAGE_PROCESSING_ASYNC=True,REDIS_HOST=10.101.211.19,REDIS_PORT=6379
       - --set-secrets=DB_PASSWORD=db-password:latest,DJANGO_SECRET_KEY=django-secret-key:latest,MEDIA_PROCESSING_SECRET=media-processing-secret:latest,CRON_SECRET=cron-secret:latest
+      - --memory=1Gi
+      - --cpu=1
+      - --max-instances=15
 images:
   - 'asia-south1-docker.pkg.dev/hamromentor-app/hamromentor-repo/backend:$COMMIT_SHA'
 options:

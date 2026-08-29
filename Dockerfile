@@ -20,4 +20,8 @@ RUN python manage.py collectstatic --noinput
 
 EXPOSE 8080
 
-CMD exec gunicorn hamromentor.wsgi:application --bind 0.0.0.0:${PORT:-8080} --workers 2 --threads 4 --timeout 60
+# --threads only has any effect with the gthread worker class (gunicorn's
+# default is plain "sync", which ignores it entirely) — this was silently
+# a no-op before, meaning each instance handled 2 real concurrent requests,
+# not 2 workers x 4 threads = 8, as the flag implied.
+CMD exec gunicorn hamromentor.wsgi:application --bind 0.0.0.0:${PORT:-8080} --worker-class gthread --workers 2 --threads 4 --timeout 60
