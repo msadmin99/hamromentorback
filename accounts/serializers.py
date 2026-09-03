@@ -2,6 +2,8 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
 from rest_framework import serializers
 
+from courses.models import Enrollment
+
 from .models import Device, RolePermission, StudentProfile
 
 User = get_user_model()
@@ -99,6 +101,51 @@ class RegisterSerializer(serializers.ModelSerializer):
         user.set_password(password)
         user.save()
         StudentProfile.objects.create(user=user, college=college)
+
+        # Unified Exam Catalog Visibility fix (root cause of "free student
+        # sees 0 tests"): courses.access.eligible_course_ids() — the single
+        # gate behind Test/Question/Video catalog visibility everywhere in
+        # the app — reads ONLY courses.Enrollment. Until now, Enrollment was
+        # created exactly two ways: an admin manually approving an
+        # EnrollmentRequest, or billing.payment_service._ensure_enrollment()
+        # on a successful purchase (see that function's own docstring — it
+        # exists because "a student could pay... and still see zero
+        # content"). Registration created neither. The student picks a
+        # course right here on this form (validated_data['course'], a
+        # Course.prefix — see User.course's help_text) and nothing ever
+        # turned that choice into catalog membership, so every self-
+        # registered free student was catalog-blind — 0 Daily/Mock/Grand/
+        # PYQ/QBank content — until an admin happened to enroll them, which
+        # in practice only ever happened as a side effect of paying.
+        #
+        # This mirrors _ensure_enrollment exactly (same model, same
+        # update_or_create shape) with access_type='free' instead of
+        # 'package' — the ACCESS_CHOICES tier that has existed on Enrollment
+        # since Phase 2 for exactly this case and was simply never wired to
+        # the one path that needed it. It grants catalog visibility only —
+        # no commercial entitlement, no Free Starter interaction, no
+        # capability change. A student who never bought anything still
+        # can't Start a Pro test; they can now see it exists.
+        #
+        # Best-effort, matching the same "never fail registration" contract
+        # this codebase already uses elsewhere: an unmatched/blank course
+        # must never fail registration — the student can still pick a
+        # course later via ActiveCourseView once an admin (or a future
+        # self-service flow) enrolls them.
+        course_prefix = (getattr(user, 'course', '') or '').strip()
+        if course_prefix:
+            try:
+                from courses.models import Course
+
+                course = Course.objects.filter(prefix=course_prefix).first()
+                if course:
+                    Enrollment.objects.update_or_create(
+                        user=user, course=course,
+                        defaults={'access_type': 'free', 'is_active': True},
+                    )
+            except Exception:
+                pass
+
         return user
 
 
