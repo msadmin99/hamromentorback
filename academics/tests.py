@@ -2,6 +2,7 @@ import io
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase
 from docx import Document as DocxDocument
@@ -328,6 +329,118 @@ class ImportUploadViewObservabilityTests(APITestCase):
         self.assertEqual(resp.status_code, 201)
         batch = ImportBatch.objects.get(pk=resp.data['id'])
         self.assertEqual(ImportRow.objects.get(batch=batch).status, 'error')
+
+
+class ImportUploadViewEarlyBoundaryObservabilityTests(APITestCase):
+    """Diagnostic phase 2: the first observability fix only guarded
+    ImportUploadView.post()'s *final* stretch. A live staging reproduction
+    of the real upload 500 showed that logger never fires — proving the
+    actual failure happens earlier: in multipart/file access, in
+    ImportUploadThrottle's check, or in the previously-unguarded
+    ImportBatch.objects.create() call. These tests prove each of those
+    three boundaries is now individually logged (with a real, expected
+    rate-limit hit staying silent and unlogged, exactly as before), and
+    that none of this changes the actual HTTP behavior for either the
+    success path or any of these failure modes."""
+
+    VALID_CSV = (
+        'Question,Option1,Option2,Option3,Option4,Correct Option,Explanation\r\n'
+        'What is 2+2?,3,4,5,6,2,Basic addition.\r\n'
+    )
+
+    def setUp(self):
+        self.staff = User.objects.create_user(
+            username='staff2', email='staff2@example.com', password='pw12345', is_staff=True, admin_role='admin',
+        )
+        self.client.force_authenticate(user=self.staff)
+
+    def _upload(self, content=None):
+        content = self.VALID_CSV if content is None else content
+        file_obj = SimpleUploadedFile('questions.csv', content.encode('utf-8'), content_type='text/csv')
+        return self.client.post('/api/import-batches/upload/', {'file': file_obj, 'import_mode': 'question_bank'})
+
+    def test_batch_create_failure_is_logged_and_still_returns_500(self):
+        def boom(*args, **kwargs):
+            raise RuntimeError('simulated ImportBatch.objects.create failure')
+
+        self.client.raise_request_exception = False
+        with patch('academics.import_views.ImportBatch.objects.create', side_effect=boom):
+            with self.assertLogs('academics.import_views', level='ERROR') as captured:
+                resp = self._upload()
+
+        self.assertEqual(resp.status_code, 500)  # unchanged semantics — still a 500, never swallowed/converted
+        self.assertEqual(len(captured.records), 1)
+        message = captured.records[0].getMessage()
+        self.assertIn('unexpected error creating ImportBatch', message)
+        self.assertIn('file_format=csv', message)
+        self.assertNotIn('2+2', message)  # never logs the uploaded file's own content
+        self.assertNotIn('questions.csv', message)  # never logs the filename either
+        self.assertIsNotNone(captured.records[0].exc_info)
+        self.assertIn('RuntimeError', captured.records[0].exc_text or '')
+        self.assertEqual(ImportBatch.objects.count(), 0)  # the create() call itself is what failed
+
+    def test_multipart_parse_failure_is_logged_and_still_returns_500(self):
+        def boom(*args, **kwargs):
+            raise RuntimeError('simulated multipart parser failure')
+
+        self.client.raise_request_exception = False
+        with patch('rest_framework.parsers.MultiPartParser.parse', side_effect=boom):
+            with self.assertLogs('academics.import_views', level='ERROR') as captured:
+                resp = self._upload()
+
+        self.assertEqual(resp.status_code, 500)
+        self.assertEqual(len(captured.records), 1)
+        message = captured.records[0].getMessage()
+        self.assertIn('unexpected error accessing uploaded file', message)
+        self.assertIn('/api/import-batches/upload/', message)
+        self.assertIsNotNone(captured.records[0].exc_info)
+        self.assertIn('RuntimeError', captured.records[0].exc_text or '')
+        self.assertEqual(ImportBatch.objects.count(), 0)  # never reached batch creation
+
+    def test_unexpected_throttle_error_is_logged_and_still_returns_500(self):
+        def boom(*args, **kwargs):
+            raise RuntimeError('simulated throttle backend failure')
+
+        self.client.raise_request_exception = False
+        with patch('academics.import_views.ImportUploadThrottle.allow_request', side_effect=boom):
+            with self.assertLogs('academics.import_views', level='ERROR') as captured:
+                resp = self._upload()
+
+        self.assertEqual(resp.status_code, 500)
+        self.assertEqual(len(captured.records), 1)
+        message = captured.records[0].getMessage()
+        self.assertIn('unexpected error during throttle check', message)
+        self.assertIsNotNone(captured.records[0].exc_info)
+        self.assertIn('RuntimeError', captured.records[0].exc_text or '')
+
+    def test_genuine_rate_limit_hit_returns_429_and_is_not_logged(self):
+        """A real throttle rejection (Throttled -> 429), driven through
+        DRF's actual SimpleRateThrottle mechanics rather than a bare mocked
+        return value (which skips the internal `self.history` bookkeeping
+        DRF's own 429-building code depends on) — proves check_throttles()'s
+        new override doesn't turn routine rate limiting into a logged
+        error."""
+        # Django's throttle cache is process-global, not reset between test
+        # methods the way the DB is — clear it so an earlier test's hits
+        # against this same scope+user cache key can't leak into this one.
+        cache.clear()
+        with patch('academics.import_views.ImportUploadThrottle.get_rate', return_value='1/day'):
+            first = self._upload()
+            self.assertEqual(first.status_code, 201)  # first request still succeeds, unaffected
+
+            with self.assertNoLogs('academics.import_views', level='ERROR'):
+                second = self._upload()
+
+        self.assertEqual(second.status_code, 429)
+
+    def test_valid_upload_still_unaffected_by_the_new_guards(self):
+        """Confirms none of the three new try/except wrappers changed the
+        successful path at all."""
+        with self.assertNoLogs('academics.import_views', level='ERROR'):
+            resp = self._upload()
+
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data['status'], 'ready')
 
 
 def _build_docx(lines):

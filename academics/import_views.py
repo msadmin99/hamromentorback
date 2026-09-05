@@ -7,7 +7,7 @@ from django.db import close_old_connections, transaction
 from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework import status
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import Throttled, ValidationError
 from rest_framework.permissions import IsAdminUser
 from rest_framework.response import Response
 from rest_framework.throttling import UserRateThrottle
@@ -86,8 +86,39 @@ class ImportUploadView(APIView):
     permission_classes = [IsAdminUser]
     throttle_classes = [ImportUploadThrottle]
 
+    def check_throttles(self, request):
+        # Diagnostic phase 2 (upload-500 investigation): DRF calls this from
+        # initial(), before post() ever runs — a failure here was previously
+        # invisible for the same reason the finalization block was (see the
+        # observability-fix phase report). A deliberate rate-limit hit
+        # raises Throttled by design (-> 429) and must stay silent and
+        # unlogged; anything else escaping the throttle check is logged
+        # before propagating, with the response unchanged either way.
+        try:
+            super().check_throttles(request)
+        except Throttled:
+            raise
+        except Exception:
+            logger.exception(
+                'ImportUploadView: unexpected error during throttle check (ImportUploadThrottle) path=%s',
+                request.path,
+            )
+            raise
+
     def post(self, request):
-        file_obj = request.FILES.get('file')
+        # Diagnostic phase 2 (upload-500 investigation): request.FILES is
+        # where DRF actually parses the multipart body, on first access —
+        # a parse failure here (malformed multipart, truncated body, etc.)
+        # was previously unguarded and invisible. Logged then re-raised so
+        # the response Django produces is unchanged.
+        try:
+            file_obj = request.FILES.get('file')
+        except Exception:
+            logger.exception(
+                'ImportUploadView: unexpected error accessing uploaded file (multipart parsing) path=%s',
+                request.path,
+            )
+            raise
         if not file_obj:
             return Response({'detail': 'No file uploaded.'}, status=400)
 
@@ -119,10 +150,23 @@ class ImportUploadView(APIView):
             return Response({'detail': f'Unknown import_mode "{import_mode}".'}, status=400)
 
         parser = PARSERS[file_format]
-        batch = ImportBatch.objects.create(
-            uploaded_by=request.user, file_name=file_obj.name, file_format=file_format, status='validating',
-            import_mode=import_mode,
-        )
+        # Diagnostic phase 2 (upload-500 investigation): batch creation is a
+        # database write with no prior exception handling at all — the same
+        # invisible-failure risk as the finalization block already fixed.
+        # Never logs the filename (may reflect uploader-chosen text) or file
+        # contents — only the detected format and byte size, both already
+        # non-secret request metadata.
+        try:
+            batch = ImportBatch.objects.create(
+                uploaded_by=request.user, file_name=file_obj.name, file_format=file_format, status='validating',
+                import_mode=import_mode,
+            )
+        except Exception:
+            logger.exception(
+                'ImportUploadView: unexpected error creating ImportBatch file_format=%s file_size_bytes=%s',
+                file_format, file_obj.size,
+            )
+            raise
         try:
             parsed_questions = parser(file_obj) if file_format == 'json' else parser(file_obj, batch_id=batch.id)
         except ValueError as exc:
