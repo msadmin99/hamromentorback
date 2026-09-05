@@ -1,6 +1,6 @@
 from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
-from django.db.models import Count, Prefetch, Q
+from django.db.models import Avg, Count, Prefetch, Q, Sum
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.pagination import PageNumberPagination
@@ -9,12 +9,15 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from courses.models import Enrollment
+from billing.models import Purchase
+from courses.models import Enrollment, EnrollmentRequest
 from hamromentor.permissions import IsAdminRoleOrAbove, IsSuperAdmin
+from tests_app.models import TestAttempt
 
 from .models import Device, RolePermission, StudentProfile
 from .serializers import (
     AdminAccountSerializer,
+    AdminUserDetailSerializer,
     AdminUserSerializer,
     LoginSerializer,
     RegisterSerializer,
@@ -279,6 +282,202 @@ class AdminUserViewSet(viewsets.ModelViewSet):
 
         serializer = AdminStudentBrowseSerializer(target, many=True)
         return paginator.get_paginated_response(serializer.data)
+
+
+    # Bulk-import-style bound: how many rows of each related collection the
+    # detail page gets. Keeps the endpoint's cost flat regardless of how
+    # long a student's history is — see the `detail` action's own docstring.
+    DETAIL_RELATED_LIMIT = 20
+
+    @action(detail=True, methods=['get'], url_path='detail')
+    def student_detail(self, request, pk=None):
+        """Admin Student Detail (Phase 1) — a separate, richer read view.
+        Deliberately NOT built on top of get_queryset()/get_object(): this
+        method builds its own queryset with select_related + bounded,
+        select_related'd Prefetch()es for every related collection, so nothing
+        here ever touches list()/retrieve()'s query shape or cost. Total
+        query count for one call: 1 (user + select_related joins) + 4
+        (enrollments/enrollment_requests/purchases/devices, each one bounded
+        query) + 1 (recent test attempts) + 2 (QuestionAttempt aggregate,
+        TestAttempt aggregate) = 8, independent of how much history the
+        student has — verified in accounts/tests.py via CaptureQueriesContext.
+        """
+        user = self._detail_queryset().filter(pk=pk).first()
+        if user is None:
+            return Response({'detail': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        user.detail_activity_summary = self._activity_summary(user, self.DETAIL_RELATED_LIMIT)
+        return Response(AdminUserDetailSerializer(user).data)
+
+    @classmethod
+    def _detail_queryset(cls):
+        """The exact select_related/Prefetch shape student_detail uses —
+        factored out so student_edit (Phase 2) can build the same
+        bounded, N+1-free response after a save without duplicating it."""
+        limit = cls.DETAIL_RELATED_LIMIT
+        return (
+            User.objects.filter(is_staff=False)
+            .select_related('profile', 'active_course', 'referred_by')
+            .prefetch_related(
+                Prefetch(
+                    'enrollments',
+                    queryset=Enrollment.objects.select_related('course', 'package', 'batch').order_by('-enrolled_at')[:limit],
+                    to_attr='detail_enrollments',
+                ),
+                Prefetch(
+                    'enrollment_requests',
+                    queryset=EnrollmentRequest.objects.select_related('course', 'package').order_by('-submitted_at')[:limit],
+                    to_attr='detail_enrollment_requests',
+                ),
+                Prefetch(
+                    'purchases',
+                    queryset=Purchase.objects.select_related(
+                        'plan', 'grand_test', 'teacher_course', 'combo_plan', 'decided_by',
+                    ).order_by('-created_at')[:limit],
+                    to_attr='detail_purchases',
+                ),
+                Prefetch('devices', queryset=Device.objects.order_by('-last_seen')[:limit], to_attr='detail_devices'),
+            )
+        )
+
+    @staticmethod
+    def _activity_summary(user, limit):
+        """Two aggregate-only queries (no row-per-attempt loading) plus one
+        bounded, select_related'd list for 'recent activity' — never
+        `.all()` over QuestionAttempt/TestAttempt, both of which are
+        platform-wide, unboundedly-growing tables."""
+        from academics.models import QuestionAttempt
+
+        qa_stats = QuestionAttempt.objects.filter(user=user).aggregate(
+            questions_attempted=Count('id'),
+            total_attempts=Sum('attempts_count'),
+            total_correct=Sum('correct_count'),
+            mastered=Count('id', filter=Q(mastery_status='mastered')),
+            weak=Count('id', filter=Q(mastery_status='weak')),
+            need_practice=Count('id', filter=Q(mastery_status='need_practice')),
+            learning=Count('id', filter=Q(mastery_status='learning')),
+            new=Count('id', filter=Q(mastery_status='new')),
+        )
+        total_attempts = qa_stats['total_attempts'] or 0
+        total_correct = qa_stats['total_correct'] or 0
+        overall_accuracy_pct = round((total_correct / total_attempts) * 100, 1) if total_attempts else None
+
+        ta_stats = TestAttempt.objects.filter(user=user, status='submitted').aggregate(
+            tests_taken=Count('id'),
+            avg_score=Avg('score'),
+            avg_accuracy=Avg('accuracy'),
+        )
+        recent_attempts = (
+            TestAttempt.objects.filter(user=user).select_related('test').order_by('-start_time')[:limit]
+        )
+
+        from .serializers import AdminStudentTestAttemptSerializer
+
+        return {
+            'questions_attempted': qa_stats['questions_attempted'] or 0,
+            'total_attempts': total_attempts,
+            'total_correct': total_correct,
+            'overall_accuracy_pct': overall_accuracy_pct,
+            'mastery_breakdown': {
+                'new': qa_stats['new'] or 0,
+                'learning': qa_stats['learning'] or 0,
+                'need_practice': qa_stats['need_practice'] or 0,
+                'weak': qa_stats['weak'] or 0,
+                'mastered': qa_stats['mastered'] or 0,
+            },
+            'tests_taken': ta_stats['tests_taken'] or 0,
+            'avg_score': round(ta_stats['avg_score'], 2) if ta_stats['avg_score'] is not None else None,
+            'avg_accuracy': round(ta_stats['avg_accuracy'], 2) if ta_stats['avg_accuracy'] is not None else None,
+            'recent_test_attempts': AdminStudentTestAttemptSerializer(recent_attempts, many=True).data,
+        }
+
+    @action(detail=True, methods=['patch'], url_path='edit')
+    def student_edit(self, request, pk=None):
+        """Admin Student Edit (Phase 2) — a dedicated endpoint, deliberately
+        separate from list()/retrieve()/partial_update()'s generic PATCH
+        (which stays exactly as it was: is_active toggle only). Every
+        request key not in AdminStudentEditSerializer's declared fields is
+        rejected outright — this is the actual enforcement mechanism behind
+        "email/password/username/referral_code/wallet_balance/active_course/
+        is_active/enrollments/purchases cannot be edited here", not just a
+        convention.
+
+        Concurrency: both rows are locked with select_for_update() inside
+        one transaction, so two admins editing the same student at once
+        serialize at the DB level (second request's read happens after the
+        first's commit) instead of racing on a stale in-Python read —
+        see accounts/tests.py's threaded concurrent-edit test.
+
+        Only ever writes the specific columns that actually changed
+        (update_fields=[...]) — never a blanket full-row save. Audit log
+        entry is written only on genuine success (see core.edit_audit).
+        """
+        from django.db import transaction
+
+        from core.edit_audit import record_admin_edit
+
+        from .serializers import AdminStudentEditSerializer
+
+        allowed_keys = set(AdminStudentEditSerializer().fields.keys())
+        disallowed = set(request.data.keys()) - allowed_keys
+        if disallowed:
+            return Response(
+                {'detail': f"These fields cannot be edited here: {', '.join(sorted(disallowed))}."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        with transaction.atomic():
+            user = User.objects.select_for_update().filter(is_staff=False, pk=pk).first()
+            if user is None:
+                return Response({'detail': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+            profile = StudentProfile.objects.select_for_update().filter(user=user).first()
+            if profile is None:
+                profile = StudentProfile.objects.create(user=user)
+
+            serializer = AdminStudentEditSerializer(data=request.data, partial=True, context={'user_id': user.id})
+            serializer.is_valid(raise_exception=True)
+            validated = serializer.validated_data
+
+            changed = {}
+            user_update_fields = []
+            for f in AdminStudentEditSerializer.USER_FIELDS:
+                if f not in validated:
+                    continue
+                old = getattr(user, f)
+                new = validated[f]
+                if old != new:
+                    changed[f] = {'old': old, 'new': new}
+                    setattr(user, f, new)
+                    user_update_fields.append(f)
+            if user_update_fields:
+                user.save(update_fields=user_update_fields)
+
+            profile_update_fields = []
+            for f in AdminStudentEditSerializer.PROFILE_FIELDS:
+                if f not in validated:
+                    continue
+                old = getattr(profile, f)
+                new = validated[f]
+                if old != new:
+                    changed[f] = {'old': old, 'new': new}
+                    setattr(profile, f, new)
+                    profile_update_fields.append(f)
+            if profile_update_fields:
+                profile.save(update_fields=profile_update_fields)
+
+        if changed:
+            record_admin_edit(
+                request, resource_type='Student', resource_id=user.id, resource_label=user.email,
+                changed_fields=changed,
+            )
+
+        return Response({
+            'id': user.id, 'first_name': user.first_name, 'last_name': user.last_name, 'phone': user.phone,
+            'program': user.program, 'course': user.course,
+            'college': profile.college, 'district': profile.district, 'province': profile.province,
+            'exam_target': profile.exam_target, 'batch': profile.batch,
+            'changed_fields': list(changed.keys()),
+        })
 
 
 class AdminAccountViewSet(viewsets.ModelViewSet):

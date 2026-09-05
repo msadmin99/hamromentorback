@@ -2,7 +2,9 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
 from rest_framework import serializers
 
-from courses.models import Enrollment
+from billing.models import Purchase
+from courses.models import Enrollment, EnrollmentRequest
+from tests_app.models import TestAttempt
 
 from .models import Device, RolePermission, StudentProfile
 
@@ -201,6 +203,192 @@ class AdminStudentBrowseSerializer(serializers.ModelSerializer):
 
     def get_enrollments(self, obj):
         return AdminStudentEnrollmentSummarySerializer(getattr(obj, 'browse_enrollments', []), many=True).data
+
+
+class AdminStudentEnrollmentSerializer(serializers.ModelSerializer):
+    """Lightweight — deliberately not courses.serializers.EnrollmentSerializer,
+    which adds its own obj.user.devices.count() per row (fine on that
+    endpoint's own bounded/paginated list, redundant and avoidable here
+    since the student detail response already carries one top-level
+    device_count)."""
+    course_name = serializers.CharField(source='course.name', read_only=True)
+    course_prefix = serializers.CharField(source='course.prefix', read_only=True)
+    package_name = serializers.CharField(source='package.name', read_only=True, default=None)
+    batch_name = serializers.CharField(source='batch.name', read_only=True, default=None)
+
+    class Meta:
+        model = Enrollment
+        fields = [
+            'id', 'course', 'course_name', 'course_prefix', 'package', 'package_name',
+            'batch', 'batch_name', 'student_code', 'access_type', 'is_active', 'enrolled_at', 'expires_at',
+        ]
+
+
+class AdminStudentEnrollmentRequestSerializer(serializers.ModelSerializer):
+    course_name = serializers.CharField(source='course.name', read_only=True)
+    package_name = serializers.CharField(source='package.name', read_only=True, default=None)
+
+    class Meta:
+        model = EnrollmentRequest
+        fields = ['id', 'course', 'course_name', 'package', 'package_name', 'student_code', 'status', 'submitted_at', 'decided_at']
+
+
+class AdminStudentPurchaseSerializer(serializers.ModelSerializer):
+    """Lightweight sibling of billing.serializers.PurchaseSerializer — that
+    one nests combo_items/grand_test_access/payment_method_detail (built for
+    the Payments admin screen's own single-purchase workflows); this one
+    only carries what a student's Payments tab needs, kept bounded to the
+    latest N rows by the view's Prefetch. Never exposes the raw screenshot
+    key/bucket/URL — has_screenshot mirrors PurchaseSerializer's own pattern
+    of leaving the actual signed-URL fetch to the existing, already-
+    authorized GET /purchases/{id}/screenshot/ endpoint."""
+    order_id = serializers.ReadOnlyField()
+    item_name = serializers.SerializerMethodField()
+    decided_by_name = serializers.SerializerMethodField()
+    has_screenshot = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Purchase
+        fields = [
+            'id', 'order_id', 'kind', 'item_name', 'final_amount', 'status',
+            'payment_reference', 'admin_note', 'created_at', 'decided_at', 'decided_by_name', 'has_screenshot',
+        ]
+
+    def get_item_name(self, obj):
+        if obj.kind == 'subscription' and obj.plan_id:
+            return obj.plan.name
+        if obj.kind == 'grand_test' and obj.grand_test_id:
+            return obj.grand_test.title
+        if obj.kind == 'teacher_course' and obj.teacher_course_id:
+            return obj.teacher_course.title
+        if obj.kind == 'combo' and obj.combo_plan_id:
+            return obj.combo_plan.name
+        return ''
+
+    def get_decided_by_name(self, obj):
+        if not obj.decided_by_id:
+            return None
+        return obj.decided_by.first_name or obj.decided_by.email
+
+    def get_has_screenshot(self, obj):
+        return bool(obj.payment_screenshot_key)
+
+
+class AdminStudentTestAttemptSerializer(serializers.ModelSerializer):
+    test_title = serializers.CharField(source='test.title', read_only=True)
+    exam_type = serializers.CharField(source='test.exam_type', read_only=True)
+
+    class Meta:
+        model = TestAttempt
+        fields = ['id', 'test', 'test_title', 'exam_type', 'score', 'accuracy', 'rank', 'percentile', 'status', 'start_time', 'end_time']
+
+
+class AdminUserDetailSerializer(serializers.ModelSerializer):
+    """Backs GET /auth/users/<id>/detail/ only — the student LIST/retrieve
+    actions keep using the shallow AdminUserSerializer above unchanged, so
+    list-page payload size/query cost is unaffected by anything added here.
+
+    Every related-collection field below reads from a `detail_*` attribute
+    the view attaches via prefetch_related(Prefetch(..., to_attr=...)) —
+    never obj.enrollments.all() etc. directly — so this serializer never
+    triggers its own queries no matter how it's called; the view is the
+    single place responsible for keeping this bounded and N+1-free (see
+    AdminUserViewSet.student_detail's docstring)."""
+    profile = StudentProfileSerializer(read_only=True)
+    active_course_detail = serializers.SerializerMethodField()
+    referred_by = serializers.SerializerMethodField()
+    enrollments = serializers.SerializerMethodField()
+    enrollment_requests = serializers.SerializerMethodField()
+    purchases = serializers.SerializerMethodField()
+    devices = serializers.SerializerMethodField()
+    device_count = serializers.SerializerMethodField()
+    activity_summary = serializers.SerializerMethodField()
+
+    class Meta:
+        model = User
+        fields = [
+            'id', 'username', 'first_name', 'last_name', 'email', 'phone',
+            'program', 'course', 'active_course', 'active_course_detail',
+            'is_active', 'is_staff', 'date_joined',
+            'referral_code', 'wallet_balance', 'referred_by',
+            'profile', 'enrollments', 'enrollment_requests', 'purchases',
+            'devices', 'device_count', 'activity_summary',
+        ]
+        read_only_fields = fields
+
+    def get_active_course_detail(self, obj):
+        if not obj.active_course_id:
+            return None
+        c = obj.active_course
+        return {'id': c.id, 'name': c.name, 'prefix': c.prefix, 'program_group': c.program_group}
+
+    def get_referred_by(self, obj):
+        if not obj.referred_by_id:
+            return None
+        r = obj.referred_by
+        return {'id': r.id, 'name': f'{r.first_name} {r.last_name}'.strip() or r.email, 'email': r.email}
+
+    def get_enrollments(self, obj):
+        return AdminStudentEnrollmentSerializer(getattr(obj, 'detail_enrollments', []), many=True).data
+
+    def get_enrollment_requests(self, obj):
+        return AdminStudentEnrollmentRequestSerializer(getattr(obj, 'detail_enrollment_requests', []), many=True).data
+
+    def get_purchases(self, obj):
+        return AdminStudentPurchaseSerializer(getattr(obj, 'detail_purchases', []), many=True).data
+
+    def get_devices(self, obj):
+        return DeviceSerializer(getattr(obj, 'detail_devices', []), many=True).data
+
+    def get_device_count(self, obj):
+        # Devices realistically never exceed MAX_DEVICES (3) — LoginView
+        # blocks the account once a 4th distinct device tries to log in
+        # (accounts/views.py) — so the bounded detail_devices prefetch
+        # (latest 20) is definitionally the complete set in every real case.
+        return len(getattr(obj, 'detail_devices', []))
+
+    def get_activity_summary(self, obj):
+        return getattr(obj, 'detail_activity_summary', {})
+
+
+class AdminStudentEditSerializer(serializers.Serializer):
+    """Phase 2 — the field allowlist for GET.../edit/. Deliberately a plain
+    Serializer, not a ModelSerializer bound to `User` or `StudentProfile`:
+    the request is one flat body touching fields split across both models,
+    and a bare allowlist here is also the single source of truth the view
+    uses to reject any key outside it (see AdminUserViewSet.student_edit) —
+    a ModelSerializer's Meta.fields would only describe one model's shape.
+
+    Every field the audit + your Phase 2 spec named as editable, and
+    NOTHING else — email, password, username, referral_code, wallet_balance,
+    active_course, is_active, enrollments/purchases/etc. are all
+    unreachable through this serializer by construction, not by convention.
+    """
+    first_name = serializers.CharField(max_length=150, required=False, allow_blank=True)
+    last_name = serializers.CharField(max_length=150, required=False, allow_blank=True)
+    phone = serializers.CharField(max_length=20, required=False, allow_blank=True, allow_null=True)
+    program = serializers.CharField(max_length=50, required=False, allow_blank=True)
+    course = serializers.CharField(max_length=50, required=False, allow_blank=True)
+    college = serializers.CharField(max_length=255, required=False, allow_blank=True)
+    district = serializers.CharField(max_length=100, required=False, allow_blank=True)
+    province = serializers.CharField(max_length=100, required=False, allow_blank=True)
+    exam_target = serializers.CharField(max_length=100, required=False, allow_blank=True)
+    batch = serializers.CharField(max_length=50, required=False, allow_blank=True)
+
+    # Split so the view knows which object to write each validated field to.
+    USER_FIELDS = ('first_name', 'last_name', 'phone', 'program', 'course')
+    PROFILE_FIELDS = ('college', 'district', 'province', 'exam_target', 'batch')
+
+    def validate_phone(self, value):
+        if not value:
+            return value
+        qs = User.objects.filter(phone=value)
+        target_id = self.context.get('user_id')
+        if target_id:
+            qs = qs.exclude(pk=target_id)
+        if qs.exists():
+            raise serializers.ValidationError('This phone number is already in use by another account.')
+        return value
 
 
 class LoginSerializer(serializers.Serializer):

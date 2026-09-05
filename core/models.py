@@ -48,6 +48,46 @@ class DeletionAuditLog(models.Model):
         return f'{self.result}: {self.resource_type} #{self.resource_id} by {self.actor_email or "unknown"}'
 
 
+class AdminEditAuditLog(models.Model):
+    """Security record of a successful admin edit to another user's data —
+    who changed what, from what to what, when. Sibling of DeletionAuditLog
+    (same actor/actor_email snapshot pattern, same ip/user-agent capture),
+    for edits rather than deletes. Written by core.edit_audit.record_admin_edit(),
+    called only after a save genuinely succeeds — see
+    accounts.views.AdminUserViewSet.student_edit (Phase 2). Never written for
+    a rejected/failed request, and changed_fields can never contain a
+    password/token/secret because the editing serializer's field allowlist
+    has no way to touch those in the first place."""
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='+',
+    )
+    actor_email = models.CharField(max_length=255, blank=True)
+
+    resource_type = models.CharField(max_length=50, help_text='e.g. "Student"')
+    resource_id = models.CharField(max_length=64)
+    resource_label = models.CharField(max_length=255, blank=True)
+
+    changed_fields = models.JSONField(
+        default=dict,
+        help_text='{"field_name": {"old": ..., "new": ...}, ...} — only fields that actually changed.',
+    )
+
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+    user_agent = models.CharField(max_length=300, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['resource_type', 'resource_id']),
+            models.Index(fields=['created_at']),
+        ]
+
+    def __str__(self):
+        return f'{self.actor_email or "unknown"} edited {self.resource_type} #{self.resource_id}'
+
+
 class Banner(models.Model):
     title = models.CharField(max_length=255)
     subtitle = models.CharField(max_length=255, blank=True)

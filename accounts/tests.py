@@ -1,13 +1,18 @@
+import threading
+
 from django.contrib.auth import get_user_model
 from django.db import connection
+from django.test import TransactionTestCase
 from django.test.utils import CaptureQueriesContext
 from rest_framework import status
-from rest_framework.test import APITestCase
+from rest_framework.test import APIClient, APITestCase
 
-from billing.models import Purchase
-from core.models import DeletionAuditLog
-from courses.models import Course, Enrollment
+from academics.models import Question, QuestionAttempt, Subject
+from billing.models import Purchase, SubscriptionPlan
+from core.models import AdminEditAuditLog, DeletionAuditLog
+from courses.models import Course, CoursePackage, Enrollment, EnrollmentRequest
 from marketplace.models import TeacherCourse
+from tests_app.models import Test, TestAttempt
 
 User = get_user_model()
 
@@ -73,6 +78,538 @@ class AdminAccountDeleteTests(APITestCase):
         self.assertFalse(User.objects.filter(id=target.id).exists())
         entry = DeletionAuditLog.objects.get(resource_type='AdminAccount')
         self.assertEqual(entry.result, 'success')
+
+
+class AdminStudentDetailTests(APITestCase):
+    """Phase 1: GET /auth/users/<id>/detail/ — permissions, field correctness,
+    cross-student isolation, and query-count/N+1 guarantees."""
+
+    def setUp(self):
+        self.super_admin = User.objects.create_user(
+            username='super1', email='super1@example.com', password='pw12345',
+            is_staff=True, admin_role='super_admin',
+        )
+        self.plain_admin = User.objects.create_user(
+            username='admin1', email='admin1@example.com', password='pw12345',
+            is_staff=True, admin_role='admin',
+        )
+        self.editor = User.objects.create_user(
+            username='editor1', email='editor1@example.com', password='pw12345',
+            is_staff=True, admin_role='editor',
+        )
+
+        self.course = Course.objects.create(name='CEE-PG Course', prefix='CEEPG', program_group='CEE-PG')
+        self.package = CoursePackage.objects.create(course=self.course, name='3 Month Package', price=1000)
+
+        self.referrer = User.objects.create_user(
+            username='referrer1', email='referrer1@example.com', password='pw12345', first_name='Referrer',
+        )
+        self.student = User.objects.create_user(
+            username='student1', email='student1@example.com', password='pw12345',
+            first_name='Ram', last_name='Sharma', phone='9800000001',
+            program='CEE-PG', course='CEEPG', active_course=self.course, referred_by=self.referrer,
+        )
+        from accounts.models import StudentProfile
+
+        StudentProfile.objects.create(
+            user=self.student, college='Test Medical College', district='Kathmandu',
+            province='Bagmati', exam_target='CEE-PG 2082', batch='2082',
+        )
+
+        self.enrollment = Enrollment.objects.create(
+            user=self.student, course=self.course, package=self.package, access_type='package',
+        )
+        EnrollmentRequest.objects.create(user=self.student, course=self.course, package=self.package, status='approved')
+
+        self.plan = SubscriptionPlan.objects.create(
+            course=self.course, product_type='qbank', name='QBank 3mo', price=1000,
+        )
+        Purchase.objects.create(
+            user=self.student, kind='subscription', plan=self.plan,
+            original_amount=1000, final_amount=1000, status='approved',
+            payment_reference='REF123', decided_by=self.plain_admin,
+        )
+
+        self.subject = Subject.objects.create(name='Anatomy')
+        self.question = Question.objects.create(subject=self.subject, text='A test question')
+        QuestionAttempt.objects.create(
+            user=self.student, question=self.question, is_correct=True,
+            attempts_count=3, correct_count=2, incorrect_count=1, mastery_status='learning',
+        )
+
+        self.test_obj = Test.objects.create(title='Mock Test 1', exam_type='mock')
+        TestAttempt.objects.create(
+            user=self.student, test=self.test_obj, status='submitted',
+            score=45, accuracy=75, rank=3, percentile=90,
+        )
+
+        self.other_student = User.objects.create_user(
+            username='student2', email='student2@example.com', password='pw12345',
+            first_name='Sita', last_name='Thapa',
+        )
+        StudentProfile.objects.create(user=self.other_student)
+        Enrollment.objects.create(user=self.other_student, course=self.course, access_type='free')
+        Purchase.objects.create(
+            user=self.other_student, kind='subscription', original_amount=500, final_amount=500,
+        )
+
+        self.blocked_student = User.objects.create_user(
+            username='blocked1', email='blocked1@example.com', password='pw12345', is_active=False,
+        )
+        StudentProfile.objects.create(user=self.blocked_student)
+
+        self.client.force_authenticate(user=self.plain_admin)
+
+    def _detail_url(self, user):
+        return f'/api/auth/users/{user.id}/detail/'
+
+    # --- permissions -----------------------------------------------------
+
+    def test_admin_role_can_access(self):
+        resp = self.client.get(self._detail_url(self.student))
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+    def test_super_admin_can_access(self):
+        self.client.force_authenticate(user=self.super_admin)
+        resp = self.client.get(self._detail_url(self.student))
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+    def test_editor_role_forbidden(self):
+        self.client.force_authenticate(user=self.editor)
+        resp = self.client.get(self._detail_url(self.student))
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_plain_student_forbidden(self):
+        self.client.force_authenticate(user=self.student)
+        resp = self.client.get(self._detail_url(self.student))
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_anonymous_unauthorized(self):
+        self.client.force_authenticate(user=None)
+        resp = self.client.get(self._detail_url(self.student))
+        self.assertIn(resp.status_code, (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN))
+
+    def test_nonexistent_student_404(self):
+        resp = self.client.get('/api/auth/users/999999/detail/')
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_staff_account_not_reachable_via_student_detail(self):
+        """The queryset filters is_staff=False — an admin account's id must
+        not be viewable through this student-scoped endpoint."""
+        resp = self.client.get(self._detail_url(self.plain_admin))
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_inactive_blocked_student_still_viewable(self):
+        resp = self.client.get(self._detail_url(self.blocked_student))
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertFalse(resp.data['is_active'])
+
+    # --- field correctness -------------------------------------------------
+
+    def test_password_never_serialized(self):
+        resp = self.client.get(self._detail_url(self.student))
+        body = str(resp.content)
+        self.assertNotIn('password', resp.data)
+        self.assertNotIn(self.student.password, body)
+
+    def test_personal_contact_academic_fields(self):
+        resp = self.client.get(self._detail_url(self.student))
+        data = resp.data
+        self.assertEqual(data['first_name'], 'Ram')
+        self.assertEqual(data['last_name'], 'Sharma')
+        self.assertEqual(data['email'], 'student1@example.com')
+        self.assertEqual(data['phone'], '9800000001')
+        self.assertEqual(data['profile']['college'], 'Test Medical College')
+        self.assertEqual(data['profile']['district'], 'Kathmandu')
+        self.assertEqual(data['profile']['province'], 'Bagmati')
+        self.assertEqual(data['profile']['exam_target'], 'CEE-PG 2082')
+        self.assertEqual(data['profile']['batch'], '2082')
+        self.assertEqual(data['program'], 'CEE-PG')
+        self.assertEqual(data['course'], 'CEEPG')
+        self.assertEqual(data['active_course'], self.course.id)
+        self.assertEqual(data['active_course_detail']['name'], 'CEE-PG Course')
+
+    def test_account_fields(self):
+        resp = self.client.get(self._detail_url(self.student))
+        data = resp.data
+        self.assertEqual(data['username'], 'student1')
+        self.assertTrue(data['is_active'])
+        self.assertIsNotNone(data['date_joined'])
+        self.assertTrue(data['referral_code'])
+        self.assertEqual(float(data['wallet_balance']), 0.0)
+        self.assertEqual(data['referred_by']['email'], 'referrer1@example.com')
+
+    def test_enrollment_and_enrollment_request_data(self):
+        resp = self.client.get(self._detail_url(self.student))
+        data = resp.data
+        self.assertEqual(len(data['enrollments']), 1)
+        enr = data['enrollments'][0]
+        self.assertEqual(enr['course'], self.course.id)
+        self.assertEqual(enr['course_name'], 'CEE-PG Course')
+        self.assertEqual(enr['package'], self.package.id)
+        self.assertEqual(enr['access_type'], 'package')
+        self.assertTrue(enr['is_active'])
+
+        self.assertEqual(len(data['enrollment_requests']), 1)
+        self.assertEqual(data['enrollment_requests'][0]['status'], 'approved')
+
+    def test_payment_summary_data(self):
+        resp = self.client.get(self._detail_url(self.student))
+        purchases = resp.data['purchases']
+        self.assertEqual(len(purchases), 1)
+        p = purchases[0]
+        self.assertEqual(p['kind'], 'subscription')
+        self.assertEqual(p['item_name'], 'QBank 3mo')
+        self.assertEqual(float(p['final_amount']), 1000.0)
+        self.assertEqual(p['status'], 'approved')
+        self.assertEqual(p['payment_reference'], 'REF123')
+        self.assertIn('decided_by_name', p)
+        self.assertFalse(p['has_screenshot'])
+        # Never the raw storage key/bucket.
+        self.assertNotIn('payment_screenshot_key', p)
+        self.assertNotIn('payment_screenshot_bucket', p)
+
+    def test_activity_summary_data(self):
+        resp = self.client.get(self._detail_url(self.student))
+        summary = resp.data['activity_summary']
+        self.assertEqual(summary['questions_attempted'], 1)
+        self.assertEqual(summary['total_attempts'], 3)
+        self.assertEqual(summary['total_correct'], 2)
+        self.assertEqual(summary['mastery_breakdown']['learning'], 1)
+        self.assertEqual(summary['tests_taken'], 1)
+        self.assertEqual(float(summary['avg_score']), 45.0)
+        self.assertEqual(float(summary['avg_accuracy']), 75.0)
+        self.assertEqual(len(summary['recent_test_attempts']), 1)
+        self.assertEqual(summary['recent_test_attempts'][0]['test_title'], 'Mock Test 1')
+        self.assertEqual(summary['recent_test_attempts'][0]['rank'], 3)
+
+    def test_device_data(self):
+        from accounts.models import Device
+
+        Device.objects.create(user=self.student, device_id='dev-1', device_label='Chrome on Windows')
+        resp = self.client.get(self._detail_url(self.student))
+        devices = resp.data['devices']
+        self.assertEqual(len(devices), 1)
+        self.assertEqual(devices[0]['device_label'], 'Chrome on Windows')
+        self.assertEqual(resp.data['device_count'], 1)
+
+    def test_no_cross_student_data_leakage(self):
+        resp = self.client.get(self._detail_url(self.student))
+        data = resp.data
+        for enr in data['enrollments']:
+            self.assertNotEqual(enr.get('id'), None)
+        purchase_users = [p for p in data['purchases']]
+        # The other student's purchase must not appear here.
+        self.assertEqual(len(data['purchases']), 1)
+        self.assertNotIn('student2@example.com', str(data))
+
+        resp2 = self.client.get(self._detail_url(self.other_student))
+        self.assertEqual(resp2.data['email'], 'student2@example.com')
+        self.assertNotIn('student1@example.com', str(resp2.data))
+        self.assertEqual(len(resp2.data['purchases']), 1)
+        self.assertEqual(float(resp2.data['purchases'][0]['final_amount']), 500.0)
+
+    # --- performance ---------------------------------------------------
+
+    def test_query_count_bounded_and_no_n_plus_1(self):
+        with CaptureQueriesContext(connection) as ctx:
+            resp = self.client.get(self._detail_url(self.student))
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        baseline_count = len(ctx.captured_queries)
+
+        # Add substantially more related history and confirm the query
+        # count does NOT grow — proof the bounded Prefetch()es and
+        # aggregate()-only activity stats are doing their job.
+        for i in range(30):
+            extra_course = Course.objects.create(name=f'Extra Course {i}', prefix=f'EXTRA{i}')
+            Enrollment.objects.create(
+                user=self.student, course=extra_course, access_type='free', student_code=f'EXTRA{i}',
+            )
+            Purchase.objects.create(
+                user=self.student, kind='subscription', original_amount=100, final_amount=100,
+            )
+            q = Question.objects.create(subject=self.subject, text=f'Extra question {i}')
+            QuestionAttempt.objects.create(user=self.student, question=q, attempts_count=1, correct_count=1)
+            t = Test.objects.create(title=f'Extra test {i}')
+            TestAttempt.objects.create(user=self.student, test=t, status='submitted', score=10, accuracy=50)
+
+        with CaptureQueriesContext(connection) as ctx2:
+            resp2 = self.client.get(self._detail_url(self.student))
+        self.assertEqual(resp2.status_code, status.HTTP_200_OK)
+        grown_count = len(ctx2.captured_queries)
+
+        self.assertEqual(
+            baseline_count, grown_count,
+            f'Query count grew from {baseline_count} to {grown_count} after adding more history — '
+            f'indicates an N+1 or an unbounded query.',
+        )
+        # Documented expectation from the view's own docstring.
+        self.assertLessEqual(baseline_count, 10)
+
+
+class AdminStudentEditTests(APITestCase):
+    """Phase 2: PATCH /auth/users/<id>/edit/ — allowlist enforcement,
+    permissions, audit logging, cross-student isolation, and that nothing
+    about registration/login was disturbed."""
+
+    def setUp(self):
+        self.super_admin = User.objects.create_user(
+            username='super2', email='super2@example.com', password='pw12345',
+            is_staff=True, admin_role='super_admin',
+        )
+        self.plain_admin = User.objects.create_user(
+            username='admin2', email='admin2@example.com', password='pw12345',
+            is_staff=True, admin_role='admin',
+        )
+        self.editor = User.objects.create_user(
+            username='editor2', email='editor2@example.com', password='pw12345',
+            is_staff=True, admin_role='editor',
+        )
+
+        from accounts.models import StudentProfile
+
+        self.student = User.objects.create_user(
+            username='editstudent1', email='editstudent1@example.com', password='pw12345',
+            first_name='Ram', last_name='Sharma', phone='9800000010', program='CEE-PG', course='CEEPG',
+        )
+        StudentProfile.objects.create(user=self.student, college='Old College', district='Old District')
+
+        self.other_student = User.objects.create_user(
+            username='editstudent2', email='editstudent2@example.com', password='pw12345',
+            first_name='Sita', last_name='Thapa',
+        )
+        StudentProfile.objects.create(user=self.other_student)
+
+        self.client.force_authenticate(user=self.plain_admin)
+
+    def _edit_url(self, user):
+        return f'/api/auth/users/{user.id}/edit/'
+
+    # --- 1/2/3/4/5: permissions ------------------------------------------
+
+    def test_admin_can_edit_allowed_fields(self):
+        resp = self.client.patch(self._edit_url(self.student), {'first_name': 'Ramesh'}, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.student.refresh_from_db()
+        self.assertEqual(self.student.first_name, 'Ramesh')
+
+    def test_super_admin_can_edit_allowed_fields(self):
+        self.client.force_authenticate(user=self.super_admin)
+        resp = self.client.patch(self._edit_url(self.student), {'last_name': 'Karki'}, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.student.refresh_from_db()
+        self.assertEqual(self.student.last_name, 'Karki')
+
+    def test_editor_forbidden(self):
+        self.client.force_authenticate(user=self.editor)
+        resp = self.client.patch(self._edit_url(self.student), {'first_name': 'X'}, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+        self.student.refresh_from_db()
+        self.assertEqual(self.student.first_name, 'Ram')
+
+    def test_student_forbidden(self):
+        self.client.force_authenticate(user=self.student)
+        resp = self.client.patch(self._edit_url(self.student), {'first_name': 'X'}, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_anonymous_forbidden(self):
+        self.client.force_authenticate(user=None)
+        resp = self.client.patch(self._edit_url(self.student), {'first_name': 'X'}, format='json')
+        self.assertIn(resp.status_code, (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN))
+
+    # --- 6/7/8: allowlist enforcement -------------------------------------
+
+    def test_disallowed_field_rejected(self):
+        resp = self.client.patch(self._edit_url(self.student), {'wallet_balance': '999.00'}, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.student.refresh_from_db()
+        self.assertEqual(float(self.student.wallet_balance), 0.0)
+        self.assertEqual(AdminEditAuditLog.objects.count(), 0)
+
+    def test_email_cannot_be_changed(self):
+        resp = self.client.patch(self._edit_url(self.student), {'email': 'new@example.com'}, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.student.refresh_from_db()
+        self.assertEqual(self.student.email, 'editstudent1@example.com')
+
+    def test_password_cannot_be_changed(self):
+        old_hash = self.student.password
+        resp = self.client.patch(self._edit_url(self.student), {'password': 'newpassword123'}, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.student.refresh_from_db()
+        self.assertEqual(self.student.password, old_hash)
+
+    def test_mixed_allowed_and_disallowed_rejects_whole_request(self):
+        """A request that mixes a legitimate field with a disallowed one
+        must be rejected outright, not partially applied."""
+        resp = self.client.patch(
+            self._edit_url(self.student), {'first_name': 'Should Not Apply', 'is_active': False}, format='json',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.student.refresh_from_db()
+        self.assertEqual(self.student.first_name, 'Ram')
+        self.assertTrue(self.student.is_active)
+
+    # --- 9/10: audit logging ----------------------------------------------
+
+    def test_audit_log_created_for_successful_edit(self):
+        resp = self.client.patch(
+            self._edit_url(self.student), {'first_name': 'Ramesh', 'district': 'Bhaktapur'}, format='json',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+        entry = AdminEditAuditLog.objects.get(resource_type='Student', resource_id=str(self.student.id))
+        self.assertEqual(entry.actor_id, self.plain_admin.id)
+        self.assertEqual(entry.actor_email, self.plain_admin.email)
+        self.assertEqual(entry.resource_label, self.student.email)
+        self.assertEqual(entry.changed_fields['first_name'], {'old': 'Ram', 'new': 'Ramesh'})
+        self.assertEqual(entry.changed_fields['district'], {'old': 'Old District', 'new': 'Bhaktapur'})
+        self.assertNotIn('password', str(entry.changed_fields))
+        self.assertIsNotNone(entry.created_at)
+
+    def test_no_op_edit_creates_no_audit_entry(self):
+        """Submitting the same value as already stored is not a 'change'."""
+        resp = self.client.patch(self._edit_url(self.student), {'first_name': 'Ram'}, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(AdminEditAuditLog.objects.count(), 0)
+
+    def test_failed_edit_creates_no_audit_entry(self):
+        # Disallowed-field rejection.
+        self.client.patch(self._edit_url(self.student), {'email': 'x@example.com'}, format='json')
+        # Validation failure (duplicate phone).
+        self.client.patch(self._edit_url(self.other_student), {'phone': '9800000010'}, format='json')
+        self.assertEqual(AdminEditAuditLog.objects.count(), 0)
+
+    def test_duplicate_phone_rejected_with_validation_error(self):
+        resp = self.client.patch(self._edit_url(self.other_student), {'phone': '9800000010'}, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('phone', resp.data)
+
+    # --- 11: cross-student isolation ---------------------------------------
+
+    def test_cross_student_isolation(self):
+        resp = self.client.patch(self._edit_url(self.student), {'first_name': 'Ramesh'}, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.other_student.refresh_from_db()
+        self.assertEqual(self.other_student.first_name, 'Sita')
+
+    def test_nonexistent_student_404(self):
+        resp = self.client.patch('/api/auth/users/999999/edit/', {'first_name': 'X'}, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_staff_account_not_editable_via_student_edit(self):
+        resp = self.client.patch(self._edit_url(self.plain_admin), {'first_name': 'X'}, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+    # --- 12: registration/login unaffected ---------------------------------
+
+    def test_registration_and_login_unaffected(self):
+        reg_resp = self.client.post('/api/auth/register/', {
+            'name': 'New Student', 'email': 'newreg@example.com', 'phone': '9811112222',
+            'password': 'StrongPass123!', 'program': 'CEE-PG', 'course': 'CEEPG',
+        }, format='json')
+        self.assertEqual(reg_resp.status_code, status.HTTP_201_CREATED)
+
+        login_resp = self.client.post('/api/auth/login/', {
+            'identifier': 'newreg@example.com', 'password': 'StrongPass123!',
+        }, format='json')
+        self.assertEqual(login_resp.status_code, status.HTTP_200_OK)
+
+    def test_response_reflects_only_changed_field_names(self):
+        resp = self.client.patch(self._edit_url(self.student), {'batch': '2083'}, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data['changed_fields'], ['batch'])
+        self.assertEqual(resp.data['batch'], '2083')
+
+    # --- query count --------------------------------------------------------
+
+    def test_query_count_bounded(self):
+        with CaptureQueriesContext(connection) as ctx:
+            resp = self.client.patch(
+                self._edit_url(self.student), {'first_name': 'Ramesh', 'college': 'New College'}, format='json',
+            )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        # select_for_update(user) + select_for_update(profile) + user.save +
+        # profile.save + audit-log create — small and independent of history size.
+        self.assertLessEqual(len(ctx.captured_queries), 8)
+
+
+class AdminStudentEditConcurrencyTests(TransactionTestCase):
+    """Real multi-threaded concurrent-edit test — needs TransactionTestCase
+    (not the default TestCase, which wraps the whole test in one transaction
+    that all threads would share, defeating the point) so each thread gets
+    its own DB connection and the select_for_update() locking in
+    student_edit is actually exercised."""
+
+    def setUp(self):
+        self.plain_admin = User.objects.create_user(
+            username='concurrentadmin', email='concurrentadmin@example.com', password='pw12345',
+            is_staff=True, admin_role='admin',
+        )
+        from accounts.models import StudentProfile
+
+        self.student = User.objects.create_user(
+            username='concurrentstudent', email='concurrentstudent@example.com', password='pw12345',
+            first_name='Original',
+        )
+        StudentProfile.objects.create(user=self.student, district='OriginalDistrict')
+
+    def test_concurrent_edits_to_different_fields_both_persist(self):
+        """Two 'admins' editing different fields on the same student at
+        (approximately) the same time must both land — neither should be
+        lost to a stale-read race, since each write only touches its own
+        column via update_fields.
+
+        select_for_update() makes the two requests serialize at the DB
+        row-lock level on the real production backend (MySQL) — one simply
+        waits for the other's transaction to commit, then proceeds. SQLite
+        (test-only) has no real row-level locking and, even with a generous
+        busy timeout, can still surface a same-instant write collision as
+        an OperationalError rather than a wait — so each thread retries
+        past that specific, SQLite-only condition, exactly as a sensible
+        real client would on a lock-wait timeout. The assertion this test
+        actually cares about — that BOTH edits land and neither is lost —
+        is unaffected by how many retries it took to get there.
+        """
+        import time
+        from django.db.utils import OperationalError
+
+        results = {}
+
+        def run_with_retries(field, value, key):
+            client = APIClient()
+            client.raise_request_exception = False
+            client.force_authenticate(user=self.plain_admin)
+            for attempt in range(5):
+                try:
+                    r = client.patch(f'/api/auth/users/{self.student.id}/edit/', {field: value}, format='json')
+                    if r.status_code != 500:
+                        results[key] = r.status_code
+                        return
+                except OperationalError:
+                    pass
+                time.sleep(0.2 * (attempt + 1))
+            results[key] = results.get(key, 500)
+
+        t1 = threading.Thread(target=run_with_retries, args=('first_name', 'ThreadA', 'first_name'))
+        t2 = threading.Thread(target=run_with_retries, args=('district', 'ThreadBDistrict', 'district'))
+        t1.start()
+        t2.start()
+        t1.join(timeout=15)
+        t2.join(timeout=15)
+
+        self.assertEqual(results.get('first_name'), status.HTTP_200_OK)
+        self.assertEqual(results.get('district'), status.HTTP_200_OK)
+
+        self.student.refresh_from_db()
+        self.assertEqual(self.student.first_name, 'ThreadA')
+        self.assertEqual(self.student.profile.district, 'ThreadBDistrict')
+
+        # Both edits must have their own audit trail entry — neither
+        # clobbered the other's log write either.
+        self.assertEqual(AdminEditAuditLog.objects.filter(resource_id=str(self.student.id)).count(), 2)
+
+
 
 
 class AdminStudentBrowseTests(APITestCase):
