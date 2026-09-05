@@ -165,6 +165,44 @@ class AdminUserSerializer(serializers.ModelSerializer):
         return obj.devices.count()
 
 
+class AdminStudentEnrollmentSummarySerializer(serializers.ModelSerializer):
+    """Phase 3 — deliberately smaller than AdminStudentEnrollmentSerializer
+    (the Student Detail tab's serializer, Phase 1): only what the Students
+    LIST page's existing Courses/Access columns actually render. No
+    enrolled_at/expires_at/package/batch — "no full enrollment history in
+    the list", per the Phase 3 spec. The richer per-enrollment detail stays
+    exactly where it already lives, one click away, on Student Detail."""
+    course_prefix = serializers.CharField(source='course.prefix', read_only=True)
+
+    class Meta:
+        model = Enrollment
+        fields = ['id', 'course_prefix', 'student_code', 'access_type', 'is_active']
+
+
+class AdminStudentBrowseSerializer(serializers.ModelSerializer):
+    """Backs GET /auth/users/browse/ only (Phase 3) — AdminUserSerializer
+    above keeps backing list()/retrieve()/partial_update() unchanged.
+    `device_count` reads the queryset's own annotation (no per-row query);
+    `enrollments` reads the view's bounded Prefetch (to_attr='browse_enrollments') —
+    neither field ever triggers a query of its own no matter how this
+    serializer is (mis)used, by the same discipline AdminUserDetailSerializer
+    (Phase 1) already established for detail_* attributes."""
+    profile = StudentProfileSerializer(read_only=True)
+    device_count = serializers.IntegerField(read_only=True)
+    enrollments = serializers.SerializerMethodField()
+
+    class Meta:
+        model = User
+        fields = [
+            'id', 'first_name', 'last_name', 'email', 'phone', 'program', 'course',
+            'is_active', 'is_staff', 'date_joined', 'profile', 'device_count', 'enrollments',
+        ]
+        read_only_fields = fields
+
+    def get_enrollments(self, obj):
+        return AdminStudentEnrollmentSummarySerializer(getattr(obj, 'browse_enrollments', []), many=True).data
+
+
 class LoginSerializer(serializers.Serializer):
     identifier = serializers.CharField(help_text='Email or phone number')
     password = serializers.CharField(write_only=True)

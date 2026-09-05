@@ -1,7 +1,9 @@
 from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
-from django.db.models import Q
+from django.db.models import Count, Prefetch, Q
 from rest_framework import status, viewsets
+from rest_framework.decorators import action
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import AllowAny, IsAdminUser, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -23,6 +25,16 @@ from .serializers import (
 User = get_user_model()
 
 MAX_DEVICES = 3
+
+
+class _StudentBrowsePagination(PageNumberPagination):
+    """Real, enveloped pagination ({count, next, previous, results}) for
+    AdminUserViewSet.browse only — mirrors academics.views._BrowsePagination
+    exactly (same page_size/max_page_size), the established precedent for
+    "a paginated variant exists alongside an untouched bare-array list()"."""
+    page_size = 20
+    max_page_size = 50
+    page_size_query_param = 'page_size'
 
 
 def tokens_for_user(user):
@@ -142,6 +154,131 @@ class AdminUserViewSet(viewsets.ModelViewSet):
         if date_to:
             qs = qs.filter(date_joined__date__lte=date_to)
         return qs.distinct()
+
+    @action(detail=False, methods=['get'], url_path='browse')
+    def browse(self, request):
+        """Admin Student List (Phase 3) — a separate, real-pagination view.
+        Deliberately NOT built on list()/get_queryset(): list() stays
+        exactly as it was (bare array, whatever page size the global
+        default gives it) because Admin/src/app/scholarships/page.js
+        already calls plain GET /auth/users/?search=... and reads the
+        response directly as an array — switching list()'s own response
+        shape to an envelope would silently break that unrelated page.
+        `browse` is new, additive, and is the only endpoint the Students
+        list page (Phase 3) now calls — same split QuestionViewSet.browse
+        already established for exactly this reason (see _BrowsePagination
+        above in academics/views.py).
+
+        Query count is flat regardless of page size or total student
+        count: 1 (COUNT for pagination) + 1 (the page's rows, with
+        select_related('profile') + an annotated device_count — a single
+        JOIN+GROUP BY, not a per-row query) + 1 (one bounded Prefetch for
+        every visible student's enrollments, `user_id IN (<=50 ids)`, not
+        per-row) = 3. Verified in accounts/tests.py via CaptureQueriesContext
+        at 20-row and 50-row pages and against a 500-student dataset.
+
+        Enrollment summary is deliberately minimal (course_prefix,
+        student_code, access_type, is_active only) — no enrolled_at/
+        expires_at/package/batch — matching "no full enrollment history in
+        the list" while still covering exactly what the existing Courses/
+        Access UI columns render.
+
+        `access` and `status` filters (added after initial release):
+        - `access`: matches courses.Enrollment.access_type, the only two
+          real values in the system ('free'/'package' — confirmed against
+          Enrollment.ACCESS_CHOICES, nothing invented). Semantics
+          deliberately mirror what the UI already displays per student
+          (AdminStudentBrowseSerializer/StudentsTable's AccessBadge): a
+          student with ANY package enrollment counts as "package"; a
+          student with zero enrollments, or only free ones, counts as
+          "free". This is a per-STUDENT classification, not "does this one
+          enrollment match" — consistent with how `course` already works
+          (does this student have *a* matching enrollment, independent of
+          any other filter), not a single correlated enrollment satisfying
+          every active filter at once.
+        - `status`: matches the existing User.is_active — the exact same
+          field Block/Unblock already reads and writes. No second status
+          system introduced.
+        Both are applied as `pk__in`/`exclude(pk__in=...)` against a
+        separately-evaluated Enrollment id subquery, same as `course`
+        above and for the same reason — never a `.filter(enrollments__...)`
+        join, which would corrupt the device_count annotate.
+        """
+        from .serializers import AdminStudentBrowseSerializer
+
+        qs = (
+            User.objects.filter(is_staff=False)
+            .select_related('profile')
+            .annotate(device_count=Count('devices', distinct=True))
+            .order_by('-date_joined')
+        )
+
+        # Same filter semantics as get_queryset() above, deliberately
+        # duplicated rather than shared — get_queryset() (and list(), which
+        # scholarships/page.js depends on) must stay byte-for-byte
+        # untouched; this is a separate, independent code path.
+        search = request.query_params.get('search')
+        course = request.query_params.get('course')
+        access = request.query_params.get('access')
+        account_status = request.query_params.get('status')
+        date_from = request.query_params.get('from')
+        date_to = request.query_params.get('to')
+        if search:
+            qs = qs.filter(
+                Q(first_name__icontains=search) | Q(last_name__icontains=search)
+                | Q(email__icontains=search) | Q(phone__icontains=search)
+            )
+        if course:
+            # A plain `.filter(enrollments__course_id=course)` join, combined
+            # with the device_count annotate above, is the classic Django
+            # "annotate + multi-row join" footgun — it can inflate the
+            # Count() once a student has more than one enrollment. Filtering
+            # by a separately-computed id list instead adds no join at all,
+            # so the annotate stays correct regardless of how many
+            # enrollments any given student has.
+            matching_user_ids = Enrollment.objects.filter(course_id=course).values_list('user_id', flat=True)
+            qs = qs.filter(pk__in=matching_user_ids)
+        if access == 'package':
+            package_user_ids = Enrollment.objects.filter(access_type='package').values_list('user_id', flat=True)
+            qs = qs.filter(pk__in=package_user_ids)
+        elif access == 'free':
+            package_user_ids = Enrollment.objects.filter(access_type='package').values_list('user_id', flat=True)
+            qs = qs.exclude(pk__in=package_user_ids)
+        if account_status == 'active':
+            qs = qs.filter(is_active=True)
+        elif account_status == 'blocked':
+            qs = qs.filter(is_active=False)
+        if date_from:
+            qs = qs.filter(date_joined__date__gte=date_from)
+        if date_to:
+            qs = qs.filter(date_joined__date__lte=date_to)
+
+        # Instantiated directly (not self.paginate_queryset(), which would
+        # need a viewset-level pagination_class — and that would also
+        # change list()'s pagination, the exact thing this action exists to
+        # avoid). Mirrors QuestionViewSet.browse's own pattern.
+        paginator = _StudentBrowsePagination()
+        page = paginator.paginate_queryset(qs, request, view=self)
+        target = list(page)
+
+        # Attach each visible student's enrollments as a plain Python list
+        # via prefetch_related's cache — one extra query total for the
+        # whole page (`user_id IN (<=50 ids)`), never per student. Runs
+        # against the exact instances being serialized (prefetch_related_objects),
+        # not a fresh queryset, since those are what the serializer reads.
+        from django.db.models import prefetch_related_objects
+
+        prefetch_related_objects(
+            target,
+            Prefetch(
+                'enrollments',
+                queryset=Enrollment.objects.select_related('course').order_by('course__prefix'),
+                to_attr='browse_enrollments',
+            ),
+        )
+
+        serializer = AdminStudentBrowseSerializer(target, many=True)
+        return paginator.get_paginated_response(serializer.data)
 
 
 class AdminAccountViewSet(viewsets.ModelViewSet):
