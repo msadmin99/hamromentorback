@@ -1,4 +1,5 @@
 import io
+from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -233,6 +234,100 @@ class ImportBatchCreateTestModeMismatchTests(APITestCase):
         )
 
         self.assertEqual(resp.status_code, 400)
+
+
+class ImportUploadViewObservabilityTests(APITestCase):
+    """Observability fix: ImportUploadView.post()'s final stretch (row
+    validation, bulk_create, batch.save, building the response) previously
+    had no exception handling at all — a failure there fell straight
+    through to Django's generic 500 with nothing logged anywhere (Django's
+    own default LOGGING only prints to console when DEBUG=True, which is
+    never true in a real environment). These tests prove: (1) an unexpected
+    exception there is now logged, with the batch id, before it propagates;
+    (2) it still produces a 500, not a swallowed/converted response —
+    exactly the same response shape a client saw before this change;
+    (3) a normal, valid upload is completely unaffected; (4) an expected
+    parser failure (a different, already-guarded code path) still returns
+    its existing 400, proving this change didn't touch that behavior."""
+
+    VALID_CSV = (
+        'Question,Option1,Option2,Option3,Option4,Correct Option,Explanation\r\n'
+        'What is 2+2?,3,4,5,6,2,Basic addition.\r\n'
+    )
+
+    def setUp(self):
+        self.staff = User.objects.create_user(
+            username='staff1', email='staff1@example.com', password='pw12345', is_staff=True, admin_role='admin',
+        )
+        self.client.force_authenticate(user=self.staff)
+
+    def _upload(self, content=None):
+        content = self.VALID_CSV if content is None else content
+        file_obj = SimpleUploadedFile('questions.csv', content.encode('utf-8'), content_type='text/csv')
+        return self.client.post('/api/import-batches/upload/', {'file': file_obj, 'import_mode': 'question_bank'})
+
+    def test_valid_upload_is_completely_unaffected(self):
+        resp = self._upload()
+
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data['total_rows'], 1)
+        self.assertEqual(resp.data['status'], 'ready')
+        batch = ImportBatch.objects.get(pk=resp.data['id'])
+        self.assertEqual(batch.status, 'ready')
+        self.assertEqual(ImportRow.objects.filter(batch=batch).count(), 1)
+
+    def test_expected_parser_failure_still_returns_400_unchanged(self):
+        # No 'Question' column at all — the parser's own pre-existing,
+        # already-guarded ValueError path, untouched by this fix.
+        resp = self._upload('NotAQuestionColumn\r\nfoo\r\n')
+
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn('Missing required column', resp.data['detail'])
+        # This path is guarded by the pre-existing try/except around the
+        # parser call, not the new one — confirms the two don't overlap.
+        with self.assertNoLogs('academics.import_views', level='ERROR'):
+            self._upload('NotAQuestionColumn\r\nfoo\r\n')
+
+    def test_unexpected_exception_is_logged_and_still_returns_500(self):
+        def boom(*args, **kwargs):
+            raise RuntimeError('simulated unexpected failure finalizing the batch')
+
+        self.client.raise_request_exception = False
+        with patch('academics.import_views.ImportRow.objects.bulk_create', side_effect=boom):
+            with self.assertLogs('academics.import_views', level='ERROR') as captured:
+                resp = self._upload()
+
+        self.assertEqual(resp.status_code, 500)  # unchanged semantics — still a 500, never swallowed/converted
+        self.assertEqual(len(captured.records), 1)
+        message = captured.records[0].getMessage()
+        self.assertIn('unexpected error finalizing batch', message)
+        # Safe context only — a real, admin-visible batch id, the detected
+        # file format, and a count — never file contents or credentials.
+        self.assertIn('file_format=csv', message)
+        self.assertIn('parsed_question_count=1', message)
+        self.assertNotIn('2+2', message)  # never logs the uploaded file's own content
+        # The traceback itself (not just the message) must be captured —
+        # logger.exception() attaches it automatically; assertLogs exposes
+        # it via the record's exc_info/exc_text.
+        self.assertIsNotNone(captured.records[0].exc_info)
+        self.assertIn('RuntimeError', captured.records[0].exc_text or '')
+
+        # The batch this failed on is left in a real, inspectable state
+        # (not silently lost) — created 'validating', never advanced to
+        # 'ready' since the failure happened before that assignment.
+        batch = ImportBatch.objects.filter(file_name='questions.csv').latest('id')
+        self.assertEqual(batch.status, 'validating')
+
+    def test_unexpected_exception_does_not_change_row_validation_behavior(self):
+        """A validation-only difference (e.g. a genuinely malformed row)
+        must still behave exactly as it did before this fix — no exception,
+        no log entry, just the normal error-status row it always produced."""
+        with self.assertNoLogs('academics.import_views', level='ERROR'):
+            resp = self._upload('Question,Option1,Option2,Option3,Option4,Correct Option,Explanation\r\n,,,,,,\r\n')
+
+        self.assertEqual(resp.status_code, 201)
+        batch = ImportBatch.objects.get(pk=resp.data['id'])
+        self.assertEqual(ImportRow.objects.get(batch=batch).status, 'error')
 
 
 def _build_docx(lines):

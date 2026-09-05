@@ -1,3 +1,4 @@
+import logging
 import threading
 import zipfile
 
@@ -19,6 +20,21 @@ from .import_engine import create_question_from_row, question_is_referenced
 from .import_validation import validate_parsed_question
 from .importers import PARSERS
 from .models import Chapter, ImportBatch, ImportRow, Question, Subject, Topic
+
+# Observability fix: a plain module-level logger, deliberately NOT relying
+# on Django's default LOGGING config — that config only attaches a console
+# handler to `django`-prefixed loggers when DEBUG=True (see
+# django.utils.log.DEFAULT_LOGGING's `console` handler, filtered by
+# require_debug_true). With DEBUG=False in every real environment, a
+# logger under this app's own name has no configured handler either, so it
+# falls through to Python's own built-in `logging.lastResort` — a
+# stderr StreamHandler always present regardless of Django's config — which
+# Cloud Run captures unconditionally. This is what actually makes
+# logger.exception() below visible in Cloud Logging without a broader
+# LOGGING config change (evaluated and intentionally deferred — see the
+# Phase report accompanying this commit for why a project-wide LOGGING
+# dict is a good follow-up but broader than this targeted fix needs).
+logger = logging.getLogger(__name__)
 
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20MB
 ALLOWED_EXTENSIONS = {'docx', 'xlsx', 'csv', 'json'}
@@ -127,21 +143,45 @@ class ImportUploadView(APIView):
         # Subject on the Preview & Validate screen (see ImportBatchTaxonomyView
         # / _run_dedup below) — the subject isn't known yet at upload time
         # since it no longer comes from the file.
-        rows_to_create = []
-        for i, pq in enumerate(parsed_questions, start=1):
-            errors, warnings = validate_parsed_question(pq)
-            row_status = 'error' if errors else ('warning' if warnings else 'valid')
-            rows_to_create.append(ImportRow(
-                batch=batch, row_number=i, raw_data=pq, status=row_status,
-                errors=errors, warnings=warnings,
-            ))
+        #
+        # Observability fix: this final stretch (per-row validation, the
+        # bulk_create, batch.save, and building the response summary) was
+        # the one part of this view with no exception handling at all — a
+        # failure here fell straight through to Django's generic 500 with
+        # nothing recorded anywhere (see the Phase report: Django's own
+        # default logging only prints to console when DEBUG=True, so in
+        # every real environment these were entirely silent). The try/except
+        # below changes NOTHING about the response: on success it returns
+        # the exact same 201 + summary as before; on an unexpected error it
+        # re-raises the identical exception, so Django's normal
+        # exception-to-500 handling still produces the same 500 response a
+        # client sees today. The only difference is that the exception is
+        # now logged, with full traceback, before it propagates. Never logs
+        # file contents, request headers, or any credential — only the
+        # batch id (already a non-secret, admin-visible identifier), the
+        # detected file format, and how many questions the parser found.
+        try:
+            rows_to_create = []
+            for i, pq in enumerate(parsed_questions, start=1):
+                errors, warnings = validate_parsed_question(pq)
+                row_status = 'error' if errors else ('warning' if warnings else 'valid')
+                rows_to_create.append(ImportRow(
+                    batch=batch, row_number=i, raw_data=pq, status=row_status,
+                    errors=errors, warnings=warnings,
+                ))
 
-        ImportRow.objects.bulk_create(rows_to_create)
-        batch.total_rows = len(rows_to_create)
-        batch.status = 'ready'
-        batch.save(update_fields=['total_rows', 'status'])
+            ImportRow.objects.bulk_create(rows_to_create)
+            batch.total_rows = len(rows_to_create)
+            batch.status = 'ready'
+            batch.save(update_fields=['total_rows', 'status'])
 
-        return Response(_batch_summary(batch), status=status.HTTP_201_CREATED)
+            return Response(_batch_summary(batch), status=status.HTTP_201_CREATED)
+        except Exception:
+            logger.exception(
+                'ImportUploadView: unexpected error finalizing batch id=%s file_format=%s parsed_question_count=%s',
+                batch.id, file_format, len(parsed_questions),
+            )
+            raise
 
 
 def _batch_summary(batch):
