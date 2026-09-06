@@ -102,6 +102,15 @@ class RolePermission(models.Model):
 
 class StudentProfile(models.Model):
     PAYMENT_CHANNEL_CHOICES = [('bank', 'Bank Transfer'), ('esewa', 'eSewa'), ('khalti', 'Khalti')]
+    # Identity verification is a profile-layer feature only — see the
+    # help_text below. It must NEVER be imported into tests_app/access.py,
+    # billing/access.py, courses/access.py, or any exam-listing/start/
+    # submit code path. See accounts/tests_verification.py's regression
+    # suite, which proves access is identical across all four states.
+    VERIFICATION_STATUS_CHOICES = [
+        ('unverified', 'Unverified'), ('pending', 'Pending'),
+        ('verified', 'Verified'), ('rejected', 'Rejected'),
+    ]
 
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='profile')
     college = models.CharField(max_length=255, blank=True)
@@ -115,6 +124,17 @@ class StudentProfile(models.Model):
         max_length=10, choices=PAYMENT_CHANNEL_CHOICES, blank=True,
         help_text='Pre-selected at checkout — informational only, this platform has no stored payment instrument.',
     )
+    verification_status = models.CharField(
+        max_length=10, choices=VERIFICATION_STATUS_CHOICES, default='unverified',
+        help_text='Profile identity verification only — never a gate on exam access, Free Starter, subscriptions, '
+                   'or any entitlement. Set to "pending" automatically on first document/photo submission; '
+                   '"verified"/"rejected" only ever set by an explicit admin action.',
+    )
+    verification_reviewed_at = models.DateTimeField(null=True, blank=True)
+    verification_reviewed_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True, related_name='+',
+    )
+    verification_rejection_reason = models.CharField(max_length=500, blank=True)
 
     def __str__(self):
         return f'Profile<{self.user.email}>'
@@ -129,3 +149,38 @@ class Device(models.Model):
 
     class Meta:
         unique_together = ('user', 'device_id')
+
+
+class VerificationDocument(models.Model):
+    """One uploaded identity/academic document, stored in the private GCS
+    bucket (see accounts/verification_storage.py) — never on this row
+    itself beyond metadata. A student may have several (one per
+    document_type, or several attempts at the same type); nothing here
+    ever deletes an old one, even on rejection — see
+    verification_storage.py's own retention note."""
+    DOCUMENT_TYPE_CHOICES = [
+        ('citizenship', 'Citizenship'), ('passport', 'Passport'),
+        ('academic_certificate', 'Academic Certificate'),
+        ('identity_document', 'Identity Document'), ('other', 'Other'),
+    ]
+    STATUS_CHOICES = [('pending', 'Pending'), ('approved', 'Approved'), ('rejected', 'Rejected')]
+
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='verification_documents')
+    document_type = models.CharField(max_length=25, choices=DOCUMENT_TYPE_CHOICES)
+    storage_bucket = models.CharField(max_length=100, blank=True)
+    storage_key = models.CharField(max_length=255, blank=True)
+    original_filename = models.CharField(max_length=255, blank=True)
+    mime_type = models.CharField(max_length=100, blank=True)
+    file_size = models.PositiveIntegerField(default=0)
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='pending')
+    rejection_reason = models.CharField(max_length=500, blank=True)
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    reviewed_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='+')
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-uploaded_at']
+
+    def __str__(self):
+        return f'{self.get_document_type_display()} — {self.user.email} ({self.status})'

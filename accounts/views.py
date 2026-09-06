@@ -1,9 +1,11 @@
 from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
 from django.db.models import Avg, Count, Prefetch, Q, Sum
+from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.pagination import PageNumberPagination
+from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import AllowAny, IsAdminUser, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -14,7 +16,8 @@ from courses.models import Enrollment, EnrollmentRequest
 from hamromentor.permissions import IsAdminRoleOrAbove, IsSuperAdmin
 from tests_app.models import TestAttempt
 
-from .models import Device, RolePermission, StudentProfile
+from . import verification_storage
+from .models import Device, RolePermission, StudentProfile, VerificationDocument
 from .serializers import (
     AdminAccountSerializer,
     AdminUserDetailSerializer,
@@ -22,7 +25,9 @@ from .serializers import (
     LoginSerializer,
     RegisterSerializer,
     RolePermissionSerializer,
+    StudentProfileSerializer,
     UserSerializer,
+    VerificationDocumentSerializer,
 )
 
 User = get_user_model()
@@ -137,7 +142,17 @@ class AdminUserViewSet(viewsets.ModelViewSet):
     queryset = User.objects.filter(is_staff=False).select_related('profile').order_by('-date_joined')
     serializer_class = AdminUserSerializer
     permission_classes = [IsAdminRoleOrAbove]
-    http_method_names = ['get', 'patch', 'head', 'options']
+    # 'post' added for the verification/approve and verification/reject
+    # @action routes below. That alone would also silently re-enable the
+    # router's list-route POST -> create() (a plain ModelViewSet wires
+    # 'post' to create() at the collection root regardless of
+    # http_method_names — the old list only blocked it at dispatch time),
+    # so create() is explicitly disabled again just below to preserve this
+    # viewset's original "no account creation here" contract.
+    http_method_names = ['get', 'post', 'patch', 'head', 'options']
+
+    def create(self, request, *args, **kwargs):
+        return Response({'detail': 'Method "POST" not allowed.'}, status=status.HTTP_405_METHOD_NOT_ALLOWED)
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -283,7 +298,6 @@ class AdminUserViewSet(viewsets.ModelViewSet):
         serializer = AdminStudentBrowseSerializer(target, many=True)
         return paginator.get_paginated_response(serializer.data)
 
-
     # Bulk-import-style bound: how many rows of each related collection the
     # detail page gets. Keeps the endpoint's cost flat regardless of how
     # long a student's history is — see the `detail` action's own docstring.
@@ -337,6 +351,11 @@ class AdminUserViewSet(viewsets.ModelViewSet):
                     to_attr='detail_purchases',
                 ),
                 Prefetch('devices', queryset=Device.objects.order_by('-last_seen')[:limit], to_attr='detail_devices'),
+                Prefetch(
+                    'verification_documents',
+                    queryset=VerificationDocument.objects.select_related('reviewed_by').order_by('-uploaded_at')[:limit],
+                    to_attr='detail_verification_documents',
+                ),
             )
         )
 
@@ -479,6 +498,48 @@ class AdminUserViewSet(viewsets.ModelViewSet):
             'changed_fields': list(changed.keys()),
         })
 
+    @action(detail=True, methods=['post'], url_path='verification/approve')
+    def verify_profile(self, request, pk=None):
+        """Sets the STUDENT'S OWN profile-level verification_status to
+        'verified' — always an explicit admin decision, never automatic
+        (see StudentProfile.verification_status's own help_text). This is
+        the only write in this whole feature that touches exam-access-
+        adjacent code paths at all, and it doesn't: nothing in
+        tests_app/access.py, billing/access.py, or courses/access.py reads
+        this field — see accounts/tests_verification.py's regression suite."""
+        user = User.objects.filter(is_staff=False, pk=pk).select_related('profile').first()
+        if user is None:
+            return Response({'detail': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+        profile, _ = StudentProfile.objects.get_or_create(user=user)
+        profile.verification_status = 'verified'
+        profile.verification_reviewed_at = timezone.now()
+        profile.verification_reviewed_by = request.user
+        profile.verification_rejection_reason = ''
+        profile.save(update_fields=[
+            'verification_status', 'verification_reviewed_at', 'verification_reviewed_by',
+            'verification_rejection_reason',
+        ])
+        return Response(StudentProfileSerializer(profile).data)
+
+    @action(detail=True, methods=['post'], url_path='verification/reject')
+    def reject_profile(self, request, pk=None):
+        reason = (request.data.get('reason') or '').strip()
+        if not reason:
+            return Response({'detail': 'A rejection reason is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        user = User.objects.filter(is_staff=False, pk=pk).select_related('profile').first()
+        if user is None:
+            return Response({'detail': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+        profile, _ = StudentProfile.objects.get_or_create(user=user)
+        profile.verification_status = 'rejected'
+        profile.verification_reviewed_at = timezone.now()
+        profile.verification_reviewed_by = request.user
+        profile.verification_rejection_reason = reason
+        profile.save(update_fields=[
+            'verification_status', 'verification_reviewed_at', 'verification_reviewed_by',
+            'verification_rejection_reason',
+        ])
+        return Response(StudentProfileSerializer(profile).data)
+
 
 class AdminAccountViewSet(viewsets.ModelViewSet):
     """Super-Admin-only: manage other admin-panel accounts (Super Admin/Admin/Editor)."""
@@ -582,3 +643,169 @@ class ChangePasswordView(APIView):
         request.user.set_password(new)
         request.user.save()
         return Response({'detail': 'Password changed.'})
+
+
+class ProfilePhotoUploadView(APIView):
+    """POST /auth/me/photo/ — student uploads/replaces their own profile
+    photo. Uses StudentProfile.photo (a plain Django ImageField already
+    backed by the project's GCS storage — see media_library/django_storage.py's
+    own docstring, which lists 'profile photos' as an intended use case).
+    Content-validated the same way payment screenshots are (real image
+    decode, not trusting the extension/Content-Type) before ever touching
+    storage. The previous photo is only deleted after the new one has
+    saved successfully — never the other way around, so a failed upload
+    never leaves the student with no photo at all."""
+    permission_classes = [IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser]
+
+    def post(self, request):
+        file_obj = request.FILES.get('photo')
+        if not file_obj:
+            return Response({'detail': 'No photo uploaded.'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            verification_storage.validate_photo(file_obj)
+        except verification_storage.InvalidUpload as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        profile, _ = StudentProfile.objects.get_or_create(user=request.user)
+        old_photo = profile.photo if profile.photo else None
+
+        file_obj.seek(0)
+        profile.photo.save(file_obj.name, file_obj, save=True)
+
+        if old_photo and old_photo.name != profile.photo.name:
+            old_photo.delete(save=False)
+
+        return Response(StudentProfileSerializer(profile).data)
+
+
+class MyVerificationView(APIView):
+    """GET /auth/me/verification/ — the student's own verification status
+    and document list (metadata only — no signed URLs; see
+    VerificationDocumentViewView for actually viewing one). POST on the
+    same path submits a new document. Deliberately NOT folded into
+    UserSerializer/MeView: the student app fetches this independently, on
+    the Profile page only, so a slow/failed verification fetch can never
+    affect login or any exam-access page — see this feature's own
+    architecture note in StudentProfile.verification_status's help_text."""
+    permission_classes = [IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser]
+
+    def get(self, request):
+        profile, _ = StudentProfile.objects.get_or_create(user=request.user)
+        documents = VerificationDocument.objects.filter(user=request.user).select_related('reviewed_by')
+        return Response({
+            'verification_status': profile.verification_status,
+            'verification_rejection_reason': profile.verification_rejection_reason,
+            'has_photo': bool(profile.photo),
+            'documents': VerificationDocumentSerializer(documents, many=True).data,
+        })
+
+    def post(self, request):
+        document_type = request.data.get('document_type')
+        valid_types = dict(VerificationDocument.DOCUMENT_TYPE_CHOICES)
+        if document_type not in valid_types:
+            return Response({'detail': f'Unknown document_type "{document_type}".'}, status=status.HTTP_400_BAD_REQUEST)
+        file_obj = request.FILES.get('file')
+        if not file_obj:
+            return Response({'detail': 'No file uploaded.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            bucket, key, content_type, size = verification_storage.store_verification_document(
+                file_obj, request.user.id, document_type,
+            )
+        except verification_storage.InvalidUpload as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        document = VerificationDocument.objects.create(
+            user=request.user, document_type=document_type, storage_bucket=bucket, storage_key=key,
+            original_filename=file_obj.name[:255], mime_type=content_type, file_size=size,
+        )
+
+        # The ONLY automatic transitions in this feature: a submission moves
+        # 'unverified' -> 'pending' (first-ever submission) and
+        # 'rejected' -> 'pending' (a resubmission after rejection puts the
+        # student back in the review queue, since the admin's rejection
+        # reason no longer describes what's currently on file). 'pending'
+        # stays 'pending' (an additional document while already under
+        # review doesn't need a second transition) and 'verified' is left
+        # untouched (an already-verified student adding another document
+        # is not a resubmission-after-failure — reaching 'rejected' from
+        # here is still always a separate, explicit admin action, never
+        # automatic, per StudentProfile.verification_status's own contract).
+        profile, _ = StudentProfile.objects.get_or_create(user=request.user)
+        if profile.verification_status in ('unverified', 'rejected'):
+            profile.verification_status = 'pending'
+            profile.save(update_fields=['verification_status'])
+
+        return Response(VerificationDocumentSerializer(document).data, status=status.HTTP_201_CREATED)
+
+
+def _can_view_verification_document(user, document):
+    if document.user_id == user.id:
+        return True
+    return bool(user.is_staff and (user.is_superuser or getattr(user, 'admin_role', None) in (None, '', 'super_admin', 'admin')))
+
+
+class VerificationDocumentViewView(APIView):
+    """GET /auth/verification-documents/{id}/view/ — a short-lived signed
+    URL for one document. Owner or admin only (same dual-audience,
+    manual-check pattern as billing.views.PurchaseViewSet.screenshot — a
+    plain APIView has no per-object DRF permission hook, so the check is
+    explicit here, same as that established precedent). Never a redirect
+    (avoids the URL landing in access/referrer logs); the URL itself is
+    never persisted anywhere, generated fresh on every authorized call."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        document = VerificationDocument.objects.filter(pk=pk).first()
+        if document is None:
+            return Response({'detail': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+        if not _can_view_verification_document(request.user, document):
+            return Response({'detail': 'Not allowed.'}, status=status.HTTP_403_FORBIDDEN)
+        url = verification_storage.verification_document_view_url(document.storage_bucket, document.storage_key)
+        if not url:
+            return Response({'detail': 'This document is not available.'}, status=status.HTTP_404_NOT_FOUND)
+        return Response({'url': url})
+
+
+class VerificationDocumentApproveView(APIView):
+    """POST /auth/verification-documents/{id}/approve/ — admin-only,
+    per-document. Does not by itself change StudentProfile.verification_status
+    (see AdminUserViewSet.verify_profile for the separate, explicit overall
+    decision) — approving one document is not the same as verifying the
+    whole profile, matching "Do not mark verified just because a file was
+    uploaded" applied one level further: approving one file isn't
+    verifying the profile either."""
+    permission_classes = [IsAdminRoleOrAbove]
+
+    def post(self, request, pk):
+        document = VerificationDocument.objects.filter(pk=pk).first()
+        if document is None:
+            return Response({'detail': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+        document.status = 'approved'
+        document.rejection_reason = ''
+        document.reviewed_at = timezone.now()
+        document.reviewed_by = request.user
+        document.save(update_fields=['status', 'rejection_reason', 'reviewed_at', 'reviewed_by'])
+        return Response(VerificationDocumentSerializer(document).data)
+
+
+class VerificationDocumentRejectView(APIView):
+    """POST /auth/verification-documents/{id}/reject/ — admin-only,
+    per-document, reason required (never a silent rejection)."""
+    permission_classes = [IsAdminRoleOrAbove]
+
+    def post(self, request, pk):
+        reason = (request.data.get('reason') or '').strip()
+        if not reason:
+            return Response({'detail': 'A rejection reason is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        document = VerificationDocument.objects.filter(pk=pk).first()
+        if document is None:
+            return Response({'detail': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+        document.status = 'rejected'
+        document.rejection_reason = reason
+        document.reviewed_at = timezone.now()
+        document.reviewed_by = request.user
+        document.save(update_fields=['status', 'rejection_reason', 'reviewed_at', 'reviewed_by'])
+        return Response(VerificationDocumentSerializer(document).data)

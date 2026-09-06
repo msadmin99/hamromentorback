@@ -6,7 +6,7 @@ from billing.models import Purchase
 from courses.models import Enrollment, EnrollmentRequest
 from tests_app.models import TestAttempt
 
-from .models import Device, RolePermission, StudentProfile
+from .models import Device, RolePermission, StudentProfile, VerificationDocument
 
 User = get_user_model()
 
@@ -17,7 +17,26 @@ class StudentProfileSerializer(serializers.ModelSerializer):
         fields = [
             'college', 'district', 'province', 'exam_target', 'batch',
             'photo', 'plan_expires_at', 'preferred_payment_channel',
+            'verification_status', 'verification_rejection_reason',
         ]
+
+
+class VerificationDocumentSerializer(serializers.ModelSerializer):
+    reviewed_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = VerificationDocument
+        fields = [
+            'id', 'document_type', 'status', 'original_filename', 'uploaded_at',
+            'reviewed_at', 'reviewed_by_name', 'rejection_reason',
+        ]
+        read_only_fields = fields
+
+    def get_reviewed_by_name(self, obj):
+        if not obj.reviewed_by_id:
+            return None
+        reviewer = obj.reviewed_by
+        return f'{reviewer.first_name} {reviewer.last_name}'.strip() or reviewer.email
 
 
 class UserSerializer(serializers.ModelSerializer):
@@ -303,6 +322,7 @@ class AdminUserDetailSerializer(serializers.ModelSerializer):
     devices = serializers.SerializerMethodField()
     device_count = serializers.SerializerMethodField()
     activity_summary = serializers.SerializerMethodField()
+    verification_documents = serializers.SerializerMethodField()
 
     class Meta:
         model = User
@@ -312,7 +332,7 @@ class AdminUserDetailSerializer(serializers.ModelSerializer):
             'is_active', 'is_staff', 'date_joined',
             'referral_code', 'wallet_balance', 'referred_by',
             'profile', 'enrollments', 'enrollment_requests', 'purchases',
-            'devices', 'device_count', 'activity_summary',
+            'devices', 'device_count', 'activity_summary', 'verification_documents',
         ]
         read_only_fields = fields
 
@@ -349,6 +369,9 @@ class AdminUserDetailSerializer(serializers.ModelSerializer):
 
     def get_activity_summary(self, obj):
         return getattr(obj, 'detail_activity_summary', {})
+
+    def get_verification_documents(self, obj):
+        return VerificationDocumentSerializer(getattr(obj, 'detail_verification_documents', []), many=True).data
 
 
 class AdminStudentEditSerializer(serializers.Serializer):

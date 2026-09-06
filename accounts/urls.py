@@ -10,9 +10,14 @@ from .views import (
     ChangePasswordView,
     LoginView,
     MeView,
+    MyVerificationView,
+    ProfilePhotoUploadView,
     RegisterView,
     RolePermissionViewSet,
     TeacherListView,
+    VerificationDocumentApproveView,
+    VerificationDocumentRejectView,
+    VerificationDocumentViewView,
 )
 
 router = DefaultRouter()
@@ -29,5 +34,19 @@ urlpatterns = [
     path('settings/', AccountSettingsView.as_view(), name='account-settings'),
     path('change-password/', ChangePasswordView.as_view(), name='change-password'),
     path('teachers/', TeacherListView.as_view(), name='teachers'),
+    path('me/photo/', ProfilePhotoUploadView.as_view(), name='profile-photo-upload'),
+    path('me/verification/', MyVerificationView.as_view(), name='my-verification'),
+    path(
+        'verification-documents/<int:pk>/view/', VerificationDocumentViewView.as_view(),
+        name='verification-document-view',
+    ),
+    path(
+        'verification-documents/<int:pk>/approve/', VerificationDocumentApproveView.as_view(),
+        name='verification-document-approve',
+    ),
+    path(
+        'verification-documents/<int:pk>/reject/', VerificationDocumentRejectView.as_view(),
+        name='verification-document-reject',
+    ),
     path('', include(router.urls)),
 ]
