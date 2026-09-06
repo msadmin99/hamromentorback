@@ -1,7 +1,8 @@
 import re
 
 from django.conf import settings
-from django.db import models
+from django.db import models, transaction
+from django.db.models import F
 from django.utils.text import slugify
 
 
@@ -102,6 +103,46 @@ class ReferenceBook(models.Model):
 
     def __str__(self):
         return self.name
+
+
+class QuestionPublicIdCounter(models.Model):
+    """Atomic per-prefix sequence backing Question.public_id — replaces the
+    old `Question.objects.filter(public_id__startswith=prefix).count() + 1`
+    scheme, which had two real problems at scale: it re-scanned every
+    question with this prefix on *every single save* (scalability audit),
+    and it raced under concurrent question creation — two saves could both
+    read the same COUNT before either committed, both compute the same
+    "next" number, and then race on public_id's uniqueness constraint (a
+    real failure mode for bulk import, which creates many questions in
+    quick succession).
+
+    One row per prefix (e.g. 'A', 'CM', 'MD'), incremented atomically under
+    a row lock (see _next_public_id_number below) so concurrent saves
+    serialize on this one small row instead of racing on the full table."""
+    prefix = models.CharField(max_length=10, unique=True)
+    last_number = models.PositiveIntegerField(default=0)
+
+    def __str__(self):
+        return f'{self.prefix} -> {self.last_number}'
+
+
+def _next_public_id_number(prefix):
+    """Atomically returns the next sequence number for `prefix`. select_for_update()
+    takes a row lock for the duration of this transaction, so a second,
+    concurrent call for the same prefix blocks until the first commits,
+    then reads the already-incremented value — no two calls can ever
+    return the same number for the same prefix. (SQLite, used by the test
+    suite, silently ignores select_for_update() since it has no row-level
+    locking, but Django test transactions are not run concurrently, so
+    that's harmless there.)"""
+    with transaction.atomic():
+        counter, _ = QuestionPublicIdCounter.objects.select_for_update().get_or_create(
+            prefix=prefix, defaults={'last_number': 0},
+        )
+        counter.last_number = F('last_number') + 1
+        counter.save(update_fields=['last_number'])
+        counter.refresh_from_db(fields=['last_number'])
+        return counter.last_number
 
 
 class Question(models.Model):
@@ -226,14 +267,40 @@ class Question(models.Model):
         blank=True, help_text='Optional short revision recap for the public page — the section is omitted entirely if blank.',
     )
 
+    class Meta:
+        # Phase 11 (plan bullet 2). Question had no Meta at all, so every
+        # taxonomy query relied on the single-column FK indexes Django
+        # creates for subject/chapter/topic. The composite below matches the
+        # platform's actual hot path — analytics and the QBank practice
+        # builder both filter subject, then narrow by chapter and topic
+        # (tests_app/performance.py: subject_breakdown/chapter_breakdown/
+        # topic_mastery; academics/views.py: the practice-session filters) —
+        # which a set of independent single-column indexes cannot serve in
+        # one seek.
+        #
+        # NOT added: the plan also lists "course+subject". That one is not
+        # expressible as an index on this table — `courses` is a
+        # ManyToManyField, so course lives in the auto-created through table
+        # (which already carries its own (question_id, course_id) unique
+        # index, the index that join actually uses) while `subject` lives
+        # here. A composite spanning both is impossible in a single index;
+        # documented in PHASE_11_ANALYTICS_ARCHITECTURE.md rather than
+        # silently dropped.
+        #
+        # No `ordering` is declared: Question deliberately had no Meta
+        # before, so adding one must not introduce a default ordering that
+        # would silently change every existing queryset's row order.
+        indexes = [
+            models.Index(fields=['subject', 'chapter', 'topic'], name='question_taxonomy_idx'),
+        ]
+
     def __str__(self):
         return self.text[:60]
 
     def save(self, *args, **kwargs):
         if not self.public_id:
             prefix = ''.join(w[0] for w in self.subject.name.split())[:2].upper() or 'MD'
-            last = Question.objects.filter(public_id__startswith=prefix).count() + 1
-            self.public_id = f'{prefix}{last:04d}'
+            self.public_id = f'{prefix}{_next_public_id_number(prefix):04d}'
         if not self.slug:
             self.slug = self._generate_slug()
         super().save(*args, **kwargs)
@@ -492,6 +559,43 @@ class ImportBatch(models.Model):
     started_at = models.DateTimeField(null=True, blank=True)
     completed_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+
+    processing_claimed_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text='Scalability audit Phase 2.2: set atomically when a background import run (Cloud Task or its '
+                   'synchronous fallback) claims this batch, so a duplicate/retried task delivery for the same '
+                   'batch (Cloud Tasks is at-least-once, not exactly-once) sees it is already being processed and '
+                   'exits instead of double-importing rows. A claim older than IMPORT_CLAIM_STALE_MINUTES is '
+                   'treated as abandoned (the instance that held it likely died) and can be reclaimed by a retry.',
+    )
+
+    DEDUP_STATUS_CHOICES = [('pending', 'Pending'), ('processing', 'Processing'), ('completed', 'Completed')]
+    dedup_status = models.CharField(
+        max_length=15, choices=DEDUP_STATUS_CHOICES, blank=True,
+        help_text='Bulk-import taxonomy audit (Phase 3): async duplicate-detection status for the CURRENT '
+                   'dedup_generation. Blank until a Subject is first selected. A separate field from '
+                   'ImportBatch.status on purpose — dedup can run many times while status stays "ready", and '
+                   'reusing status would make its own well-established meaning ambiguous.',
+    )
+    dedup_generation = models.PositiveIntegerField(
+        default=0,
+        help_text='Incremented every time the taxonomy PATCH changes Subject to a genuinely different value '
+                   '(never on Chapter/Topic/course changes, and never on re-selecting the same Subject — see '
+                   'ImportBatchTaxonomyView.patch()). The version token a stale, superseded dedup worker checks '
+                   'against before writing any row result, so a slow run for an old Subject can never overwrite '
+                   'a newer Subject\'s results. The Cloud Task name is generation-scoped '
+                   '(dedup-batch-{id}-gen-{generation}) so Cloud Tasks itself also never conflates two different '
+                   'generations under one task identity.',
+    )
+    dedup_claimed_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text='Same staleness-reclaim pattern as processing_claimed_at, but for the dedup worker specifically '
+                   '— kept as its own field since dedup and import are independent operations that can each get '
+                   'stuck on their own schedule. A claim older than DEDUP_CLAIM_STALE_MINUTES is reclaimable.',
+    )
+    dedup_completed_at = models.DateTimeField(
+        null=True, blank=True, help_text='When dedup_status last became "completed" — observability only.',
+    )
 
     class Meta:
         ordering = ['-created_at']

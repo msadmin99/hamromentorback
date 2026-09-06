@@ -1,6 +1,8 @@
-from django.db.models import Count, Exists, OuterRef, Sum
+from django.core.paginator import Paginator
+from django.db.models import Count, Exists, OuterRef, Prefetch, Sum
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
+from django.utils.functional import cached_property
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.pagination import PageNumberPagination
@@ -13,6 +15,7 @@ from hamromentor.permissions import IsStaffOrReadOnly, IsStaffOrReadOnlyExcludin
 from .access import locked_subject_ids as _locked_subject_ids
 from .access import question_course_scoped as _question_course_scoped
 from .excel import import_workbook, template_response
+from .random_sample import random_sample
 from .models import (
     Chapter, Option, Question, QuestionAttempt, QuestionBankConfig, QuestionDifficultyRating,
     QuestionEvent, QuestionReport, ReferenceBook, Subject, Topic,
@@ -54,10 +57,25 @@ def _course_scoped(qs, user, *, courses_lookup):
     return qs.filter(Q(**{isnull_lookup: True}) | Q(**{in_lookup: course_ids})).distinct()
 
 
+class _BoundedListPagination(PageNumberPagination):
+    """Shared safety cap for GET /subjects/, /chapters/, /topics/ — none of
+    these have real pagination UI on any known caller (all read the
+    response as a bare array), and catalog-wide counts of subjects/
+    chapters/topics stay small even at the 100,000+ MCQ target, but an
+    explicit DB-level LIMIT is still cheap insurance against an
+    unfiltered request materializing every row."""
+    page_size = 500
+    max_page_size = 500
+
+    def get_paginated_response(self, data):
+        return Response(data)
+
+
 class SubjectViewSet(viewsets.ModelViewSet):
     queryset = Subject.objects.all().prefetch_related('courses')
     permission_classes = [IsStaffOrReadOnlyExcludingTeacherWrites]
     lookup_field = 'slug'
+    pagination_class = _BoundedListPagination
 
     def get_serializer_class(self):
         if self.action == 'retrieve':
@@ -73,13 +91,51 @@ class SubjectViewSet(viewsets.ModelViewSet):
             # (e.g. the Admin Subjects page filtering by course) — never a
             # substitute for the eligibility filter for non-staff.
             qs = qs.filter(courses__id=course_id)
-        return qs.distinct()
+        qs = qs.distinct().annotate(
+            # module_count/question_count/video_count were previously
+            # obj.chapters.count()/obj.questions.count()/obj.videos.count()
+            # SerializerMethodFields — one query each per subject per
+            # field, per request (scalability audit). Combined in one
+            # annotate() call with distinct=True on each, following the
+            # same fan-out-safe pattern already proven for Test's
+            # question_count/total_marks annotations.
+            annotated_module_count=Count('chapters', distinct=True),
+            annotated_question_count=Count('questions', distinct=True),
+            annotated_video_count=Count('videos', distinct=True),
+        ).order_by('order', 'name', 'id')
+        # solved_modules/attempted_count are per-student, not per-catalog,
+        # so batching them here (subject count stays small even at the
+        # 100,000+ MCQ target) trades one extra grouped query for
+        # eliminating what used to be two more queries PER SUBJECT ROW.
+        user = self.request.user
+        self._attempted_count_by_subject = {}
+        self._solved_modules_by_subject = {}
+        if user.is_authenticated:
+            subject_ids = list(qs.values_list('id', flat=True))
+            if subject_ids:
+                rows = QuestionAttempt.objects.filter(
+                    user=user, question__subject_id__in=subject_ids,
+                ).values('question__subject_id', 'question__chapter_id')
+                solved_chapters = {}
+                for row in rows:
+                    sid = row['question__subject_id']
+                    self._attempted_count_by_subject[sid] = self._attempted_count_by_subject.get(sid, 0) + 1
+                    solved_chapters.setdefault(sid, set()).add(row['question__chapter_id'])
+                self._solved_modules_by_subject = {sid: len(chs) for sid, chs in solved_chapters.items()}
+        return qs
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context['attempted_count_by_subject'] = getattr(self, '_attempted_count_by_subject', None)
+        context['solved_modules_by_subject'] = getattr(self, '_solved_modules_by_subject', None)
+        return context
 
 
 class ChapterViewSet(viewsets.ModelViewSet):
     queryset = Chapter.objects.all()
     serializer_class = ChapterSerializer
     permission_classes = [IsStaffOrReadOnlyExcludingTeacherWrites]
+    pagination_class = _BoundedListPagination
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -87,13 +143,42 @@ class ChapterViewSet(viewsets.ModelViewSet):
         subject_slug = self.request.query_params.get('subject')
         if subject_slug:
             qs = qs.filter(subject__slug=subject_slug)
+        # ChapterSerializer nests TopicSerializer(many=True) for `topics` —
+        # previously unprefetched (N+1 on its own) and each nested Topic's
+        # question_count/video_count were themselves per-topic queries (a
+        # second, multiplicative N+1 layer). The Prefetch's own queryset
+        # carries the same annotations TopicSerializer reads.
+        topic_qs = Topic.objects.annotate(
+            annotated_question_count=Count('questions', distinct=True),
+            annotated_video_count=Count('videos', distinct=True),
+        ).order_by('order', 'name', 'id')
+        qs = qs.distinct().annotate(
+            annotated_mcq_count=Count('questions', distinct=True),
+            annotated_video_count=Count('videos', distinct=True),
+        ).prefetch_related(Prefetch('topics', queryset=topic_qs)).order_by('order', 'name', 'id')
+        user = self.request.user
+        self._solved_count_by_chapter = {}
+        if user.is_authenticated:
+            chapter_ids = list(qs.values_list('id', flat=True))
+            if chapter_ids:
+                rows = (
+                    QuestionAttempt.objects.filter(user=user, question__chapter_id__in=chapter_ids)
+                    .values('question__chapter_id').annotate(n=Count('id'))
+                )
+                self._solved_count_by_chapter = {row['question__chapter_id']: row['n'] for row in rows}
         return qs
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context['solved_count_by_chapter'] = getattr(self, '_solved_count_by_chapter', None)
+        return context
 
 
 class TopicViewSet(viewsets.ModelViewSet):
     queryset = Topic.objects.all()
     serializer_class = TopicSerializer
     permission_classes = [IsStaffOrReadOnlyExcludingTeacherWrites]
+    pagination_class = _BoundedListPagination
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -101,7 +186,10 @@ class TopicViewSet(viewsets.ModelViewSet):
         chapter_id = self.request.query_params.get('chapter')
         if chapter_id:
             qs = qs.filter(chapter_id=chapter_id)
-        return qs
+        return qs.distinct().annotate(
+            annotated_question_count=Count('questions', distinct=True),
+            annotated_video_count=Count('videos', distinct=True),
+        ).order_by('order', 'name', 'id')
 
 
 def _status_question_ids(user, statuses, base_qs):
@@ -130,15 +218,151 @@ def _status_question_ids(user, statuses, base_qs):
     return ids
 
 
+# Scalability audit Phase B: Q(text__icontains=search) forced a full table
+# scan of academics_question on every Question Bank search (confirmed via
+# EXPLAIN: type=ALL, ~29,500 rows examined at 30K questions) — the search
+# spans `text` (the question body, by far the largest/most numerous field
+# being scanned) plus public_id/subject/chapter/topic/tags, but only
+# `text` is what actually drives the scan cost at scale (the others are
+# short fields or joins to small catalog tables, ~20 subjects/chapters/
+# topics — never the bottleneck).
+#
+# MySQL FULLTEXT (BOOLEAN MODE, trailing wildcard for prefix matching) is
+# a real index lookup instead of a scan, but it is *word*-tokenized: it
+# cannot match a term that only appears mid-word inside another word
+# (searching "diac" would never match "cardiac" — LIKE '%diac%' would).
+# There's no reliable way to know in advance whether a given search term
+# is a genuine word/prefix (safe for FULLTEXT) or a word fragment (needs
+# the old scan) — so instead of guessing from the term itself, this tries
+# FULLTEXT first and checks the *result*: if it found at least one match,
+# that's used (the fast path, and the overwhelmingly common case — most
+# real searches for a whole word/prefix that exists in the question
+# bank). If FULLTEXT found nothing, that's exactly the "maybe this term
+# only exists as a mid-word substring, or is shorter than FULLTEXT's
+# minimum indexed token length" case — falls back to the *exact* original
+# full-scan query, so no result the old search would have found is ever
+# lost, just occasionally not sped up. `tags` is excluded from FULLTEXT
+# entirely (it's a JSONField storing a keyword list, not a text column —
+# MySQL FULLTEXT indexes can't include JSON columns) and stays on
+# icontains in both branches, completely unaffected either way.
+#
+# MySQL-only: SQLite (local dev/tests) has no FULLTEXT/MATCH...AGAINST
+# support at all, so this always takes the original full-scan path there
+# — same query, same results, just without the index. See this migration:
+# academics/migrations/0024_question_text_fulltext_index.py.
+def _apply_question_search(qs, search):
+    from django.db.models import Q
+
+    def _original_full_scan():
+        return qs.filter(
+            Q(public_id__icontains=search) | Q(text__icontains=search)
+            | Q(subject__name__icontains=search) | Q(chapter__name__icontains=search)
+            | Q(topic__name__icontains=search) | Q(tags__icontains=search)
+        )
+
+    from django.db import connection
+
+    if connection.vendor != 'mysql':
+        return _original_full_scan()
+
+    import re
+
+    # Strip MySQL boolean-mode operators (+ - < > ( ) ~ * " @) so a search
+    # term containing them can't change query semantics (e.g. a leading
+    # "-word" means "exclude" in boolean mode) or cause a syntax error —
+    # tokenized the same way FULLTEXT itself would split on them anyway.
+    safe_term = re.sub(r'[+\-<>()~*"@]+', ' ', search).strip()
+    boolean_term = ' '.join(f'{word}*' for word in safe_term.split() if word)
+    if not boolean_term:
+        return _original_full_scan()
+
+    # Materialized eagerly (a plain Python list of ids), not left as a
+    # lazy queryset nested via id__in=<queryset> — Django re-aliases the
+    # table when a queryset is embedded as a subquery (`academics_question`
+    # becomes `U0` in the generated SQL), which breaks this raw MATCH()
+    # clause's hardcoded table reference and MySQL rejects it outright
+    # (errno 1210, "Incorrect arguments to MATCH") since MATCH() can't
+    # correlate to an outer query's table. Running it as its own
+    # standalone top-level query first sidesteps that entirely — confirmed
+    # via a direct repro against staging before landing this fix.
+    fulltext_ids = list(
+        Question.objects.extra(
+            where=['MATCH(academics_question.text) AGAINST (%s IN BOOLEAN MODE)'],
+            params=[boolean_term],
+        ).values_list('id', flat=True)
+    )
+    if not fulltext_ids:
+        return _original_full_scan()
+
+    return qs.filter(
+        Q(id__in=fulltext_ids) | Q(public_id__icontains=search)
+        | Q(subject__name__icontains=search) | Q(chapter__name__icontains=search)
+        | Q(topic__name__icontains=search) | Q(tags__icontains=search)
+    )
+
+
 class _BrowsePagination(PageNumberPagination):
     page_size = 20
     max_page_size = 50
     page_size_query_param = 'page_size'
 
 
+class _CheapDistinctCountPaginator(Paginator):
+    """Scalability audit: DRF's paginator needs self.count (via num_pages)
+    to validate the requested page even though _QuestionListPagination's
+    response never surfaces it — and the normal Paginator.count just calls
+    queryset.count(). For QuestionViewSet's queryset that means a wide,
+    unrestricted DISTINCT: no .values()/.only() is applied, so MySQL has
+    to materialize every matching row's full ~40-column set (including the
+    large `text` field and the 4 correlated-subquery annotation columns)
+    into a derived table, deduplicate on ALL of it, and only then count —
+    confirmed by direct measurement at 2.7-4.7s per request at 100K
+    questions, dominating this endpoint's latency far more than the actual
+    500-row fetch or serialization (both of which stayed under 100ms).
+
+    Every row is already unique by `pk` (Question's AutoField), so
+    counting `.values('pk').distinct()` instead returns the exact same
+    number — it does not change which questions match, their order, or
+    anything about the actual page that gets fetched/serialized/returned
+    (unaffected: filtering, search, course-scoping, permissions, response
+    shape) — but it lets MySQL deduplicate on one indexed integer column
+    instead of a full wide row, an index-covered operation. Confirmed via
+    direct measurement: ~20-30ms at 100K questions, matching the cost of a
+    plain COUNT(*) with no DISTINCT at all."""
+    @cached_property
+    def count(self):
+        return self.object_list.values('pk').distinct().count()
+
+
+class _QuestionListPagination(PageNumberPagination):
+    """Caps GET /questions/ at a real DB-level LIMIT without changing its
+    response shape — its 4 confirmed callers (QuestionSolver's chapter-
+    solve session, the QBank bookmarks page, the Admin question-management
+    table, Admin's QuestionPicker) all read the response as a bare array,
+    exactly the reason `browse` above exists as a separate opt-in action
+    rather than pagination going on globally. The two Admin surfaces
+    (management table, QuestionPicker) are the genuine "browse the whole
+    catalog" cases and are the best long-term fit for `browse`'s paginated
+    envelope, but migrating them requires real Admin UI changes (pagination
+    controls) that are out of scope for this pass per "do not change
+    existing UI/UX unless required for scalability" — this 500-row cap
+    already satisfies the actual requirement (no endpoint returns an
+    unbounded dataset) for them today. The two student-facing callers (one
+    chapter's questions, one student's own bookmarks) are inherently
+    bounded by what they already filter to. This cap is the safety net for
+    the remaining unbounded case — no filters at all applied."""
+    page_size = 500
+    max_page_size = 500
+    django_paginator_class = _CheapDistinctCountPaginator
+
+    def get_paginated_response(self, data):
+        return Response(data)
+
+
 class QuestionViewSet(viewsets.ModelViewSet):
     queryset = Question.objects.all().select_related('subject', 'chapter').prefetch_related('options')
     permission_classes = [IsStaffOrReadOnly]
+    pagination_class = _QuestionListPagination
 
     def get_serializer_class(self):
         if self.request.user.is_authenticated and self.request.user.is_staff:
@@ -146,7 +370,28 @@ class QuestionViewSet(viewsets.ModelViewSet):
         return QuestionSerializer
 
     def get_queryset(self):
-        qs = super().get_queryset()
+        # topic + each option's image_asset were previously unfetched
+        # (only subject/chapter/options itself were) — one extra query per
+        # row per relation, per field, on every question in the page
+        # (scalability audit: up to ~122 queries for one 20-row public
+        # page, ~182 for the admin one). image_asset is select_related
+        # unconditionally because QuestionSerializer.get_image_data() reads
+        # it too (public path, not admin-only, unlike the block below).
+        # explanation_image_asset/reference_book/created_by ARE ADMIN-
+        # serializer-only fields (QuestionSerializer never reads them) —
+        # only select_related them for a staff request, per "only load
+        # relationships required by the serializer/action".
+        is_admin_view = self.request.user.is_authenticated and self.request.user.is_staff
+        option_qs = Option.objects.select_related('image_asset')
+        qs = Question.objects.select_related('subject', 'chapter', 'topic', 'image_asset').prefetch_related(
+            Prefetch('options', queryset=option_qs),
+        )
+        if is_admin_view:
+            qs = qs.select_related('explanation_image_asset', 'reference_book', 'created_by')
+            # QuestionAdminSerializer also exposes the raw `courses` M2M
+            # (QuestionSerializer does not) — without this, each row triggers
+            # its own `courses_course` query when the field is serialized.
+            qs = qs.prefetch_related('courses')
         subject = self.request.query_params.get('subject')
         chapter = self.request.query_params.get('chapter')  # Chapter model — "Unit" in the UI
         topic = self.request.query_params.get('topic')  # Topic model — "Chapter" in the UI
@@ -167,16 +412,18 @@ class QuestionViewSet(viewsets.ModelViewSet):
         if year:
             qs = qs.filter(year=year)
         if course:
-            qs = qs.filter(courses__id=course)
+            # Scalability audit Fix 2: was qs.filter(courses__id=course) —
+            # a JOIN to the same Question.courses M2M table as
+            # question_course_scoped() below. This one value can only
+            # ever match one M2M row per question (no fan-out on its own),
+            # but converting it to EXISTS keeps every course-related
+            # filter on this queryset off the JOIN path consistently, per
+            # the approved fix scope.
+            qs = qs.filter(Exists(Question.courses.through.objects.filter(question_id=OuterRef('pk'), course_id=course)))
         if teacher:
             qs = qs.filter(created_by_id=teacher)
         if search:
-            from django.db.models import Q
-            qs = qs.filter(
-                Q(public_id__icontains=search) | Q(text__icontains=search)
-                | Q(subject__name__icontains=search) | Q(chapter__name__icontains=search)
-                | Q(topic__name__icontains=search) | Q(tags__icontains=search)
-            )
+            qs = _apply_question_search(qs, search)
         if bookmarked in ('true', '1'):
             if self.request.user.is_authenticated:
                 qs = qs.filter(attempts__user=self.request.user, attempts__is_bookmarked=True)
@@ -217,7 +464,30 @@ class QuestionViewSet(viewsets.ModelViewSet):
                 last_result_for_user=Subquery(attempt_for_user.values('last_result')[:1]),
                 revision_due_at_for_user=Subquery(attempt_for_user.values('revision_due_at')[:1]),
             )
-        return qs.distinct()
+        # Question has no Meta.ordering — was never deterministic before
+        # this (DRF's paginator would otherwise warn "may yield
+        # inconsistent results", same as tests_app.TestViewSet had to be
+        # fixed for). -id (newest first) matches the direction every
+        # existing consumer already implicitly assumed with no order at all.
+        #
+        # Scalability audit Fix 2: .distinct() removed here. It used to be
+        # required because course_course_scoped()'s and the ?course=
+        # filter's M2M JOINs could fan out (one row per matching related
+        # row); both are now EXISTS-based subqueries, which return one
+        # boolean per outer row and never fan out. Every other filter
+        # applied above is verified fan-out-safe on its own: search only
+        # joins Question's single-valued subject/chapter/topic FKs (at
+        # most one match per question); the bookmarked filter joins
+        # QuestionAttempt, which has a unique_together(user, question)
+        # constraint (at most one match per question per user); the status
+        # filter narrows by a pre-deduplicated Python set of ids. With no
+        # remaining fan-out source, .distinct() was a pure no-op paid on
+        # every request — and, with no restricted .values(), an expensive
+        # one: it forced MySQL to materialize every matching row's full
+        # column set into a derived table just to deduplicate rows that
+        # were never duplicated in the first place (confirmed via EXPLAIN
+        # and direct timing — see the Fix 2 audit report).
+        return qs.order_by('-id')
 
     def destroy(self, request, *args, **kwargs):
         """Permanent delete — blocked if the question has practice-attempt
@@ -344,7 +614,19 @@ class QuestionViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
     def answer(self, request, pk=None):
-        question = self.get_object()
+        # Phase 3 Free Starter: deliberately NOT self.get_object() — that
+        # applies get_queryset()'s LISTING-scoped locked_subject_ids
+        # exclusion, which is a coarse, subject-wide lock meant for catalog
+        # browsing. This action already runs its own precise, per-question
+        # entitlement check below (can_view_qbank, gated on option_id) —
+        # applying the coarser listing lock on top would 404 a request this
+        # action's own gate is fully equipped to answer properly (e.g. an
+        # informative 402 instead of an opaque "not found"), and would
+        # incorrectly block re-answering an already-legitimately-attempted
+        # question once the student's free-starter quota is later
+        # exhausted. Matches the existing get_object_or_404(Option, ...)
+        # pattern a few lines below — same style, same reasoning.
+        question = get_object_or_404(Question, pk=pk)
         serializer = AnswerSubmitSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         option_id = serializer.validated_data.get('option_id')
@@ -354,6 +636,40 @@ class QuestionViewSet(viewsets.ModelViewSet):
         selected_option = None
         is_correct = False
         if option_id:
+            # Phase 3 Free Starter (docs/FREE_STARTER_USAGE_RULES.md §2):
+            # only gate/consume on a student's genuinely FIRST-EVER attempt
+            # at THIS question — an already-attempted question (any prior
+            # entitlement source) stays answerable even if the student's
+            # entitlement has since lapsed, matching the same "don't re-gate
+            # something already unlocked" rule applied to Mock/Daily/Grand
+            # below. Free subjects are never gated at all (see
+            # entitlements.services.can_view_qbank's own free-subject
+            # short-circuit).
+            # Staff excluded entirely (Step 31) — preserves the exact
+            # pre-Phase-3 behavior of unrestricted staff QBank access (there
+            # was no gate here for anyone before this phase; adding one for
+            # staff now would both regress admin/QA workflows and risk
+            # accidentally consuming a free-starter row for a non-student
+            # account).
+            already_attempted = QuestionAttempt.objects.filter(user=request.user, question=question).exists()
+            if not already_attempted and not question.subject.is_free and not request.user.is_staff:
+                from entitlements.provisioning import ensure_and_consume_free_starter
+                from entitlements.services import SOURCE_FREE_STARTER, can_view_qbank
+
+                decision = can_view_qbank(request.user, question.subject)
+                if not decision.allowed:
+                    return Response(
+                        {
+                            'detail': 'Free practice limit reached.', 'code': 'purchase_required',
+                            'access_denied': {
+                                'reason': 'free_limit_reached', 'source': 'free_starter', 'upgrade_available': True,
+                            },
+                        },
+                        status=status.HTTP_402_PAYMENT_REQUIRED,
+                    )
+                if decision.source_type == SOURCE_FREE_STARTER:
+                    ensure_and_consume_free_starter(request.user, 'qbank')
+
             selected_option = get_object_or_404(Option, pk=option_id, question=question)
             is_correct = selected_option.is_correct
             # bookmark is intentionally untouched here — it has its own dedicated
@@ -766,8 +1082,9 @@ class QuestionViewSet(viewsets.ModelViewSet):
         except (TypeError, ValueError):
             count = 20
 
-        qs = qs.distinct().order_by('?')[:count]
-        questions = list(qs)
+        # random_sample() replaces `.order_by('?')[:count]` — see
+        # academics/random_sample.py for why ORDER BY RAND() doesn't scale.
+        questions = random_sample(qs.distinct(), count)
         bookmarked_ids = set(
             QuestionAttempt.objects.filter(user=user, question__in=questions, is_bookmarked=True)
             .values_list('question_id', flat=True)

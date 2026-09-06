@@ -60,6 +60,34 @@ class IsSuperAdmin(BasePermission):
         return bool(user.is_superuser or getattr(user, 'admin_role', None) in (None, '', 'super_admin'))
 
 
+def HasFeature(feature_key):
+    """Factory: returns a permission class requiring `feature_key` in the
+    caller's feature list, per accounts.models.user_feature_list — the
+    same computation the frontend's hasFeature()/RequireStaff already use
+    for nav/button visibility.
+
+    FIX (P0 security audit): until this class existed, the RolePermission
+    feature-key vocabulary (billing, exam_schedule, exam_archive,
+    exam_delete, question_entry, ...) was consulted ONLY by the frontend —
+    no backend DRF permission class ever read RolePermission at all, so
+    hiding a button never actually stopped a direct API call. Use this on
+    any action that a specific feature key is meant to gate; for anything
+    coarser, IsAdminRoleOrAbove/IsStaffOrReadOnly are still correct.
+    """
+
+    class _HasFeature(BasePermission):
+        def has_permission(self, request, view):
+            from accounts.models import user_feature_list
+
+            user = request.user
+            if not (user and user.is_authenticated and user.is_staff):
+                return False
+            return feature_key in user_feature_list(user)
+
+    _HasFeature.__name__ = f'HasFeature_{feature_key}'
+    return _HasFeature
+
+
 class IsApprovedTeacher(BasePermission):
     """Marketplace-teacher-only write access. Deliberately unrelated to
     admin_role='teacher' (the internal-staff concept) — this checks the

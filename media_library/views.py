@@ -63,7 +63,11 @@ class MediaUploadView(APIView):
 
 
 class MediaAssetDetailView(APIView):
-    """GET /api/media/<uuid>/ — poll for processing status/URLs.
+    """GET /api/media/<uuid>/ — poll for processing status/URLs. Owner-or-
+    staff: any authenticated uploader (including a student polling their
+    own student_avatar upload — see STUDENT_ALLOWED_TYPES in
+    permissions_util.py, the only image_type a student can create) may
+    read their own asset; staff may read any.
     DELETE /api/media/<uuid>/ — permanent delete (dedup-aware GCS cleanup,
     audit-logged). Staff-only: an asset may still be referenced by a
     Question/Option another admin owns, so this isn't opened up to any
@@ -76,6 +80,14 @@ class MediaAssetDetailView(APIView):
             asset = MediaAsset.objects.get(id=pk)
         except MediaAsset.DoesNotExist:
             return Response(status=status.HTTP_404_NOT_FOUND)
+        # FIX (P0 security audit): this previously had no ownership/staff
+        # check at all — any authenticated user could poll ANY asset by
+        # UUID, not just their own uploads. Scoped to owner-or-staff rather
+        # than staff-only so the existing student_avatar self-upload path
+        # (the one MediaAsset type a plain student account may create)
+        # keeps working.
+        if not (request.user.is_staff or asset.owner_id == request.user.id):
+            return Response({'detail': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
         return Response(MediaAssetSerializer(asset).data)
 
     def delete(self, request, pk):

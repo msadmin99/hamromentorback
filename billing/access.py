@@ -29,6 +29,17 @@ def has_qbank_access(user, subject):
     return _active_subscriptions(user, 'qbank').filter(course_id__in=course_ids).exists()
 
 
+def active_qbank_course_ids(user):
+    """Course ids this user currently has an active QBank subscription
+    for — the batched equivalent of calling has_qbank_access() once per
+    Subject (scalability audit Phase 3: academics.access.locked_subject_ids
+    used to do exactly that, an O(subject count) query pattern on a call
+    site hit on nearly every Question Bank request)."""
+    if not user or not user.is_authenticated:
+        return set()
+    return set(_active_subscriptions(user, 'qbank').values_list('course_id', flat=True))
+
+
 def has_video_access(user, video):
     if video.access_level == 'public':
         return True
@@ -96,9 +107,14 @@ def consume_quota(user, product_type):
 
 
 def get_grand_test_access(user, test):
+    """Phase 9: `revoked_at__isnull=True` — a Grand Test grant whose paying
+    purchase was refunded no longer grants access. The row itself is kept
+    (issued password + audit trail), it just stops counting here, which is
+    the single place every caller resolves Grand Test entitlement through
+    (tests_app._start_attempt, entitlements.services.can_start_test)."""
     if not user or not user.is_authenticated:
         return None
-    return GrandTestAccess.objects.filter(user=user, test=test).first()
+    return GrandTestAccess.objects.filter(user=user, test=test, revoked_at__isnull=True).first()
 
 
 def is_preview_only(user, test):

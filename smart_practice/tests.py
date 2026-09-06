@@ -17,6 +17,7 @@ from .services import (
     create_session,
     due_review_candidates,
     new_question_candidates,
+    new_question_pool,
     record_session_answer,
 )
 from .source_performance import source_missed_questions, source_topic_mastery
@@ -391,6 +392,25 @@ class NewPracticePathModesTests(SmartPracticeTestCase):
         ctx = resolve_source_scope(self.student, self.test.id)
         bookmarked_ids = {q.id for q in bookmarked_candidates(ctx, self.student)}
         self.assertEqual(bookmarked_ids, {self.q1.id})
+
+    def test_new_question_pool_count_matches_unlimited_candidates_length(self):
+        """Scalability audit fix (Phase 1.7): new_question_pool() was split
+        out of new_question_candidates() so EligibilityView/
+        RecommendationsView can .count() instead of materializing every row
+        just to take len() — this proves the split didn't change what
+        either number reports."""
+        QuestionAttempt.objects.create(user=self.student, question=self.q1)
+        ctx = resolve_source_scope(self.student, self.test.id)
+        self.assertEqual(new_question_pool(ctx, self.student).count(), len(new_question_candidates(ctx, self.student)))
+
+    def test_new_question_candidates_limit_returns_at_most_limit_real_members(self):
+        ctx = resolve_source_scope(self.student, self.test.id)
+        pool_ids = {q.id for q in new_question_candidates(ctx, self.student)}  # unlimited, for membership check
+
+        result = new_question_candidates(ctx, self.student, limit=1)
+
+        self.assertEqual(len(result), 1)
+        self.assertIn(result[0].id, pool_ids)
 
     def test_ai_mixed_returns_a_deduplicated_blend_within_the_authorized_pool(self):
         QuestionAttempt.objects.create(user=self.student, question=self.q3, revision_due_at=timezone.now() - timezone.timedelta(days=1))

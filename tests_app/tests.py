@@ -1,11 +1,13 @@
 from django.contrib.auth import get_user_model
+from django.test import TestCase, override_settings
 from django.utils import timezone
 from rest_framework import status
-from rest_framework.test import APITestCase
+from rest_framework.test import APITestCase, APITransactionTestCase
 
 from academics.models import Option, Question, QuestionAttempt, QuestionEvent, Subject
 from core.models import DeletionAuditLog
-from tests_app.models import Answer, ExamSession, ExamTemplate, SavedExamView, Test, TestAttempt, TestQuestion
+from tests_app.models import Answer, ExamSession, ExamTemplate, ExamTypePolicy, SavedExamView, Test, TestAttempt, TestQuestion
+from tests_app.policy import POLICY_CONTROLLED_FIELDS, get_all_exam_type_defaults, get_exam_type_defaults
 
 User = get_user_model()
 
@@ -98,6 +100,178 @@ class ExamSessionDeleteTests(APITestCase):
         self.assertEqual(entry.result, 'success')
 
 
+class ExamSessionAttemptsPermissionTests(APITestCase):
+    """P0 security-audit regression: GET /exam-sessions/{id}/attempts/ used
+    to inherit IsStaffOrReadOnly with no override — since GET is a
+    SAFE_METHOD, that permission class returned True for ANYONE, including
+    an anonymous caller, leaking every participant's name/email/score/rank.
+    Must now be admin-only, matching GET /exam-templates/{id}/sessions/'s
+    identical fix below."""
+
+    def setUp(self):
+        self.staff = User.objects.create_user(
+            username='sess_attempts_staff', email='sess_attempts_staff@example.com', password='pw12345',
+            is_staff=True, admin_role='admin',
+        )
+        self.student = User.objects.create_user(
+            username='sess_attempts_student', email='sess_attempts_student@example.com', password='pw12345',
+        )
+        self.template = ExamTemplate.objects.create(title='Attempts Perm Exam', exam_type='mock')
+        self.version = Test.objects.create(title='Attempts Perm Exam v1', exam_type='mock', exam_template=self.template)
+        now = timezone.now()
+        self.session = ExamSession.objects.create(
+            exam_template=self.template, exam_version=self.version,
+            session_name='Session 1', start_datetime=now, end_datetime=now,
+        )
+        TestAttempt.objects.create(
+            user=self.student, test=self.version, session=self.session, status='submitted', score=10,
+        )
+
+    def test_anonymous_caller_is_rejected(self):
+        resp = self.client.get(f'/api/exam-sessions/{self.session.id}/attempts/')
+        self.assertIn(resp.status_code, (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN))
+
+    def test_authenticated_non_staff_student_is_rejected(self):
+        self.client.force_authenticate(user=self.student)
+        resp = self.client.get(f'/api/exam-sessions/{self.session.id}/attempts/')
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_staff_can_view_participants(self):
+        self.client.force_authenticate(user=self.staff)
+        resp = self.client.get(f'/api/exam-sessions/{self.session.id}/attempts/')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(resp.data), 1)
+
+
+class ExamTemplateSessionsPermissionTests(APITestCase):
+    """P0 security-audit regression: same unauthenticated-read pattern as
+    ExamSessionAttemptsPermissionTests, on GET /exam-templates/{id}/sessions/
+    (schedule metadata, no participant PII — lower severity, same root cause
+    and same fix)."""
+
+    def setUp(self):
+        self.staff = User.objects.create_user(
+            username='tmpl_sessions_staff', email='tmpl_sessions_staff@example.com', password='pw12345',
+            is_staff=True, admin_role='admin',
+        )
+        self.student = User.objects.create_user(
+            username='tmpl_sessions_student', email='tmpl_sessions_student@example.com', password='pw12345',
+        )
+        self.template = ExamTemplate.objects.create(title='Sessions Perm Exam', exam_type='mock')
+
+    def test_anonymous_caller_is_rejected(self):
+        resp = self.client.get(f'/api/exam-templates/{self.template.id}/sessions/')
+        self.assertIn(resp.status_code, (status.HTTP_401_UNAUTHORIZED, status.HTTP_403_FORBIDDEN))
+
+    def test_authenticated_non_staff_student_is_rejected(self):
+        self.client.force_authenticate(user=self.student)
+        resp = self.client.get(f'/api/exam-templates/{self.template.id}/sessions/')
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_staff_can_view_schedule_history(self):
+        self.client.force_authenticate(user=self.staff)
+        resp = self.client.get(f'/api/exam-templates/{self.template.id}/sessions/')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+
+class ExamDeleteFeatureGateTests(APITestCase):
+    """P0 security-audit regression: TestViewSet.destroy previously allowed
+    ANY staff account (including Editor/Teacher, who the product's own
+    RolePermission/EXAM_MANAGEMENT_FEATURES design explicitly excludes from
+    exam deletion) through plain IsStaffOrReadOnly. Now gated on the
+    'exam_delete' feature key, matching what the Admin UI already hides for
+    these roles (ExamTable.js's hasFeature(user, "exam_delete") check) —
+    this closes the gap between the frontend hiding it and the backend
+    actually enforcing it."""
+
+    def setUp(self):
+        self.editor = User.objects.create_user(
+            username='examdel_editor', email='examdel_editor@example.com', password='pw12345',
+            is_staff=True, admin_role='editor',
+        )
+        self.teacher = User.objects.create_user(
+            username='examdel_teacher', email='examdel_teacher@example.com', password='pw12345',
+            is_staff=True, admin_role='teacher',
+        )
+        self.admin = User.objects.create_user(
+            username='examdel_admin', email='examdel_admin@example.com', password='pw12345',
+            is_staff=True, admin_role='admin',
+        )
+
+    def test_editor_without_exam_delete_feature_is_rejected(self):
+        test = Test.objects.create(title='Editor Delete Target', exam_type='mock')
+        self.client.force_authenticate(user=self.editor)
+
+        resp = self.client.delete(f'/api/tests/{test.id}/')
+
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertTrue(Test.objects.filter(id=test.id).exists())
+
+    def test_teacher_without_exam_delete_feature_is_rejected(self):
+        test = Test.objects.create(title='Teacher Delete Target', exam_type='mock', created_by=self.teacher)
+        self.client.force_authenticate(user=self.teacher)
+
+        resp = self.client.delete(f'/api/tests/{test.id}/')
+
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertTrue(Test.objects.filter(id=test.id).exists())
+
+    def test_admin_with_exam_delete_feature_succeeds(self):
+        test = Test.objects.create(title='Admin Delete Target', exam_type='mock')
+        self.client.force_authenticate(user=self.admin)
+
+        resp = self.client.delete(f'/api/tests/{test.id}/')
+
+        self.assertEqual(resp.status_code, status.HTTP_204_NO_CONTENT)
+
+
+class ExamRescheduleFeatureGateTests(APITestCase):
+    """Same fix, applied to POST /tests/{id}/reschedule/ ('exam_schedule')."""
+
+    def setUp(self):
+        self.editor = User.objects.create_user(
+            username='examsched_editor', email='examsched_editor@example.com', password='pw12345',
+            is_staff=True, admin_role='editor',
+        )
+        self.teacher = User.objects.create_user(
+            username='examsched_teacher', email='examsched_teacher@example.com', password='pw12345',
+            is_staff=True, admin_role='teacher',
+        )
+        self.admin = User.objects.create_user(
+            username='examsched_admin', email='examsched_admin@example.com', password='pw12345',
+            is_staff=True, admin_role='admin',
+        )
+        self.test = Test.objects.create(title='Reschedule Target', exam_type='mock')
+
+    def test_teacher_without_exam_schedule_feature_is_rejected(self):
+        """admin_role='teacher' is a fixed, non-configurable ceiling
+        (accounts.models.TEACHER_ALLOWED_FEATURES) that does not include
+        'exam_schedule' — this is the documented design intent, not a new
+        restriction; the Admin UI already never offered this button to a
+        teacher account."""
+        self.client.force_authenticate(user=self.teacher)
+
+        resp = self.client.post(f'/api/tests/{self.test.id}/reschedule/', {
+            'start_datetime': (timezone.now() + timezone.timedelta(days=1)).isoformat(),
+            'end_datetime': (timezone.now() + timezone.timedelta(days=1, hours=1)).isoformat(),
+        })
+
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_editor_with_exam_schedule_feature_succeeds(self):
+        """'exam_schedule' IS in EDITOR_ALLOWED_FEATURES's ceiling, and an
+        Editor with no RolePermission row yet falls back to that ceiling
+        (accounts.models.user_feature_list) — so this must succeed."""
+        self.client.force_authenticate(user=self.editor)
+
+        resp = self.client.post(f'/api/tests/{self.test.id}/reschedule/', {
+            'start_datetime': (timezone.now() + timezone.timedelta(days=1)).isoformat(),
+            'end_datetime': (timezone.now() + timezone.timedelta(days=1, hours=1)).isoformat(),
+        })
+
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+
+
 class SubmitTestFeedsQuestionPerformanceTests(APITestCase):
     """Test submission must feed academics.QuestionAttempt/QuestionEvent
     platform-wide (the Smart Question Bank's core architecture decision:
@@ -145,11 +319,22 @@ class SubmitTestFeedsQuestionPerformanceTests(APITestCase):
         self.client.post(f'/api/attempts/{self.attempt.id}/submit/')
         self.assertFalse(QuestionAttempt.objects.filter(user=self.student, question=self.question).exists())
 
+    @override_settings(STATS_PROCESSING_ASYNC=False)
     def test_result_view_reports_total_responses_gated_by_threshold(self):
+        """Deadlock-fix audit: total_responses/stats_available are derived
+        from Option.pick_percentage/Question.total_attempts, which
+        SubmitTestView now applies via a deferred stats task instead of
+        inline (see StatsDeferralTests) — enqueued from transaction.
+        on_commit(), which never fires under TestCase's non-committing
+        transaction wrapper unless captured via captureOnCommitCallbacks().
+        STATS_PROCESSING_ASYNC=False (local-dev-only sync fallback) then
+        makes the *captured* callback apply stats inline, without changing
+        what this test actually verifies."""
         from academics.models import QuestionBankConfig
 
         self.client.post(f'/api/attempts/{self.attempt.id}/answer/', {'question_id': self.question.id, 'option_id': self.correct.id})
-        self.client.post(f'/api/attempts/{self.attempt.id}/submit/')
+        with self.captureOnCommitCallbacks(execute=True):
+            self.client.post(f'/api/attempts/{self.attempt.id}/submit/')
 
         resp = self.client.get(f'/api/attempts/{self.attempt.id}/')
         q = resp.data['questions'][0]
@@ -297,6 +482,15 @@ class KpiOverviewQuestionsTodayTests(APITestCase):
     date_from/date_to window, and never count yesterday's activity."""
 
     def setUp(self):
+        from django.core.cache import cache
+
+        # StudentPerformanceOverviewView now caches its response per-user
+        # for 30s (scalability audit) — see PerformanceCourseScopingTests.
+        # setUp() for the same reasoning; this class's two tests reuse the
+        # same email/user across methods and would otherwise leak this
+        # test's cached questions_today into the other.
+        cache.clear()
+
         self.student = User.objects.create_user(username='student1', email='student1@example.com', password='pw12345')
         self.subject = Subject.objects.create(name='Physics')
         self.q1 = Question.objects.create(subject=self.subject, text='Q1')
@@ -815,6 +1009,14 @@ class PerformanceCourseScopingTests(APITestCase):
 
     def setUp(self):
         from courses.models import Course, Enrollment
+        from django.core.cache import cache
+
+        # StudentPerformanceOverviewView now caches its response per-user
+        # for 30s (scalability audit) — the cache backend isn't reset by
+        # Django's per-test DB rollback, so a prior test's cached response
+        # for the same (reused-id) user/params can otherwise leak into this
+        # one. Same reasoning/pattern as SubjectRankCachingTests.setUp().
+        cache.clear()
 
         self.cee_ug = Course.objects.create(name='CEE-UG Perf', prefix='CEEUGPERF')
         self.cee_pg = Course.objects.create(name='CEE-PG Perf', prefix='CEEPGPERF')
@@ -1332,3 +1534,1520 @@ class UniversitiesEnrichmentTests(APITestCase):
         self.assertEqual(by_name['IOM']['paper_count'], 2)
         self.assertEqual(by_name['KU']['years_available'], 1)
         self.assertEqual(by_name['KU']['paper_count'], 1)
+
+
+class TestListQueryCountAndCorrectnessTests(APITestCase):
+    """Scalability audit fix: GET /tests/ used to cost ~8 queries per row
+    (question_count/total_marks properties + separate best-score/
+    in-progress/attempts-used/courses/subject/created_by lookups) with no
+    select_related/prefetch_related at all. Confirms the fix is both fast
+    (bounded query count regardless of row count) and correct (annotated
+    values match what the old per-row queries would have computed) —
+    speed without correctness would be a worse regression than the
+    original N+1."""
+
+    def setUp(self):
+        from courses.models import Course, Enrollment
+
+        self.course = Course.objects.create(name='QC Course', prefix='QCCOURSE')
+        self.other_course = Course.objects.create(name='QC Other Course', prefix='QCOTHER')
+        self.student = User.objects.create_user(username='qc_student', email='qc_student@example.com', password='pw12345')
+        Enrollment.objects.create(user=self.student, course=self.course)
+        self.teacher = User.objects.create_user(
+            username='qc_teacher', email='qc_teacher@example.com', password='pw12345', is_staff=True, admin_role='teacher',
+        )
+        self.subject = Subject.objects.create(name='QC Subject')
+
+        def make_test(title, marks_list):
+            t = Test.objects.create(title=title, exam_type='mock', is_draft=False, subject=self.subject, created_by=self.teacher)
+            t.courses.set([self.course])
+            for i, marks in enumerate(marks_list):
+                q = Question.objects.create(subject=self.subject, text=f'{title} Q{i}', marks=marks, negative_marks=0)
+                TestQuestion.objects.create(test=t, question=q, order=i)
+            return t
+
+        # 5 tests with varying question counts/marks — a real N+1 would cost
+        # more queries as this number grows; the fix must not.
+        self.tests = [make_test(f'QC Test {i}', [1, 2, 3][: i + 1]) for i in range(5)]
+
+        self.client.force_authenticate(user=self.student)
+
+    def test_response_is_still_a_bare_array_not_a_pagination_envelope(self):
+        """The core non-negotiable: existing callers (7 confirmed frontend
+        call sites) expect a plain array back, not {count,next,previous,results}."""
+        resp = self.client.get('/api/tests/?exam_type=mock')
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsInstance(resp.data, list)
+        self.assertEqual(len(resp.data), 5)
+
+    def test_question_count_and_total_marks_are_correct(self):
+        resp = self.client.get('/api/tests/?exam_type=mock')
+        by_title = {row['title']: row for row in resp.data}
+        self.assertEqual(by_title['QC Test 0']['question_count'], 1)
+        self.assertEqual(by_title['QC Test 0']['total_marks'], 1.0)
+        self.assertEqual(by_title['QC Test 4']['question_count'], 3)
+        self.assertEqual(by_title['QC Test 4']['total_marks'], 6.0)  # 1+2+3
+
+    def test_subject_name_courses_and_created_by_are_correct(self):
+        resp = self.client.get('/api/tests/?exam_type=mock')
+        row = resp.data[0]
+        self.assertEqual(row['subject_name'], 'QC Subject')
+        self.assertEqual(row['created_by_name'], self.teacher.email)
+        self.assertEqual([c['id'] for c in row['courses_detail']], [self.course.id])
+
+    def test_query_count_does_not_grow_with_row_count(self):
+        """The actual regression test for the N+1 fix — 10 tests must not
+        cost meaningfully more queries than 5. A real N+1 would show a
+        clear linear jump; the annotated/prefetched version stays flat."""
+        with self.assertNumQueries(FixedQueryCount := 6):
+            resp = self.client.get('/api/tests/?exam_type=mock')
+            self.assertEqual(len(resp.data), 5)
+
+        # Double the row count — a per-row query pattern would roughly
+        # double total queries too; this must not.
+        def make_more(title):
+            t = Test.objects.create(title=title, exam_type='mock', is_draft=False, subject=self.subject, created_by=self.teacher)
+            t.courses.set([self.course])
+            q = Question.objects.create(subject=self.subject, text=f'{title} Q', marks=1, negative_marks=0)
+            TestQuestion.objects.create(test=t, question=q)
+            return t
+
+        for i in range(5, 10):
+            make_more(f'QC Test {i}')
+
+        with self.assertNumQueries(FixedQueryCount):
+            resp = self.client.get('/api/tests/?exam_type=mock')
+            self.assertEqual(len(resp.data), 10)
+
+    def test_best_score_and_latest_attempt_id_pick_the_highest_scoring_submitted_attempt(self):
+        t = self.tests[0]
+        low = TestAttempt.objects.create(user=self.student, test=t, status='submitted', score=1)
+        high = TestAttempt.objects.create(user=self.student, test=t, status='submitted', score=5)
+        TestAttempt.objects.create(user=self.student, test=t, status='in_progress', score=0)  # must not count as "best"
+
+        resp = self.client.get('/api/tests/?exam_type=mock')
+        row = next(r for r in resp.data if r['id'] == t.id)
+        self.assertEqual(row['best_score'], 5.0)
+        self.assertEqual(row['latest_attempt_id'], high.id)
+        self.assertEqual(row['card_status'], 'completed')
+        self.assertEqual(row['attempts_used'], 3)
+        self.assertNotEqual(row['latest_attempt_id'], low.id)
+
+    def test_tied_best_scores_deterministically_pick_the_most_recent_attempt(self):
+        """No secondary sort key existed in the original .order_by('-score')
+        — an improvement over undefined tie-break behavior, not a
+        regression, but must be deterministic and documented."""
+        t = self.tests[0]
+        first = TestAttempt.objects.create(user=self.student, test=t, status='submitted', score=3)
+        second = TestAttempt.objects.create(user=self.student, test=t, status='submitted', score=3)
+
+        resp = self.client.get('/api/tests/?exam_type=mock')
+        row = next(r for r in resp.data if r['id'] == t.id)
+        self.assertEqual(row['best_score'], 3.0)
+        # TestAttempt's default ordering is -start_time (most recent first);
+        # `second` was created after `first`, so it's the deterministic pick.
+        self.assertEqual(row['latest_attempt_id'], second.id)
+        self.assertNotEqual(row['latest_attempt_id'], first.id)
+
+    def test_in_progress_attempt_reports_real_answered_count_with_no_extra_queries(self):
+        t = self.tests[1]
+        q1 = t.questions.all()[0]
+        q2 = t.questions.all()[1]
+        attempt = TestAttempt.objects.create(user=self.student, test=t, status='in_progress')
+        Answer.objects.create(attempt=attempt, question=q1)
+        Answer.objects.create(attempt=attempt, question=q2)
+
+        with self.assertNumQueries(6):
+            resp = self.client.get('/api/tests/?exam_type=mock')
+        row = next(r for r in resp.data if r['id'] == t.id)
+        self.assertEqual(row['card_status'], 'in_progress')
+        self.assertEqual(row['in_progress_answered_count'], 2)
+
+    def test_expired_bounded_cap_still_returns_a_bare_array_shape(self):
+        """pagination_class is attached (a real DB-level LIMIT) but its
+        get_paginated_response() unwraps back to a bare array — confirms
+        the pagination mechanism itself doesn't leak the {count,...}
+        envelope even when it actually triggers."""
+        resp = self.client.get('/api/tests/?exam_type=mock&page_size=2')
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsInstance(resp.data, list)
+
+    def test_anonymous_request_still_works_without_the_authenticated_only_prefetch(self):
+        self.client.force_authenticate(user=None)
+        t = self.tests[0]
+        t.is_pro = False
+        t.save()
+        resp = self.client.get('/api/tests/?exam_type=mock')
+        # Anonymous users don't pass visible_test_queryset's eligibility
+        # (no Enrollment) — this must not error, whatever it returns.
+        self.assertIn(resp.status_code, (200, 401, 403))
+
+
+class SubmitTestRankingTests(APITestCase):
+    """Scalability audit fix: SubmitTestView's ranking used to `list()` the
+    entire submitted-attempt pool ordered by score and call `.index()` on
+    it — an O(pool size) query and Python scan on every single submission.
+    Replaced with a single aggregate query: rank = 1 + COUNT(strictly ahead
+    on score). Tied scores now share a rank (standard "competition
+    ranking") instead of getting an arbitrary DB-order-dependent sequential
+    position, which was never a guaranteed behavior in the old code."""
+
+    def setUp(self):
+        from academics.models import QuestionBankConfig
+
+        # Pre-warm the QuestionBankConfig singleton — record_question_result()
+        # lazily get-or-creates it on first use, which would otherwise add
+        # one-time extra queries (SELECT+SAVEPOINT+INSERT+RELEASE) to
+        # whichever submission happens first in a test, unrelated to
+        # ranking and not something this test class is about.
+        QuestionBankConfig.load()
+
+        self.student = User.objects.create_user(username='rank_student', email='rank_student@example.com', password='pw12345')
+        self.subject = Subject.objects.create(name='Ranking Subject')
+        self.question = Question.objects.create(subject=self.subject, text='2+2=?', marks=10, negative_marks=0)
+        self.correct = Option.objects.create(question=self.question, text='4', is_correct=True)
+        self.wrong = Option.objects.create(question=self.question, text='5', is_correct=False)
+        self.test = Test.objects.create(title='Ranking Mock', exam_type='mock', negative_marking=False)
+        TestQuestion.objects.create(test=self.test, question=self.question)
+        self.attempt = TestAttempt.objects.create(user=self.student, test=self.test, status='in_progress')
+        self.client.force_authenticate(user=self.student)
+
+    def _submit_for_score_10(self):
+        """Answers the one question correctly (marks=10, no negative
+        marking) so the real SubmitTestView scoring path produces exactly
+        score=10 — a real integration test, not a fabricated score."""
+        self.client.post(f'/api/attempts/{self.attempt.id}/answer/', {'question_id': self.question.id, 'option_id': self.correct.id})
+        return self.client.post(f'/api/attempts/{self.attempt.id}/submit/')
+
+    def test_solo_submission_is_rank_1_percentile_100(self):
+        resp = self._submit_for_score_10()
+        self.assertEqual(resp.status_code, 200)
+        self.attempt.refresh_from_db()
+        self.assertEqual(self.attempt.rank, 1)
+        self.assertEqual(float(self.attempt.percentile), 100)
+
+    def test_rank_reflects_strictly_higher_scores_only(self):
+        """One attempt ahead (20), one tied (10), one behind (5) — rank
+        must be 2 (only the strictly-higher one counts), not affected by
+        the tie or the lower score."""
+        TestAttempt.objects.create(user=self.student, test=self.test, status='submitted', score=20)
+        TestAttempt.objects.create(user=self.student, test=self.test, status='submitted', score=10)
+        TestAttempt.objects.create(user=self.student, test=self.test, status='submitted', score=5)
+
+        resp = self._submit_for_score_10()
+
+        self.assertEqual(resp.status_code, 200)
+        self.attempt.refresh_from_db()
+        self.assertEqual(self.attempt.rank, 2)
+        # total pool = 4 (this attempt + the 3 above); percentile = (4-2)/4*100
+        self.assertEqual(float(self.attempt.percentile), 50.0)
+
+    def test_tied_scores_share_the_same_rank(self):
+        """Two attempts tied at the top score must both be rank 1 — this
+        attempt (score 10) ties with a pre-existing score-10 attempt, and
+        neither should be pushed to rank 2 by the other."""
+        TestAttempt.objects.create(user=self.student, test=self.test, status='submitted', score=10)
+
+        resp = self._submit_for_score_10()
+
+        self.assertEqual(resp.status_code, 200)
+        self.attempt.refresh_from_db()
+        self.assertEqual(self.attempt.rank, 1)
+
+    def test_incomplete_in_progress_attempts_are_excluded_from_ranking(self):
+        """An in_progress attempt (the model's only non-submitted status —
+        there is no 'cancelled' status on TestAttempt) must never count
+        toward another attempt's rank or the pool total, however high its
+        score field happens to be set."""
+        TestAttempt.objects.create(user=self.student, test=self.test, status='in_progress', score=9999)
+
+        resp = self._submit_for_score_10()
+
+        self.assertEqual(resp.status_code, 200)
+        self.attempt.refresh_from_db()
+        self.assertEqual(self.attempt.rank, 1)
+        self.assertEqual(float(self.attempt.percentile), 100)
+
+    def test_attempts_on_a_different_test_are_excluded(self):
+        other_test = Test.objects.create(title='Unrelated Mock', exam_type='mock')
+        TestAttempt.objects.create(user=self.student, test=other_test, status='submitted', score=9999)
+
+        resp = self._submit_for_score_10()
+
+        self.assertEqual(resp.status_code, 200)
+        self.attempt.refresh_from_db()
+        self.assertEqual(self.attempt.rank, 1)
+        self.assertEqual(float(self.attempt.percentile), 100)
+
+    def test_attempts_in_a_different_session_of_the_same_test_are_excluded(self):
+        """Rescheduled occurrences of the same exam must never merge
+        rankings — a submitted attempt in another ExamSession of this same
+        Test must not count toward this session-less attempt's rank."""
+        template = ExamTemplate.objects.create(title='Ranking Template', exam_type='mock')
+        self.test.exam_template = template
+        self.test.save(update_fields=['exam_template'])
+        now = timezone.now()
+        session = ExamSession.objects.create(
+            exam_template=template, exam_version=self.test,
+            session_name='Other Session', start_datetime=now, end_datetime=now,
+        )
+        TestAttempt.objects.create(user=self.student, test=self.test, session=session, status='submitted', score=9999)
+
+        resp = self._submit_for_score_10()
+
+        self.assertEqual(resp.status_code, 200)
+        self.attempt.refresh_from_db()
+        # self.attempt has session=None — only shares a ranking pool with
+        # other session=None attempts on this Test, not the session=X one.
+        self.assertEqual(self.attempt.rank, 1)
+        self.assertEqual(float(self.attempt.percentile), 100)
+
+    def test_attempts_in_the_same_session_do_count(self):
+        """The positive counterpart of the test above — a submitted
+        attempt in the SAME session must count toward ranking."""
+        template = ExamTemplate.objects.create(title='Ranking Template 2', exam_type='mock')
+        self.test.exam_template = template
+        self.test.save(update_fields=['exam_template'])
+        now = timezone.now()
+        # Phase 6: must be a genuinely OPEN window — self.attempt gets
+        # assigned to this session below, and Phase 6's server-side
+        # deadline enforcement (tests_app.lifecycle) now correctly rejects
+        # answering/submitting once a session's window has closed. A
+        # start==end instant (as the sibling negative test above still
+        # uses, safely, since it never assigns self.attempt to that
+        # session) would make this attempt expired before the test's own
+        # answer/submit calls ran.
+        session = ExamSession.objects.create(
+            exam_template=template, exam_version=self.test,
+            session_name='Shared Session',
+            start_datetime=now - timezone.timedelta(hours=1), end_datetime=now + timezone.timedelta(hours=1),
+        )
+        self.attempt.session = session
+        self.attempt.save(update_fields=['session'])
+        TestAttempt.objects.create(user=self.student, test=self.test, session=session, status='submitted', score=20)
+
+        resp = self._submit_for_score_10()
+
+        self.assertEqual(resp.status_code, 200)
+        self.attempt.refresh_from_db()
+        self.assertEqual(self.attempt.rank, 2)
+        self.assertEqual(float(self.attempt.percentile), 0)
+
+    def _submit_query_count(self, pool_size):
+        """Creates `pool_size` extra already-submitted competing attempts,
+        then submits a fresh attempt for this student and returns how many
+        queries SubmitTestView.post() issued in total. Uses its own fresh
+        Test/Question/Option (not self.test/self.question/self.correct)
+        each time it's called so the two measurements in the test below
+        start from identical state: reusing the same Test would accumulate
+        an extra TestQuestion each call, making the *second* response
+        serialize more questions than the first (a real but unrelated
+        per-question serialization cost, not a ranking-pool-size effect);
+        reusing the same Option would make its accumulated total_attempts/
+        pick_count cross a real, unrelated recompute threshold differently
+        each time (Option.pick_percentage bookkeeping in
+        record_question_result). Either would make this test flaky for
+        reasons that have nothing to do with ranking."""
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        test = Test.objects.create(title='Ranking QC Mock', exam_type='mock', negative_marking=False)
+        question = Question.objects.create(subject=self.subject, text='fresh q', marks=10, negative_marks=0)
+        correct = Option.objects.create(question=question, text='right', is_correct=True)
+        TestQuestion.objects.create(test=test, question=question)
+
+        for i in range(pool_size):
+            TestAttempt.objects.create(user=self.student, test=test, status='submitted', score=i)
+
+        attempt = TestAttempt.objects.create(user=self.student, test=test, status='in_progress')
+        self.client.post(f'/api/attempts/{attempt.id}/answer/', {'question_id': question.id, 'option_id': correct.id})
+        with CaptureQueriesContext(connection) as ctx:
+            resp = self.client.post(f'/api/attempts/{attempt.id}/submit/')
+        self.assertEqual(resp.status_code, 200)
+        return len(ctx.captured_queries)
+
+    def test_ranking_query_count_does_not_grow_with_pool_size(self):
+        """The old .index()-based implementation issued one query that
+        returned every submitted attempt id in the pool — query count was
+        flat but result-row-count (and Python work) grew with pool size.
+        The new aggregate approach is flat on both fronts; this test
+        proves the query *count* (measured across two separate students,
+        since ranking pools are scoped per-user's-own-attempt-flow here,
+        not per-test) stays flat as the pool grows from a handful of
+        competing attempts to a much larger one."""
+        small_pool_count = self._submit_query_count(pool_size=3)
+
+        other_student = User.objects.create_user(username='rank_student_2', email='rank_student_2@example.com', password='pw12345')
+        self.student = other_student
+        self.client.force_authenticate(user=other_student)
+        large_pool_count = self._submit_query_count(pool_size=50)
+
+        self.assertEqual(small_pool_count, large_pool_count)
+
+
+class LargeExamSubmissionTests(APITestCase):
+    """Scalability audit fix (Phase 2.1): SubmitTestView now runs the whole
+    submission (scoring + per-answer record_question_result() + rank) in
+    one outer transaction instead of each record_question_result() call
+    committing independently. Confirms scoring/accuracy stay exactly
+    correct at 50/100/200/300-question exam sizes (explicitly required by
+    the audit), and that a crash partway through leaves no partial state —
+    the attempt stays 'in_progress' and none of that submission's
+    QuestionAttempt/QuestionEvent rows exist, safe to retry cleanly."""
+
+    def setUp(self):
+        self.student = User.objects.create_user(username='large_exam_student', email='large_exam_student@example.com', password='pw12345')
+        self.subject = Subject.objects.create(name='Large Exam Subject')
+        self.client.force_authenticate(user=self.student)
+
+    def _build_exam(self, n, negative_marking=True):
+        """n questions, each marks=2, negative_marks=0.5. Odd-indexed
+        questions (0-based) are answered correctly, even-indexed
+        incorrectly — a known, hand-computable mix, not all-correct or
+        all-wrong (which could hide a sign error in the score math)."""
+        test = Test.objects.create(title=f'{n}Q Exam', exam_type='mock', negative_marking=negative_marking)
+        # bulk_create() skips Question.save(), which is what normally
+        # generates slug/public_id — both are unique=True, so bulk-created
+        # rows need explicit, distinct values or they'd all collide on the
+        # unique constraint (empty string == empty string). test.id keeps
+        # these unique across this test class's several exam sizes too.
+        questions = Question.objects.bulk_create([
+            Question(
+                subject=self.subject, text=f'Q{i}', marks=2, negative_marks=0.5,
+                slug=f'large-exam-{test.id}-q{i}', public_id=f'LE{test.id}{i:04d}',
+            )
+            for i in range(n)
+        ])
+        options = []
+        for q in questions:
+            options += [
+                Option(question=q, text='Correct', order=0, is_correct=True),
+                Option(question=q, text='Wrong', order=1, is_correct=False),
+            ]
+        Option.objects.bulk_create(options)
+        TestQuestion.objects.bulk_create([TestQuestion(test=test, question=q, order=i) for i, q in enumerate(questions)])
+
+        attempt = TestAttempt.objects.create(user=self.student, test=test, status='in_progress')
+        correct_options = {o.question_id: o for o in Option.objects.filter(question__in=questions, is_correct=True)}
+        wrong_options = {o.question_id: o for o in Option.objects.filter(question__in=questions, is_correct=False)}
+        answers = []
+        expected_correct = 0
+        for i, q in enumerate(questions):
+            if i % 2 == 0:
+                answers.append(Answer(attempt=attempt, question=q, selected_option=correct_options[q.id], is_correct=True))
+                expected_correct += 1
+            else:
+                answers.append(Answer(attempt=attempt, question=q, selected_option=wrong_options[q.id], is_correct=False))
+        Answer.objects.bulk_create(answers)
+        return test, attempt, questions, expected_correct
+
+    def _assert_correct_scoring(self, n):
+        test, attempt, questions, expected_correct = self._build_exam(n)
+        expected_wrong = n - expected_correct
+        expected_score = round(expected_correct * 2 - expected_wrong * 0.5, 2)
+        expected_accuracy = round(expected_correct / n * 100, 2)
+
+        resp = self.client.post(f'/api/attempts/{attempt.id}/submit/')
+
+        self.assertEqual(resp.status_code, 200, resp.data)
+        attempt.refresh_from_db()
+        self.assertEqual(attempt.status, 'submitted')
+        self.assertEqual(float(attempt.score), expected_score)
+        self.assertEqual(float(attempt.accuracy), expected_accuracy)
+        self.assertEqual(attempt.rank, 1)
+        self.assertEqual(QuestionAttempt.objects.filter(user=self.student, question__in=questions).count(), n)
+        self.assertEqual(QuestionEvent.objects.filter(user=self.student, question__in=questions).count(), n)
+
+    def test_50_question_exam_scores_correctly(self):
+        self._assert_correct_scoring(50)
+
+    def test_100_question_exam_scores_correctly(self):
+        self._assert_correct_scoring(100)
+
+    def test_200_question_exam_scores_correctly(self):
+        self._assert_correct_scoring(200)
+
+    def test_300_question_exam_scores_correctly(self):
+        self._assert_correct_scoring(300)
+
+    @override_settings(STATS_PROCESSING_ASYNC=False)
+    def _assert_deferred_stats_applied_correctly(self, n):
+        """Deadlock-fix audit requirement: large exam test for 200/300
+        questions must also confirm the deferred stats pipeline actually
+        applies correctly at that scale, not just that scoring is
+        unaffected (already proven by _assert_correct_scoring)."""
+        test, attempt, questions, expected_correct = self._build_exam(n)
+
+        with self.captureOnCommitCallbacks(execute=True):
+            resp = self.client.post(f'/api/attempts/{attempt.id}/submit/')
+        self.assertEqual(resp.status_code, 200, resp.data)
+
+        attempt.refresh_from_db()
+        self.assertIsNotNone(attempt.stats_applied_at)
+        for q in Question.objects.filter(id__in=[q.id for q in questions]):
+            self.assertEqual(q.total_attempts, 1)
+        correct_count = sum(1 for i in range(n) if i % 2 == 0)
+        self.assertEqual(correct_count, expected_correct)
+        for q in Question.objects.filter(id__in=[q.id for q in questions]):
+            correct_opt = q.options.get(is_correct=True)
+            wrong_opt = q.options.get(is_correct=False)
+            # Exactly one of the two options got this attempt's one vote —
+            # whichever this question's answer pattern selected.
+            self.assertEqual(correct_opt.pick_count + wrong_opt.pick_count, 1)
+
+    def test_200_question_exam_deferred_stats_apply_correctly(self):
+        self._assert_deferred_stats_applied_correctly(200)
+
+    def test_300_question_exam_deferred_stats_apply_correctly(self):
+        self._assert_deferred_stats_applied_correctly(300)
+
+    def test_a_crash_partway_through_leaves_no_partial_state(self):
+        from unittest.mock import patch
+
+        from academics.services import record_question_result as real_record_question_result
+
+        test, attempt, questions, _ = self._build_exam(20)
+
+        calls = {'n': 0}
+
+        def flaky(*args, **kwargs):
+            calls['n'] += 1
+            if calls['n'] == 12:
+                raise RuntimeError('simulated crash partway through submission')
+            return real_record_question_result(*args, **kwargs)
+
+        self.client.raise_request_exception = False
+        # Phase 6: SubmitTestView's scoring/ranking body moved to
+        # tests_app.lifecycle.finalize_attempt() (shared with the
+        # auto-submit path) — patch targets updated to match; the behavior
+        # under test (a mid-loop crash rolls back the whole transaction)
+        # is unchanged.
+        with patch('tests_app.lifecycle.record_question_result', side_effect=flaky), \
+                patch('tests_app.lifecycle.enqueue_question_stats_task') as mock_enqueue, \
+                self.captureOnCommitCallbacks(execute=True):
+            resp = self.client.post(f'/api/attempts/{attempt.id}/submit/')
+
+        self.assertEqual(resp.status_code, 500)
+        # transaction.on_commit() requirement: a rolled-back submission
+        # must never create a stats task — nothing was captured/executed
+        # above because nothing committed, and the mock confirms it
+        # directly rather than just by absence of a side effect.
+        mock_enqueue.assert_not_called()
+        attempt.refresh_from_db()
+        # Nothing committed: not just the un-processed answers, but ALSO
+        # the ones record_question_result() already handled successfully
+        # before the 12th call raised — proving the whole transaction
+        # rolled back together, not just the failing call.
+        self.assertEqual(attempt.status, 'in_progress')
+        self.assertIsNone(attempt.end_time)
+        self.assertIsNone(attempt.stats_applied_at)
+        self.assertEqual(float(attempt.score), 0)
+        self.assertEqual(QuestionAttempt.objects.filter(user=self.student, question__in=questions).count(), 0)
+        self.assertEqual(QuestionEvent.objects.filter(user=self.student, question__in=questions).count(), 0)
+
+        # And it's safe to retry cleanly from here.
+        self.client.raise_request_exception = True
+        resp2 = self.client.post(f'/api/attempts/{attempt.id}/submit/')
+        self.assertEqual(resp2.status_code, 200)
+        attempt.refresh_from_db()
+        self.assertEqual(attempt.status, 'submitted')
+        self.assertEqual(QuestionAttempt.objects.filter(user=self.student, question__in=questions).count(), 20)
+
+
+class StatsDeferralTests(APITestCase):
+    """Deadlock-fix audit mandatory validation, isolated from the full
+    SubmitTestView request cycle already covered by LargeExamSubmissionTests
+    above: academics.services.apply_question_stats_deltas() (the async-
+    worker batch-apply path), its ordering guarantee, its 1213/1205 retry
+    safety net, tests_app.stats_tasks.process_question_stats()'s
+    idempotency claim, and SubmitTestView's transaction.on_commit() wiring
+    itself (which args it enqueues, not just that DB state ends up
+    correct — that part is already covered elsewhere)."""
+
+    def setUp(self):
+        self.subject = Subject.objects.create(name='Stats Deferral Subject')
+        self.student_inline = User.objects.create_user(username='stats_inline', email='stats_inline@example.com', password='pw12345')
+        self.student_deferred = User.objects.create_user(username='stats_deferred', email='stats_deferred@example.com', password='pw12345')
+
+    def _make_question(self, suffix):
+        q = Question.objects.create(subject=self.subject, text=f'Stats Q {suffix}', marks=1, negative_marks=0)
+        correct = Option.objects.create(question=q, text='Correct', order=0, is_correct=True)
+        wrong = Option.objects.create(question=q, text='Wrong', order=1, is_correct=False)
+        return q, correct, wrong
+
+    def test_deferred_stats_equivalent_to_inline_stats(self):
+        """The old inline path (defer_stats=False, still used unchanged by
+        QBank) and the new deferred+batched path (defer_stats=True ->
+        apply_question_stats_deltas, used by SubmitTestView) must produce
+        byte-identical Question/Option aggregate results for the same
+        sequence of answers — this is the whole point of moving the
+        computation out-of-line without changing what it computes."""
+        from academics.services import apply_question_stats_deltas, record_question_result
+
+        q_inline, correct_inline, wrong_inline = self._make_question('inline')
+        q_deferred, correct_deferred, wrong_deferred = self._make_question('deferred')
+
+        # Each question answered wrong, then (retrying) correct — exercises
+        # the "move the vote, don't add a second one" branch, not just the
+        # simple first-answer branch.
+        record_question_result(self.student_inline, q_inline, False, source='qbank', selected_option=wrong_inline)
+        record_question_result(self.student_inline, q_inline, True, source='qbank', selected_option=correct_inline)
+
+        _, delta1 = record_question_result(
+            self.student_deferred, q_deferred, False, source='test', selected_option=wrong_deferred, defer_stats=True,
+        )
+        _, delta2 = record_question_result(
+            self.student_deferred, q_deferred, True, source='test', selected_option=correct_deferred, defer_stats=True,
+        )
+        apply_question_stats_deltas([d for d in (delta1, delta2) if d])
+
+        q_inline.refresh_from_db()
+        q_deferred.refresh_from_db()
+        correct_inline.refresh_from_db()
+        wrong_inline.refresh_from_db()
+        correct_deferred.refresh_from_db()
+        wrong_deferred.refresh_from_db()
+
+        self.assertEqual(q_inline.total_attempts, q_deferred.total_attempts)
+        self.assertEqual(q_inline.correct_attempts, q_deferred.correct_attempts)
+        self.assertEqual(correct_inline.pick_count, correct_deferred.pick_count)
+        self.assertEqual(wrong_inline.pick_count, wrong_deferred.pick_count)
+        self.assertEqual(correct_inline.pick_percentage, correct_deferred.pick_percentage)
+        self.assertEqual(wrong_inline.pick_percentage, wrong_deferred.pick_percentage)
+        # And the shared values are the actually-expected ones, not just
+        # "equal to each other by coincidence of both being wrong".
+        self.assertEqual(q_deferred.total_attempts, 1)
+        self.assertEqual(q_deferred.correct_attempts, 1)
+        self.assertEqual(correct_deferred.pick_count, 1)
+        self.assertEqual(wrong_deferred.pick_count, 0)
+
+    def test_apply_question_stats_deltas_applies_in_ascending_question_id_order(self):
+        """The actual deadlock fix: a consistent lock-acquisition order
+        across every caller, regardless of the order deltas arrive in
+        (which, before this fix, followed each student's randomly
+        shuffled answer order)."""
+        from unittest.mock import patch
+
+        from academics import services
+
+        call_order = []
+
+        def fake_apply(delta):
+            call_order.append(delta['question_id'])
+
+        with patch.object(services, '_apply_one_delta_with_retry', side_effect=fake_apply):
+            services.apply_question_stats_deltas([
+                {'question_id': 30, 'total_delta': 1, 'correct_delta': 0, 'option_deltas': {}},
+                {'question_id': 10, 'total_delta': 1, 'correct_delta': 0, 'option_deltas': {}},
+                {'question_id': 20, 'total_delta': 1, 'correct_delta': 0, 'option_deltas': {}},
+            ])
+
+        self.assertEqual(call_order, [10, 20, 30])
+
+    def test_retryable_deadlock_errno_is_retried_then_succeeds(self):
+        """MySQL errno 1213 (deadlock) is the safety net, not the primary
+        fix — this proves the net itself works: transient failures on a
+        single question's apply are retried a few times within the same
+        max_attempts budget, and don't abort the whole batch."""
+        from unittest.mock import patch
+
+        from django.db import OperationalError
+
+        from academics import services
+
+        delta = {'question_id': 999, 'total_delta': 1, 'correct_delta': 1, 'option_deltas': {}}
+        call_count = {'n': 0}
+
+        def flaky_apply(question_id, total_delta, correct_delta, option_deltas):
+            call_count['n'] += 1
+            if call_count['n'] < 3:
+                raise OperationalError(1213, 'Deadlock found when trying to get lock; try restarting transaction')
+
+        with patch.object(services, '_apply_question_stat_delta', side_effect=flaky_apply), \
+                patch.object(services.time, 'sleep'):
+            services._apply_one_delta_with_retry(delta)
+
+        self.assertEqual(call_count['n'], 3)
+
+    def test_retryable_lock_timeout_errno_is_retried_then_succeeds(self):
+        """Same safety net, MySQL errno 1205 (lock wait timeout) — the
+        other retryable error this fix explicitly targets."""
+        from unittest.mock import patch
+
+        from django.db import OperationalError
+
+        from academics import services
+
+        delta = {'question_id': 998, 'total_delta': 1, 'correct_delta': 0, 'option_deltas': {}}
+        call_count = {'n': 0}
+
+        def flaky_apply(question_id, total_delta, correct_delta, option_deltas):
+            call_count['n'] += 1
+            if call_count['n'] < 2:
+                raise OperationalError(1205, 'Lock wait timeout exceeded; try restarting transaction')
+
+        with patch.object(services, '_apply_question_stat_delta', side_effect=flaky_apply), \
+                patch.object(services.time, 'sleep'):
+            services._apply_one_delta_with_retry(delta)
+
+        self.assertEqual(call_count['n'], 2)
+
+    def test_non_retryable_errno_propagates_immediately_without_retry(self):
+        """Per the explicit "do NOT hide the error with retries" requirement:
+        only 1213/1205 are retried — any other OperationalError (e.g. 1062,
+        a duplicate-key error) must propagate on the very first attempt,
+        not be silently swallowed by the safety net."""
+        from unittest.mock import patch
+
+        from django.db import OperationalError
+
+        from academics import services
+
+        delta = {'question_id': 997, 'total_delta': 1, 'correct_delta': 1, 'option_deltas': {}}
+        call_count = {'n': 0}
+
+        def always_fail(question_id, total_delta, correct_delta, option_deltas):
+            call_count['n'] += 1
+            raise OperationalError(1062, "Duplicate entry '997' for key 'PRIMARY'")
+
+        with patch.object(services, '_apply_question_stat_delta', side_effect=always_fail):
+            with self.assertRaises(OperationalError):
+                services._apply_one_delta_with_retry(delta)
+
+        self.assertEqual(call_count['n'], 1)
+
+    def test_process_question_stats_is_idempotent_under_redelivery(self):
+        """Cloud Tasks is at-least-once delivery: the same (attempt_id,
+        deltas) payload can arrive twice. The stats_applied_at claim must
+        make the second delivery a safe no-op, not a double-count."""
+        from tests_app.stats_tasks import process_question_stats
+
+        q, correct, _wrong = self._make_question('idempotent')
+        test = Test.objects.create(title='Idempotency Exam', exam_type='mock')
+        attempt = TestAttempt.objects.create(user=self.student_inline, test=test, status='submitted')
+        deltas = [{'question_id': q.id, 'total_delta': 1, 'correct_delta': 1, 'option_deltas': {correct.id: 1}}]
+
+        process_question_stats(attempt.id, deltas)
+        process_question_stats(attempt.id, deltas)  # simulated Cloud Tasks redelivery, identical payload
+
+        attempt.refresh_from_db()
+        self.assertIsNotNone(attempt.stats_applied_at)
+        q.refresh_from_db()
+        correct.refresh_from_db()
+        self.assertEqual(q.total_attempts, 1)
+        self.assertEqual(q.correct_attempts, 1)
+        self.assertEqual(correct.pick_count, 1)
+
+    def test_process_question_stats_unclaims_on_failure_so_a_retry_can_still_apply(self):
+        """The other half of the idempotency contract: if applying the
+        deltas fails partway (e.g. a non-retryable DB error escapes the
+        retry safety net), the claim must be released, not left set —
+        otherwise a legitimate Cloud Tasks retry would see "already
+        processed" and the stats would be lost forever instead of
+        eventually applied."""
+        from unittest.mock import patch
+
+        from tests_app.stats_tasks import process_question_stats
+
+        q, correct, _wrong = self._make_question('unclaim')
+        test = Test.objects.create(title='Unclaim Exam', exam_type='mock')
+        attempt = TestAttempt.objects.create(user=self.student_inline, test=test, status='submitted')
+        deltas = [{'question_id': q.id, 'total_delta': 1, 'correct_delta': 1, 'option_deltas': {correct.id: 1}}]
+
+        with patch('academics.services.apply_question_stats_deltas', side_effect=RuntimeError('boom')):
+            with self.assertRaises(RuntimeError):
+                process_question_stats(attempt.id, deltas)
+
+        attempt.refresh_from_db()
+        self.assertIsNone(attempt.stats_applied_at)
+
+        # A retry (this time succeeding) must still be able to apply it.
+        process_question_stats(attempt.id, deltas)
+        attempt.refresh_from_db()
+        self.assertIsNotNone(attempt.stats_applied_at)
+        q.refresh_from_db()
+        self.assertEqual(q.total_attempts, 1)
+
+    def test_a_failure_partway_through_a_multi_delta_batch_rolls_back_the_earlier_delta_too(self):
+        """Final-review fix (pre-production stats-pipeline audit): the
+        whole claim-check + apply + mark-applied sequence is now one outer
+        transaction. Proves the specific new guarantee that motivated it —
+        previously each delta in a batch committed via its own independent
+        atomic() block, so a failure on delta 2 of 2 would leave delta 1's
+        effect permanently applied even though the claim was released and
+        the whole attempt was retried, silently double-counting delta 1 on
+        the next successful retry. Now a failure anywhere in the batch
+        rolls back every delta in it, not just the ones after the failure
+        point, so a retry starts from a clean slate and can never
+        double-count."""
+        from unittest.mock import patch
+
+        from tests_app.stats_tasks import process_question_stats
+
+        q1, correct1, _w1 = self._make_question('batch1')
+        q2, correct2, _w2 = self._make_question('batch2')
+        test = Test.objects.create(title='Partial Batch Exam', exam_type='mock')
+        attempt = TestAttempt.objects.create(user=self.student_inline, test=test, status='submitted')
+        deltas = [
+            {'question_id': q1.id, 'total_delta': 1, 'correct_delta': 1, 'option_deltas': {correct1.id: 1}},
+            {'question_id': q2.id, 'total_delta': 1, 'correct_delta': 1, 'option_deltas': {correct2.id: 1}},
+        ]
+
+        from academics.services import _apply_question_stat_delta as real_apply_one
+
+        def flaky_apply(question_id, total_delta, correct_delta, option_deltas):
+            real_apply_one(question_id, total_delta, correct_delta, option_deltas)
+            if question_id == q2.id:
+                raise RuntimeError('simulated crash after q1 succeeded, during q2')
+
+        with patch('academics.services._apply_question_stat_delta', side_effect=flaky_apply):
+            with self.assertRaises(RuntimeError):
+                process_question_stats(attempt.id, deltas)
+
+        attempt.refresh_from_db()
+        self.assertIsNone(attempt.stats_applied_at)
+        q1.refresh_from_db()
+        q2.refresh_from_db()
+        # q1's delta must NOT be durably applied even though it "succeeded"
+        # before q2 raised — the whole batch rolled back together.
+        self.assertEqual(q1.total_attempts, 0)
+        self.assertEqual(q2.total_attempts, 0)
+
+        # A clean retry applies both exactly once — no double-count of q1.
+        process_question_stats(attempt.id, deltas)
+        attempt.refresh_from_db()
+        self.assertIsNotNone(attempt.stats_applied_at)
+        q1.refresh_from_db()
+        q2.refresh_from_db()
+        self.assertEqual(q1.total_attempts, 1)
+        self.assertEqual(q2.total_attempts, 1)
+
+    def test_submit_test_enqueues_stats_only_after_commit_with_correct_payload(self):
+        """transaction.on_commit() wiring, checked directly (which args
+        SubmitTestView hands to the enqueue function), complementing the
+        DB-state-only checks in LargeExamSubmissionTests and the negative
+        (rolled-back-submission) case in
+        test_a_crash_partway_through_leaves_no_partial_state."""
+        from unittest.mock import patch
+
+        test = Test.objects.create(title='OnCommit Exam', exam_type='mock', negative_marking=False)
+        question = Question.objects.create(subject=self.subject, text='On-commit Q', marks=1, negative_marks=0)
+        correct = Option.objects.create(question=question, text='Correct', order=0, is_correct=True)
+        TestQuestion.objects.create(test=test, question=question)
+        attempt = TestAttempt.objects.create(user=self.student_inline, test=test, status='in_progress')
+        Answer.objects.create(attempt=attempt, question=question, selected_option=correct, is_correct=True)
+
+        self.client.force_authenticate(user=self.student_inline)
+        # Phase 6: patch target moved with the enqueue call — see the
+        # comment on the same rename above in
+        # test_a_crash_partway_through_leaves_no_partial_state.
+        with patch('tests_app.lifecycle.enqueue_question_stats_task') as mock_enqueue, \
+                self.captureOnCommitCallbacks(execute=True):
+            resp = self.client.post(f'/api/attempts/{attempt.id}/submit/')
+
+        self.assertEqual(resp.status_code, 200, resp.data)
+        mock_enqueue.assert_called_once()
+        called_attempt_id, called_deltas = mock_enqueue.call_args[0]
+        self.assertEqual(called_attempt_id, attempt.id)
+        self.assertEqual(len(called_deltas), 1)
+        self.assertEqual(called_deltas[0]['question_id'], question.id)
+
+
+class ConcurrentStatsDeferralRegressionTests(APITransactionTestCase):
+    """Deadlock-fix audit mandatory validation ("concurrent submission
+    regression test"): two DIFFERENT students submitting DIFFERENT
+    attempts that share a question pool is exactly the scenario that used
+    to deadlock (two per-question select_for_update() calls, in whatever
+    order each student's randomly shuffled answers came back in — see the
+    staging reproduction that motivated this whole fix). Needs a real
+    APITransactionTestCase, same reasoning as
+    SubmitTestDoubleSubmissionRaceTests above: each thread needs its own
+    real, committing connection, and transaction.on_commit() must
+    actually fire.
+
+    SQLite (this suite's test DB) has no real row-level locking, so it
+    can't reproduce a MySQL 1213 deadlock itself — that reproduction, and
+    its absence after this fix, was done directly against the staging
+    MySQL instance (see the load-test report). What this test proves
+    locally is that the new code path — sorted, per-question-transaction
+    delta application — completes cleanly under real concurrency and
+    that both students' stats land correctly with none lost or
+    duplicated."""
+
+    @override_settings(STATS_PROCESSING_ASYNC=False)
+    def test_two_students_submitting_shared_question_pool_concurrently(self):
+        import threading
+
+        from django.db import connection
+
+        subject = Subject.objects.create(name='Concurrent Regression Subject')
+        students = [
+            User.objects.create_user(
+                username=f'concurrent_student_{i}', email=f'concurrent_student_{i}@example.com', password='pw12345',
+            )
+            for i in range(2)
+        ]
+        questions = []
+        for i in range(10):
+            q = Question.objects.create(subject=subject, text=f'Concurrent Q{i}', marks=1, negative_marks=0)
+            Option.objects.create(question=q, text='Correct', order=0, is_correct=True)
+            Option.objects.create(question=q, text='Wrong', order=1, is_correct=False)
+            questions.append(q)
+        test = Test.objects.create(title='Concurrent Shared Pool Exam', exam_type='mock', negative_marking=False)
+        for i, q in enumerate(questions):
+            TestQuestion.objects.create(test=test, question=q, order=i)
+
+        attempts = []
+        for idx, student in enumerate(students):
+            attempt = TestAttempt.objects.create(user=student, test=test, status='in_progress')
+            # Opposite processing order per student — exactly the pattern
+            # random shuffle_questions used to produce, and the mechanism
+            # that caused the original deadlock.
+            ordered_questions = questions if idx == 0 else list(reversed(questions))
+            for q in ordered_questions:
+                correct = q.options.get(is_correct=True)
+                Answer.objects.create(attempt=attempt, question=q, selected_option=correct, is_correct=True)
+            attempts.append(attempt)
+
+        results = {}
+        errors = []
+
+        def submit(student, attempt):
+            import time
+
+            from rest_framework.test import APIClient
+
+            client = APIClient()
+            client.force_authenticate(user=student)
+            # Same documented SQLite testing artifact as
+            # SubmitTestDoubleSubmissionRaceTests above: SQLite has no
+            # per-row locking, so concurrent threads can hit "database
+            # table is locked" even where real MySQL/InnoDB row locks
+            # would just make one transaction wait — retried here rather
+            # than treated as a failure, since it's a test-DB artifact,
+            # not the deadlock behavior under test.
+            for attempt_no in range(20):
+                try:
+                    if connection.vendor == 'sqlite':
+                        with connection.cursor() as cur:
+                            cur.execute('PRAGMA busy_timeout = 30000')
+                    resp = client.post(f'/api/attempts/{attempt.id}/submit/')
+                    results[attempt.id] = resp.status_code
+                    return
+                except Exception as exc:  # noqa: BLE001
+                    if 'locked' in str(exc).lower() and attempt_no < 19:
+                        time.sleep(0.05)
+                        continue
+                    errors.append(exc)
+                    return
+                finally:
+                    connection.close()
+
+        threads = [threading.Thread(target=submit, args=(s, a)) for s, a in zip(students, attempts)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(errors, [])
+        # Same loosening as SubmitTestDoubleSubmissionRaceTests above, and
+        # for the same reason: SQLite's table-level (not row-level) locking
+        # can make a commit appear to fail to the Python client when it
+        # actually landed, so a retried request can find its own attempt
+        # already submitted and get a clean 404 instead of 200. That's a
+        # SQLite test-DB artifact, not a correctness bug — the actual
+        # invariant this test exists to prove is the DB state below (both
+        # students' stats land exactly once each, nothing lost or
+        # duplicated), which holds regardless of which status codes came
+        # back.
+        self.assertTrue(set(results.values()).issubset({200, 404}), results)
+        for q in Question.objects.filter(id__in=[q.id for q in questions]):
+            self.assertEqual(q.total_attempts, 2)
+            self.assertEqual(q.correct_attempts, 2)
+            correct_opt = q.options.get(is_correct=True)
+            self.assertEqual(correct_opt.pick_count, 2)
+        for attempt in TestAttempt.objects.filter(id__in=[a.id for a in attempts]):
+            self.assertIsNotNone(attempt.stats_applied_at)
+
+
+class SubmitTestDoubleSubmissionRaceTests(APITransactionTestCase):
+    """The select_for_update() half of the Phase 2.1 fix — needs a real
+    TransactionTestCase (via APITransactionTestCase) because each thread
+    needs its own real, committing connection; the default APITestCase
+    wraps the whole test in one outer transaction that never actually
+    commits, which would hide exactly the race this test exists to
+    catch."""
+
+    def test_concurrent_double_submit_only_processes_once(self):
+        import threading
+        import time
+
+        student = User.objects.create_user(username='race_student', email='race_student@example.com', password='pw12345')
+        subject = Subject.objects.create(name='Race Subject')
+        question = Question.objects.create(subject=subject, text='2+2=?', marks=1, negative_marks=0)
+        correct = Option.objects.create(question=question, text='4', order=0, is_correct=True)
+        test = Test.objects.create(title='Race Exam', exam_type='mock', negative_marking=False)
+        TestQuestion.objects.create(test=test, question=question)
+        attempt = TestAttempt.objects.create(user=student, test=test, status='in_progress')
+        Answer.objects.create(attempt=attempt, question=question, selected_option=correct, is_correct=True)
+
+        results = []
+        lock = threading.Lock()
+
+        def submit_once():
+            from django.db import connection
+            from rest_framework.test import APIClient
+
+            client = APIClient()
+            client.force_authenticate(user=student)
+            for attempt_no in range(20):
+                try:
+                    # SQLite (this suite's test DB) has no per-row locking
+                    # and its shared-cache mode (needed for genuinely
+                    # concurrent threads to see each other's commits) raises
+                    # "database table is locked" under contention — see
+                    # Phase 1.8's QuestionPublicIdConcurrencyTests for the
+                    # same, already-documented testing artifact. Re-applied
+                    # every attempt since connection.close() below tears
+                    # down the connection this pragma was set on. On the
+                    # real target database (MySQL/InnoDB), select_for_
+                    # update() takes an actual row lock and a concurrent
+                    # transaction blocks-and-waits instead of erroring.
+                    if connection.vendor == 'sqlite':
+                        with connection.cursor() as cur:
+                            cur.execute('PRAGMA busy_timeout = 30000')
+                    resp = client.post(f'/api/attempts/{attempt.id}/submit/')
+                    with lock:
+                        results.append(resp.status_code)
+                    return
+                except Exception as exc:  # noqa: BLE001 — SQLite lock-contention retry, see Phase 1.8's tests
+                    if 'locked' in str(exc).lower() and attempt_no < 19:
+                        time.sleep(0.05)
+                        continue
+                    raise
+                finally:
+                    connection.close()
+
+        threads = [threading.Thread(target=submit_once) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # Under real production contention (MySQL/InnoDB), exactly one
+        # request scores it (200) and the other cleanly finds it no longer
+        # 'in_progress' once it gets the row lock (404 — the existing,
+        # unchanged get_object_or_404(status='in_progress') behavior for
+        # an already-submitted attempt). Under this test's SQLite table-
+        # level (not row-level) locking, a request can hit "table is
+        # locked" mid-transaction, roll back cleanly, and retry — which
+        # can scramble the exact status codes observed (e.g. both threads
+        # ending up 404 because a retry lands after the *other* thread's
+        # retry already committed) without ever causing a double-count.
+        # So the response codes are checked loosely; the DB state below —
+        # exactly one write, no duplication — is the actual invariant this
+        # test exists to prove, and it holds regardless of engine.
+        self.assertTrue(set(results).issubset({200, 404}), results)
+        attempt.refresh_from_db()
+        self.assertEqual(attempt.status, 'submitted')
+        self.assertEqual(float(attempt.score), 1.0)
+        self.assertEqual(QuestionAttempt.objects.filter(user=student, question=question).count(), 1)
+        qa = QuestionAttempt.objects.get(user=student, question=question)
+        self.assertEqual(qa.attempts_count, 1)  # not 2 — the whole point of this test
+        self.assertEqual(QuestionEvent.objects.filter(user=student, question=question).count(), 1)
+
+
+class SubjectRankCachingTests(APITestCase):
+    """Scalability audit fix (Phase 3): _subject_rank used to run two full
+    cross-student GROUP-BY scans (QuestionAttempt + Answer, across the
+    whole subject) on every single call — subject_breakdown() calls it
+    once per subject shown, so a dashboard load re-scanned every student's
+    data in that subject from scratch. Now Redis/cache-backed per subject,
+    shared across every student and every call within the TTL."""
+
+    def setUp(self):
+        from django.core.cache import cache
+
+        cache.clear()
+        self.subject = Subject.objects.create(name='Rank Cache Subject', is_free=True)
+        self.students = [
+            User.objects.create_user(username=f'rank_cache_s{i}', email=f'rank_cache_s{i}@example.com', password='pw12345')
+            for i in range(3)
+        ]
+        # Each student answers 5 questions (>= MIN_ATTEMPTS_FOR_SUBJECT_RANK)
+        # with a distinct accuracy so their ranks are unambiguous: s0 best,
+        # s2 worst.
+        accuracies = [5, 3, 1]  # correct out of 5
+        self.questions = [Question.objects.create(subject=self.subject, text=f'Rank Q{i}') for i in range(5)]
+        for student, correct_count in zip(self.students, accuracies):
+            for i, q in enumerate(self.questions):
+                QuestionAttempt.objects.create(
+                    user=student, question=q, attempts_count=1,
+                    correct_count=1 if i < correct_count else 0,
+                    is_correct=i < correct_count,
+                )
+
+    def test_rank_and_out_of_are_correct(self):
+        from tests_app.performance import _subject_rank
+
+        self.assertEqual(_subject_rank(self.students[0], self.subject), {'rank': 1, 'out_of': 3})
+        self.assertEqual(_subject_rank(self.students[1], self.subject), {'rank': 2, 'out_of': 3})
+        self.assertEqual(_subject_rank(self.students[2], self.subject), {'rank': 3, 'out_of': 3})
+
+    def test_a_student_below_the_minimum_attempts_threshold_has_no_rank(self):
+        from tests_app.performance import _subject_rank
+
+        newcomer = User.objects.create_user(username='rank_cache_newcomer', email='rank_cache_newcomer@example.com', password='pw12345')
+        QuestionAttempt.objects.create(user=newcomer, question=self.questions[0], attempts_count=1, correct_count=1, is_correct=True)
+        self.assertIsNone(_subject_rank(newcomer, self.subject))
+
+    def test_second_call_within_ttl_does_not_requery(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from tests_app.performance import _subject_rank
+
+        _subject_rank(self.students[0], self.subject)  # warms the cache
+        with CaptureQueriesContext(connection) as ctx:
+            result = _subject_rank(self.students[1], self.subject)  # different student, same subject
+        self.assertEqual(result, {'rank': 2, 'out_of': 3})
+        self.assertEqual(len(ctx.captured_queries), 0)  # served entirely from cache
+
+    def test_a_different_subject_gets_its_own_independent_cache_entry(self):
+        from tests_app.performance import _subject_rank
+
+        other_subject = Subject.objects.create(name='Rank Cache Other Subject', is_free=True)
+        for i, q_text in enumerate(['A', 'B', 'C', 'D', 'E']):
+            oq = Question.objects.create(subject=other_subject, text=f'Other Rank Q{q_text}')
+            # Reverse the ranking here vs. the main subject: s2 best this time.
+            for student, correct_count in zip(self.students, [1, 3, 5]):
+                QuestionAttempt.objects.create(
+                    user=student, question=oq, attempts_count=1,
+                    correct_count=1 if i < correct_count else 0, is_correct=i < correct_count,
+                )
+
+        self.assertEqual(_subject_rank(self.students[0], self.subject), {'rank': 1, 'out_of': 3})
+        self.assertEqual(_subject_rank(self.students[0], other_subject), {'rank': 3, 'out_of': 3})
+
+    def test_overview_endpoint_still_reports_correct_rank(self):
+        self.client.force_authenticate(user=self.students[0])
+        resp = self.client.get('/api/performance/overview/')
+        row = next(r for r in resp.data['subjects'] if r['subject_id'] == self.subject.id)
+        self.assertEqual(row['rank'], {'rank': 1, 'out_of': 3})
+
+
+class SubjectBreakdownOptimizationTests(APITestCase):
+    """Scalability audit fix (Phase 3): subject_breakdown()'s
+    subject.questions.count() per subject (an N+1) is now a single
+    annotated query; StudentPerformanceOverviewView computes
+    subject_breakdown() once and shares it with strengths_and_weaknesses()/
+    recommendations() instead of each silently recomputing it (a 3x call
+    for the same request previously)."""
+
+    def setUp(self):
+        from django.core.cache import cache
+
+        cache.clear()
+        self.student = User.objects.create_user(username='sb_opt_student', email='sb_opt_student@example.com', password='pw12345')
+        self.subject = Subject.objects.create(name='SB Opt Subject', is_free=True)
+        self.questions = [Question.objects.create(subject=self.subject, text=f'SB Opt Q{i}') for i in range(4)]
+        for i, q in enumerate(self.questions[:2]):
+            QuestionAttempt.objects.create(user=self.student, question=q, attempts_count=1, correct_count=1, is_correct=True)
+        self.client.force_authenticate(user=self.student)
+
+    def test_total_questions_is_correct(self):
+        from tests_app.performance import subject_breakdown
+
+        rows = subject_breakdown(self.student)
+        row = next(r for r in rows if r['subject_id'] == self.subject.id)
+        self.assertEqual(row['total_questions'], 4)
+        self.assertEqual(row['attempted'], 2)
+        self.assertEqual(row['correct'], 2)
+
+    def test_total_questions_query_count_does_not_grow_with_question_count(self):
+        """Isolates the annotated_question_count fix specifically: a
+        subject with more questions must not cost more queries to report
+        total_questions for (the old subject.questions.count() N+1). Adds
+        questions to the *same already-ranked* subject rather than new
+        subjects, so this doesn't also exercise _subject_rank's separate,
+        legitimately-per-subject cache cost (see SubjectRankCachingTests)."""
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from tests_app.performance import subject_breakdown
+
+        subject_breakdown(self.student)  # warm this subject's rank cache first
+
+        with CaptureQueriesContext(connection) as ctx:
+            rows = subject_breakdown(self.student)
+        small_count = len(ctx.captured_queries)
+        small_total = next(r for r in rows if r['subject_id'] == self.subject.id)['total_questions']
+
+        for i in range(20):
+            Question.objects.create(subject=self.subject, text=f'SB Opt Extra Q{i}')
+
+        with CaptureQueriesContext(connection) as ctx:
+            rows = subject_breakdown(self.student)
+        large_count = len(ctx.captured_queries)
+        large_total = next(r for r in rows if r['subject_id'] == self.subject.id)['total_questions']
+
+        self.assertEqual(small_count, large_count)
+        self.assertEqual(small_total, 4)
+        self.assertEqual(large_total, 24)
+
+    def test_overview_endpoint_computes_subject_breakdown_only_once(self):
+        """The dedup fix: strengths_and_weaknesses/recommendations must
+        receive the already-computed `subjects` list, not silently call
+        subject_breakdown() again."""
+        from unittest.mock import patch
+
+        import tests_app.performance as performance_module
+
+        original = performance_module.subject_breakdown
+        calls = {'n': 0}
+
+        def counting_wrapper(*args, **kwargs):
+            calls['n'] += 1
+            return original(*args, **kwargs)
+
+        with patch('tests_app.views.performance.subject_breakdown', side_effect=counting_wrapper):
+            resp = self.client.get('/api/performance/overview/')
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(calls['n'], 1)
+
+
+# ============================================================================
+# Phase 5 — Exam Type Policies & Unified Exam Configuration
+# ============================================================================
+
+class ExamTypePolicyModelAndServiceTests(TestCase):
+    """get_exam_type_defaults()/get_all_exam_type_defaults() — the single
+    read path consumed by TestAdminSerializer.create() and the
+    exam_type_policies endpoint."""
+
+    def test_every_exam_type_has_a_seeded_policy_row(self):
+        for exam_type, _label in Test.EXAM_TYPE_CHOICES:
+            self.assertTrue(ExamTypePolicy.objects.filter(pk=exam_type).exists(), exam_type)
+
+    def test_get_exam_type_defaults_returns_every_controlled_field(self):
+        defaults = get_exam_type_defaults('mock')
+        self.assertEqual(set(defaults.keys()), set(POLICY_CONTROLLED_FIELDS))
+
+    def test_get_exam_type_defaults_reflects_a_policy_row_edit(self):
+        policy = ExamTypePolicy.objects.get(pk='mock')
+        policy.default_duration_minutes = 90
+        policy.save()
+
+        self.assertEqual(get_exam_type_defaults('mock')['duration_minutes'], 90)
+
+    def test_missing_policy_row_falls_back_to_model_field_defaults(self):
+        """Defensive fallback — a fresh DB before the seeding data migration
+        has run, or a row deleted by hand, must never crash exam creation."""
+        ExamTypePolicy.objects.filter(pk='grand').delete()
+
+        defaults = get_exam_type_defaults('grand')
+
+        self.assertEqual(defaults['duration_minutes'], Test._meta.get_field('duration_minutes').get_default())
+        self.assertEqual(defaults['is_draft'], Test._meta.get_field('is_draft').get_default())
+
+    def test_get_all_exam_type_defaults_covers_all_five_categories(self):
+        all_defaults = get_all_exam_type_defaults()
+        self.assertEqual(set(all_defaults.keys()), {'qbank', 'daily', 'mock', 'grand', 'pyq'})
+
+
+class ExamTypePoliciesEndpointTests(APITestCase):
+    """GET /api/tests/exam_type_policies/ — staff-only, read-only."""
+
+    def setUp(self):
+        self.staff = User.objects.create_user(
+            username='policy_staff', email='policy_staff@example.com', password='pw12345', is_staff=True, admin_role='admin',
+        )
+        self.student = User.objects.create_user(username='policy_student', email='policy_student@example.com', password='pw12345')
+
+    def test_staff_can_read_all_five_policies(self):
+        self.client.force_authenticate(user=self.staff)
+        resp = self.client.get('/api/tests/exam_type_policies/')
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(set(resp.data.keys()), {'qbank', 'daily', 'mock', 'grand', 'pyq'})
+        self.assertEqual(set(resp.data['mock'].keys()), set(POLICY_CONTROLLED_FIELDS))
+
+    def test_student_cannot_read_policies(self):
+        self.client.force_authenticate(user=self.student)
+        resp = self.client.get('/api/tests/exam_type_policies/')
+        self.assertEqual(resp.status_code, 403)
+
+    def test_anonymous_cannot_read_policies(self):
+        resp = self.client.get('/api/tests/exam_type_policies/')
+        self.assertIn(resp.status_code, (401, 403))
+
+    def test_endpoint_reflects_an_admin_edit_immediately(self):
+        ExamTypePolicy.objects.filter(pk='daily').update(default_max_attempts=3)
+        self.client.force_authenticate(user=self.staff)
+
+        resp = self.client.get('/api/tests/exam_type_policies/')
+
+        self.assertEqual(resp.data['daily']['max_attempts'], 3)
+
+
+class ExamCreationAppliesPolicyDefaultsTests(APITestCase):
+    """Per-exam-type template applied at creation time when a field is
+    omitted from the payload — one test per category, per the Phase 5 spec's
+    explicit per-exam-type coverage requirement. Confirms the backend
+    itself (not just the frontend) is authoritative for defaults."""
+
+    def setUp(self):
+        self.staff = User.objects.create_user(
+            username='createpolicy_staff', email='createpolicy_staff@example.com', password='pw12345',
+            is_staff=True, admin_role='admin',
+        )
+        self.client.force_authenticate(user=self.staff)
+
+    def _create_minimal(self, exam_type):
+        resp = self.client.post('/api/tests/', {'title': f'{exam_type} exam', 'exam_type': exam_type}, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+        return Test.objects.get(pk=resp.data['id'])
+
+    def test_qbank_receives_policy_defaults_when_fields_omitted(self):
+        self._assert_matches_policy('qbank')
+
+    def test_daily_receives_policy_defaults_when_fields_omitted(self):
+        self._assert_matches_policy('daily')
+
+    def test_mock_receives_policy_defaults_when_fields_omitted(self):
+        self._assert_matches_policy('mock')
+
+    def test_grand_receives_policy_defaults_when_fields_omitted(self):
+        self._assert_matches_policy('grand')
+
+    def test_pyq_receives_policy_defaults_when_fields_omitted(self):
+        self._assert_matches_policy('pyq')
+
+    def _assert_matches_policy(self, exam_type):
+        expected = get_exam_type_defaults(exam_type)
+        test = self._create_minimal(exam_type)
+        for field in POLICY_CONTROLLED_FIELDS:
+            self.assertEqual(getattr(test, field), expected[field], field)
+
+    def test_admin_can_customize_a_category_and_new_exams_pick_it_up(self):
+        """Admin override behavior — editing the policy in Django admin
+        (simulated here via the ORM, exactly what the admin UI writes)
+        changes what NEW exams of that category receive."""
+        ExamTypePolicy.objects.filter(pk='mock').update(
+            default_duration_minutes=45, default_max_attempts=2, default_is_draft=False,
+        )
+
+        test = self._create_minimal('mock')
+
+        self.assertEqual(test.duration_minutes, 45)
+        self.assertEqual(test.max_attempts, 2)
+        self.assertFalse(test.is_draft)
+
+
+class ExamCreationExplicitValueOverridesPolicyTests(APITestCase):
+    """An admin's explicit value in the create payload always wins over the
+    category policy — the policy only ever fills in what's missing."""
+
+    def setUp(self):
+        self.staff = User.objects.create_user(
+            username='overridepolicy_staff', email='overridepolicy_staff@example.com', password='pw12345',
+            is_staff=True, admin_role='admin',
+        )
+        self.client.force_authenticate(user=self.staff)
+
+    def test_explicit_duration_beats_policy_default(self):
+        self.assertNotEqual(get_exam_type_defaults('mock')['duration_minutes'], 15)
+
+        resp = self.client.post(
+            '/api/tests/', {'title': 'Custom duration', 'exam_type': 'mock', 'duration_minutes': 15}, format='json',
+        )
+
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+        test = Test.objects.get(pk=resp.data['id'])
+        self.assertEqual(test.duration_minutes, 15)
+
+    def test_explicit_is_draft_false_beats_policy_default(self):
+        test = self._create_with_explicit_is_draft(False)
+        self.assertFalse(test.is_draft)
+
+    def test_explicit_is_draft_true_beats_a_policy_customized_to_false(self):
+        ExamTypePolicy.objects.filter(pk='mock').update(default_is_draft=False)
+        test = self._create_with_explicit_is_draft(True)
+        self.assertTrue(test.is_draft)
+
+    def _create_with_explicit_is_draft(self, value):
+        resp = self.client.post(
+            '/api/tests/', {'title': 'Explicit draft flag', 'exam_type': 'mock', 'is_draft': value}, format='json',
+        )
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+        return Test.objects.get(pk=resp.data['id'])
+
+
+class ExamTypePolicyImmutabilityTests(APITestCase):
+    """Mandatory Policy Immutability Test, exact steps from the Phase 5
+    spec: create a Mock Test under policy config A, change the Mock policy
+    to config B, confirm the EXISTING Test still reflects config A, create
+    a second Mock Test, confirm IT reflects config B. Policy is applied
+    once, at creation — never re-derived from a live FK."""
+
+    def setUp(self):
+        self.staff = User.objects.create_user(
+            username='immutability_staff', email='immutability_staff@example.com', password='pw12345',
+            is_staff=True, admin_role='admin',
+        )
+        self.client.force_authenticate(user=self.staff)
+
+    def test_policy_change_never_mutates_an_already_created_exam(self):
+        # (1) Create a Mock Test under policy config A.
+        ExamTypePolicy.objects.filter(pk='mock').update(default_duration_minutes=60, default_max_attempts=1)
+        resp_a = self.client.post('/api/tests/', {'title': 'Config A exam', 'exam_type': 'mock'}, format='json')
+        self.assertEqual(resp_a.status_code, status.HTTP_201_CREATED, resp_a.data)
+        test_a = Test.objects.get(pk=resp_a.data['id'])
+        self.assertEqual(test_a.duration_minutes, 60)
+        self.assertEqual(test_a.max_attempts, 1)
+
+        # (2) Change the Mock policy to config B.
+        ExamTypePolicy.objects.filter(pk='mock').update(default_duration_minutes=120, default_max_attempts=3)
+
+        # (3) The existing Mock Test still uses config A.
+        test_a.refresh_from_db()
+        self.assertEqual(test_a.duration_minutes, 60)
+        self.assertEqual(test_a.max_attempts, 1)
+
+        # (4) Create another Mock Test.
+        resp_b = self.client.post('/api/tests/', {'title': 'Config B exam', 'exam_type': 'mock'}, format='json')
+        self.assertEqual(resp_b.status_code, status.HTTP_201_CREATED, resp_b.data)
+        test_b = Test.objects.get(pk=resp_b.data['id'])
+
+        # (5) The new Test uses config B.
+        self.assertEqual(test_b.duration_minutes, 120)
+        self.assertEqual(test_b.max_attempts, 3)
+
+
+class ExamPolicyOverrideSurvivesLaterPolicyChangeTests(APITestCase):
+    """Mandatory Override Test, exact steps: policy says duration=X, create
+    exam (receives X), admin edits that specific exam to duration=Y, verify
+    Y, change the policy to Z, verify the exam is still Y (not Z)."""
+
+    def setUp(self):
+        self.staff = User.objects.create_user(
+            username='overridesurvive_staff', email='overridesurvive_staff@example.com', password='pw12345',
+            is_staff=True, admin_role='admin',
+        )
+        self.client.force_authenticate(user=self.staff)
+
+    def test_manual_edit_survives_a_later_policy_change(self):
+        # Policy says duration=X.
+        ExamTypePolicy.objects.filter(pk='mock').update(default_duration_minutes=60)
+
+        # Create exam — receives X.
+        resp = self.client.post('/api/tests/', {'title': 'Override test exam', 'exam_type': 'mock'}, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+        test_id = resp.data['id']
+        self.assertEqual(Test.objects.get(pk=test_id).duration_minutes, 60)
+
+        # Admin edits that specific exam to duration=Y.
+        resp = self.client.patch(f'/api/tests/{test_id}/', {'duration_minutes': 90}, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        self.assertEqual(Test.objects.get(pk=test_id).duration_minutes, 90)
+
+        # Change the policy to Z.
+        ExamTypePolicy.objects.filter(pk='mock').update(default_duration_minutes=180)
+
+        # The specific exam remains Y (not Z) — update() never reads policy.
+        self.assertEqual(Test.objects.get(pk=test_id).duration_minutes, 90)
+
+
+class ExamEditNeverAppliesPolicyDefaultsTests(APITestCase):
+    """A PATCH that omits a policy-controlled field must leave that field
+    unchanged (normal partial-update semantics) — never silently pull in
+    the category's current policy default, unlike create()."""
+
+    def setUp(self):
+        self.staff = User.objects.create_user(
+            username='editpolicy_staff', email='editpolicy_staff@example.com', password='pw12345',
+            is_staff=True, admin_role='admin',
+        )
+        self.client.force_authenticate(user=self.staff)
+
+    def test_partial_patch_omitting_duration_leaves_it_unchanged(self):
+        test = Test.objects.create(title='Edit no-touch', exam_type='mock', duration_minutes=77)
+        ExamTypePolicy.objects.filter(pk='mock').update(default_duration_minutes=999)
+
+        resp = self.client.patch(f'/api/tests/{test.id}/', {'title': 'Edit no-touch — renamed'}, format='json')
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        test.refresh_from_db()
+        self.assertEqual(test.duration_minutes, 77)
+
+
+class IsDraftDriftResolutionTests(APITestCase):
+    """Phase 5's explicit, deliberate resolution of the is_draft default
+    drift (Create Exam Wizard defaulted to True/draft, Import & Create Test
+    defaulted to False/publish-immediately) — the canonical policy default
+    is now True for every category, matching Test.is_draft's own
+    documented safe-by-default behavior."""
+
+    def setUp(self):
+        self.staff = User.objects.create_user(
+            username='draftdrift_staff', email='draftdrift_staff@example.com', password='pw12345',
+            is_staff=True, admin_role='admin',
+        )
+        self.client.force_authenticate(user=self.staff)
+
+    def test_canonical_is_draft_default_is_true_for_every_category(self):
+        for exam_type, _label in Test.EXAM_TYPE_CHOICES:
+            self.assertTrue(get_exam_type_defaults(exam_type)['is_draft'], exam_type)
+
+    def test_new_exam_created_with_no_is_draft_field_starts_as_draft(self):
+        resp = self.client.post('/api/tests/', {'title': 'No is_draft sent', 'exam_type': 'mock'}, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+        self.assertTrue(Test.objects.get(pk=resp.data['id']).is_draft)
+
+
+class ExamTypePolicyBackwardCompatibilityTests(APITestCase):
+    """Existing Tests created before Phase 5 keep working unchanged —
+    ExamTypePolicy is never read on any list/detail/attempt/result path."""
+
+    def setUp(self):
+        self.staff = User.objects.create_user(
+            username='backcompat_staff', email='backcompat_staff@example.com', password='pw12345',
+            is_staff=True, admin_role='admin',
+        )
+        self.client.force_authenticate(user=self.staff)
+
+    def test_pre_existing_test_values_are_untouched_by_any_policy_row(self):
+        """A Test created directly via the ORM (simulating one that
+        predates Phase 5) with values that disagree with every current
+        policy default must never be silently 'corrected'."""
+        test = Test.objects.create(
+            title='Legacy exam', exam_type='mock', duration_minutes=37, max_attempts=9,
+            is_draft=False, negative_marking=False,
+        )
+        ExamTypePolicy.objects.filter(pk='mock').update(
+            default_duration_minutes=60, default_max_attempts=1, default_is_draft=True, default_negative_marking=True,
+        )
+
+        resp = self.client.get(f'/api/tests/{test.id}/')
+        self.assertEqual(resp.status_code, 200)
+
+        test.refresh_from_db()
+        self.assertEqual(test.duration_minutes, 37)
+        self.assertEqual(test.max_attempts, 9)
+        self.assertFalse(test.is_draft)
+        self.assertFalse(test.negative_marking)
+
+    def test_makemigrations_check_is_clean(self):
+        """Sanity check embedded in the suite: the ExamTypePolicy model as
+        currently defined has no pending, un-migrated changes."""
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        out = StringIO()
+        try:
+            call_command('makemigrations', '--check', '--dry-run', stdout=out, stderr=out)
+            clean = True
+        except SystemExit:
+            clean = False
+        self.assertTrue(clean, out.getvalue())

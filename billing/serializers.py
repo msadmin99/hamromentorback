@@ -48,13 +48,33 @@ class PaymentMethodSerializer(serializers.ModelSerializer):
 
 class SubscriptionPlanSerializer(serializers.ModelSerializer):
     course_name = serializers.CharField(source='course.name', read_only=True)
+    # Phase 10: what the plans page renders. Admin-configured `features`
+    # when set, otherwise a line derived from this plan's own real fields —
+    # never a hardcoded list living in the frontend.
+    display_features = serializers.SerializerMethodField()
 
     class Meta:
         model = SubscriptionPlan
         fields = [
             'id', 'course', 'course_name', 'product_type', 'name', 'duration_value', 'duration_unit',
             'mock_test_quota', 'price', 'is_active', 'is_popular', 'is_best_value', 'order',
+            'features', 'display_features',
         ]
+
+    def get_display_features(self, obj):
+        if obj.features:
+            return list(obj.features)
+        # Derived from the plan's actual configuration, so an unconfigured
+        # plan still advertises something true rather than nothing (or, as
+        # before, something invented in the frontend).
+        derived = [f'{obj.duration_value} {obj.get_duration_unit_display().lower().rstrip("(s)")} access'
+                   if obj.duration_value else 'Full access']
+        if obj.product_type == 'mock_test':
+            derived.append(
+                f'{obj.mock_test_quota} mock tests included' if obj.mock_test_quota else 'Unlimited mock tests'
+            )
+        derived.append(f'{obj.get_product_type_display()}')
+        return derived
 
 
 class ComboPlanSerializer(serializers.ModelSerializer):
@@ -179,10 +199,14 @@ class PurchaseSerializer(serializers.ModelSerializer):
             'original_amount', 'discount_amount', 'final_amount', 'payment_method', 'payment_method_detail',
             'payment_reference', 'has_screenshot', 'status', 'admin_note', 'expires_at', 'is_expired',
             'created_at', 'decided_at', 'grand_test_access',
+            # Phase 9 — additive, all read-only. A refund is only ever driven
+            # by the admin-gated /refund/ action through payment_service, never
+            # by writing these from a request payload.
+            'refunded_at', 'refund_reason',
         ]
         read_only_fields = [
             'user', 'currency', 'original_amount', 'discount_amount', 'final_amount', 'status', 'expires_at',
-            'created_at', 'decided_at',
+            'created_at', 'decided_at', 'refunded_at', 'refund_reason',
         ]
 
     def get_user_name(self, obj):

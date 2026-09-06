@@ -76,7 +76,7 @@ EDITOR_ALLOWED_FEATURES = [
 # Chosen over a separate role hierarchy (Question Editor/Exam Manager as
 # first-class admin_role values) so the existing feature-key + RolePermission
 # system stays the single source of truth for capability differences.
-EXAM_MANAGEMENT_FEATURES = ['exam_schedule', 'exam_archive', 'exam_delete']
+EXAM_MANAGEMENT_FEATURES = ['exam_schedule', 'exam_archive', 'exam_delete', 'exam_release_solutions']
 
 ALL_FEATURES = [
     'dashboard', 'courses', 'question_bank', 'question_entry', 'video_lectures', 'daily_practice', 'students',
@@ -98,6 +98,42 @@ class RolePermission(models.Model):
 
     def __str__(self):
         return self.role
+
+
+def user_feature_list(user):
+    """The dashboard feature keys this account may use — the single source
+    of truth for the whole RolePermission system.
+
+    FIX (P0 security audit): before this helper existed, this exact
+    computation was duplicated only in UserSerializer.get_permissions()
+    (accounts/serializers.py) and consulted ONLY by the frontend
+    (hasFeature()/RequireStaff) — no backend DRF permission class ever
+    read RolePermission at all, so the feature-key vocabulary (billing,
+    exam_schedule, exam_archive, exam_delete, question_entry, ...) was
+    frontend-UX-only. `hamromentor.permissions.HasFeature` is the backend
+    enforcement counterpart, and both it and the serializer now call this
+    one function so they can never drift apart again.
+    """
+    if not user or not getattr(user, 'is_staff', False):
+        return []
+    if getattr(user, 'is_superuser', False) or getattr(user, 'admin_role', None) in (None, '', 'super_admin'):
+        return ALL_FEATURES
+    if user.admin_role == 'teacher':
+        # Fixed ceiling — not admin-configurable via RolePermission (see model comment).
+        return TEACHER_ALLOWED_FEATURES
+    role_permission = RolePermission.objects.filter(role=user.admin_role).first()
+    if role_permission:
+        if user.admin_role == 'editor':
+            # Server-side ceiling enforcement (P0 fix): EDITOR_ALLOWED_FEATURES
+            # was previously documented as a hard ceiling but never actually
+            # enforced — a RolePermission row could contain anything (e.g.
+            # 'billing', 'advanced') and get_permissions()/HasFeature would
+            # honor it verbatim. Intersecting here means a stored row can never
+            # grant an Editor more than the documented ceiling, regardless of
+            # how it was written (API, admin site, a future bug in the save UI).
+            return [f for f in role_permission.features if f in EDITOR_ALLOWED_FEATURES]
+        return role_permission.features
+    return ALL_FEATURES if user.admin_role == 'admin' else EDITOR_ALLOWED_FEATURES
 
 
 class StudentProfile(models.Model):

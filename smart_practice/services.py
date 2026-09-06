@@ -5,6 +5,7 @@ directly, it only calls into that existing function with source='smart'."""
 from django.utils import timezone
 
 from academics.models import QuestionAttempt
+from academics.random_sample import random_sample
 from academics.services import record_question_result
 from tests_app.models import TestQuestion
 
@@ -54,10 +55,24 @@ def due_review_candidates(ctx, user):
     return [by_id[qid] for qid in due_ids if qid in by_id]
 
 
-def new_question_candidates(ctx, user):
+def new_question_pool(ctx, user):
+    """The (unevaluated) queryset of never-attempted questions in this
+    source's authorized pool — exposed separately from
+    new_question_candidates() so a caller that only needs a count (see
+    smart_practice/views.py EligibilityView/RecommendationsView) can call
+    .count() directly instead of materializing every matching row just to
+    take len() of the result."""
     pool = _subject_scoped_pool(ctx)
     attempted_ids = QuestionAttempt.objects.filter(user=user).values_list('question_id', flat=True)
-    return list(pool.exclude(id__in=attempted_ids).order_by('?'))
+    return pool.exclude(id__in=attempted_ids)
+
+
+def new_question_candidates(ctx, user, limit=None):
+    """Random sample of up to `limit` never-attempted questions (all of
+    them, still randomly ordered but without ORDER BY RAND(), if
+    limit=None — see academics/random_sample.py)."""
+    pool = new_question_pool(ctx, user)
+    return random_sample(pool, limit if limit is not None else pool.count())
 
 
 def bookmarked_candidates(ctx, user):
@@ -109,7 +124,7 @@ def build_candidates(ctx, mode, count, user=None):
         add_missed(topic_filter=weak_topic_ids)
         if weak_topic_ids and len(candidates) < count:
             expansion = ctx.expansion_pool.filter(topic_id__in=weak_topic_ids).exclude(id__in=seen_ids)
-            for q in expansion.order_by('?')[: max(count * 2, count - len(candidates))]:
+            for q in random_sample(expansion, max(count * 2, count - len(candidates))):
                 if q.id in seen_ids:
                     continue
                 candidates.append((q, 'source_weak_topic'))
@@ -122,7 +137,7 @@ def build_candidates(ctx, mode, count, user=None):
         add_missed()
         if weak_chapter_ids and len(candidates) < count:
             expansion = ctx.expansion_pool.filter(chapter_id__in=weak_chapter_ids).exclude(id__in=seen_ids)
-            for q in expansion.order_by('?')[: max(count * 2, count - len(candidates))]:
+            for q in random_sample(expansion, max(count * 2, count - len(candidates))):
                 if q.id in seen_ids:
                     continue
                 candidates.append((q, 'expansion_pool'))
@@ -132,7 +147,7 @@ def build_candidates(ctx, mode, count, user=None):
         add_from_list(due_review_candidates(ctx, user), 'due_review')
 
     elif mode == 'new_questions':
-        add_from_list(new_question_candidates(ctx, user), 'new_question')
+        add_from_list(new_question_candidates(ctx, user, limit=count), 'new_question')
 
     elif mode == 'bookmarked':
         add_from_list(bookmarked_candidates(ctx, user), 'bookmarked')
@@ -147,7 +162,7 @@ def build_candidates(ctx, mode, count, user=None):
             'retry_mistakes': [q for q, _ in build_candidates(ctx, 'retry_mistakes', count, user=user)],
             'source_weak_areas': [q for q, _ in build_candidates(ctx, 'source_weak_areas', count, user=user)],
             'due_review': due_review_candidates(ctx, user),
-            'new_questions': new_question_candidates(ctx, user),
+            'new_questions': new_question_candidates(ctx, user, limit=count),
         }
         origin_map = {
             'retry_mistakes': 'source_mistake', 'source_weak_areas': 'source_weak_topic',

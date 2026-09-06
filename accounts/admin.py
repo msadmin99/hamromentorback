@@ -15,7 +15,54 @@ class HamroUserAdmin(UserAdmin):
 
 @admin.register(RolePermission)
 class RolePermissionAdmin(admin.ModelAdmin):
+    """The Django-admin mutation path for RolePermission.
+
+    Audited to the same AdminEditAuditLog as the API path (see
+    accounts/role_audit.py). Django's own LogEntry already records *that*
+    a change happened here; this records what the value was before and
+    after, which LogEntry does not capture for a JSONField.
+
+    No double-logging risk: this stack and the DRF viewset are entirely
+    separate, so one mutation only ever traverses one of them.
+    """
     list_display = ('role', 'features')
+
+    def save_model(self, request, obj, form, change):
+        from django.db import transaction
+
+        from .role_audit import record_role_permission_change, snapshot
+
+        # Re-read the stored row for the before-state: `obj` is already
+        # carrying the form's new values by the time save_model is called,
+        # so snapshotting it here would record new-vs-new and show no change.
+        before = snapshot(RolePermission.objects.filter(pk=obj.pk).first()) if change else {}
+        with transaction.atomic():
+            super().save_model(request, obj, form, change)
+            record_role_permission_change(request, before=before, after=snapshot(obj), instance=obj)
+
+    def delete_model(self, request, obj):
+        from django.db import transaction
+
+        from .role_audit import record_role_permission_change, snapshot
+
+        before = snapshot(obj)
+        with transaction.atomic():
+            super().delete_model(request, obj)
+            record_role_permission_change(request, before=before, after={}, instance=obj)
+
+    def delete_queryset(self, request, queryset):
+        """The bulk-delete admin action. Deleting the row that grants a role
+        its features is as consequential as editing it, and the bulk path
+        must not be the unaudited way to do it."""
+        from django.db import transaction
+
+        from .role_audit import record_role_permission_change, snapshot
+
+        befores = [snapshot(obj) for obj in queryset]
+        with transaction.atomic():
+            super().delete_queryset(request, queryset)
+            for before in befores:
+                record_role_permission_change(request, before=before, after={}, instance=None)
 
 
 @admin.register(StudentProfile)

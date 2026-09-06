@@ -28,7 +28,28 @@ SECRET_KEY = os.environ.get(
 )
 
 # Shared secret for the external cron endpoints under /api/cron/*.
-CRON_SECRET = os.environ.get('CRON_SECRET', 'dev-cron-secret-change-me')
+#
+# Phase 9 hardening (deferred here from Phase 1): this used to fall back to a
+# hardcoded, publicly-readable 'dev-cron-secret-change-me' whenever the env var
+# was missing — meaning a deployment that simply failed to inject the secret
+# would silently accept that known string from anyone, with no signal that
+# anything was wrong. Production wires it through Secret Manager
+# (`CRON_SECRET=cron-secret:latest` in cloudbuild.yaml, verified), so outside
+# DEBUG the correct behavior is to fail loudly at startup rather than quietly
+# fall back. The dev default is kept for local work only.
+#
+# The endpoints themselves also fail closed on an empty configured secret (see
+# billing.views/courses.views `_check_cron_secret`) so a blank value can never
+# match a blank header.
+_DEBUG_ENV = os.environ.get('DJANGO_DEBUG', 'True') == 'True'
+CRON_SECRET = os.environ.get('CRON_SECRET', 'dev-cron-secret-change-me' if _DEBUG_ENV else '')
+if not CRON_SECRET and not _DEBUG_ENV:
+    from django.core.exceptions import ImproperlyConfigured
+
+    raise ImproperlyConfigured(
+        'CRON_SECRET must be set outside DEBUG — the /api/cron/* endpoints are protected by it alone. '
+        'Production injects it from Secret Manager (see cloudbuild.yaml).'
+    )
 
 # Referral program — applied automatically on a referred student's first approved purchase.
 REFERRAL_FRIEND_DISCOUNT_PERCENT = int(os.environ.get('REFERRAL_FRIEND_DISCOUNT_PERCENT', 10))
@@ -65,6 +86,57 @@ MEDIA_PROCESSING_SECRET = os.environ.get('MEDIA_PROCESSING_SECRET', 'dev-media-s
 # False in local dev (no Cloud Tasks queue to enqueue to) — processes
 # inline/synchronously instead. True in production.
 IMAGE_PROCESSING_ASYNC = os.environ.get('IMAGE_PROCESSING_ASYNC', 'False') == 'True'
+
+# Scalability audit Phase 2.2 — same Cloud Tasks pattern as image processing
+# above (an authenticated HTTP callback into this same service, no broker/
+# worker process), applied to bulk question import so a run survives request
+# completion/instance recycling and gets automatically retried by Cloud
+# Tasks on a transient failure. A dedicated queue (not the image-processing
+# one) so a backlog/failure in one workload never throttles the other.
+CLOUD_TASKS_IMPORT_QUEUE = os.environ.get('CLOUD_TASKS_IMPORT_QUEUE', 'bulk-import')
+IMPORT_PROCESSING_SECRET = os.environ.get('IMPORT_PROCESSING_SECRET', 'dev-import-secret-change-me')
+IMPORT_PROCESSING_ASYNC = os.environ.get('IMPORT_PROCESSING_ASYNC', 'False') == 'True'
+# How long a claimed-but-silent import run is presumed dead (instance
+# recycled, crashed) before a retried Cloud Task is allowed to reclaim and
+# resume it — see ImportBatch.processing_claimed_at.
+IMPORT_CLAIM_STALE_MINUTES = int(os.environ.get('IMPORT_CLAIM_STALE_MINUTES', '30'))
+
+# Bulk-import taxonomy audit (Phase 3): duplicate detection on a Subject
+# change moved off the taxonomy PATCH's synchronous request path — same
+# Cloud Tasks pattern, its own dedicated queue (not bulk-import) since
+# dedup and import have different runtime profiles and retry needs. See
+# academics/import_dedup_tasks.py.
+CLOUD_TASKS_DEDUP_QUEUE = os.environ.get('CLOUD_TASKS_DEDUP_QUEUE', 'bulk-import-dedup')
+DEDUP_PROCESSING_SECRET = os.environ.get('DEDUP_PROCESSING_SECRET', 'dev-dedup-secret-change-me')
+DEDUP_PROCESSING_ASYNC = os.environ.get('DEDUP_PROCESSING_ASYNC', 'False') == 'True'
+# How long a claimed-but-silent dedup run is presumed dead before a retried
+# Cloud Task is allowed to reclaim and resume it — see ImportBatch.
+# dedup_claimed_at. Kept separate from IMPORT_CLAIM_STALE_MINUTES since a
+# dedup run's own duration profile (all in-memory Python comparison, no
+# per-row DB work until a match is found) differs from a full import run's.
+DEDUP_CLAIM_STALE_MINUTES = int(os.environ.get('DEDUP_CLAIM_STALE_MINUTES', '30'))
+
+# Deadlock-fix audit — same Cloud Tasks pattern again, applied to the
+# cross-student Question/Option aggregate stats update SubmitTestView used
+# to apply inline: concurrent exam submissions sharing a question pool
+# could lock Question rows in different orders (each student's answers
+# come back in their own shuffled order) and deadlock under MySQL (errno
+# 1213), a real 500 for a real student. See tests_app/stats_tasks.py.
+#
+# Deliberately the OPPOSITE default from IMAGE_PROCESSING_ASYNC/
+# IMPORT_PROCESSING_ASYNC above: inline processing during a live exam
+# submission is exactly the bug this fixes, so an unset env var must fail
+# safe toward async, not toward the deadlock-prone inline path. Only ever
+# set STATS_PROCESSING_ASYNC=False for local development.
+CLOUD_TASKS_STATS_QUEUE = os.environ.get('CLOUD_TASKS_STATS_QUEUE', 'question-stats')
+STATS_PROCESSING_SECRET = os.environ.get('STATS_PROCESSING_SECRET', 'dev-stats-secret-change-me')
+STATS_PROCESSING_ASYNC = os.environ.get('STATS_PROCESSING_ASYNC', 'True') == 'True'
+# Production rollback lever, independent of the async/sync choice above:
+# False stops the stats pipeline entirely (SubmitTestView never computes
+# or enqueues a stats task) — exam submission itself is completely
+# unaffected either way, so this is always the safe rollback if the async
+# worker has a problem, never a reason to revert to inline processing.
+STATS_PROCESSING_ENABLED = os.environ.get('STATS_PROCESSING_ENABLED', 'True') == 'True'
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.environ.get('DJANGO_DEBUG', 'True') == 'True'
@@ -104,6 +176,7 @@ INSTALLED_APPS = [
     'marketplace',
     'media_library',
     'smart_practice',
+    'entitlements',
 ]
 
 MIDDLEWARE = [
@@ -129,6 +202,12 @@ REST_FRAMEWORK = {
     'DEFAULT_PERMISSION_CLASSES': (
         'rest_framework.permissions.IsAuthenticatedOrReadOnly',
     ),
+    # Scalability audit Phase 1.1: a bare-array-preserving backstop cap for
+    # any list endpoint that doesn't already set its own pagination_class —
+    # see hamromentor/pagination.py for why this doesn't change response
+    # shape anywhere.
+    'DEFAULT_PAGINATION_CLASS': 'hamromentor.pagination.GlobalSafeListPagination',
+    'PAGE_SIZE': 500,
 }
 
 SIMPLE_JWT = {
@@ -194,6 +273,14 @@ else:
         'default': {
             'ENGINE': 'django.db.backends.sqlite3',
             'NAME': BASE_DIR / 'db.sqlite3',
+            # Local/test-only fallback (production always uses MySQL, above).
+            # A generous busy timeout so select_for_update()-guarded writes
+            # from two overlapping requests/threads (see accounts/tests.py's
+            # AdminStudentEditConcurrencyTests, Phase 2) wait for each
+            # other the way real row-level locking would on MySQL, instead
+            # of SQLite's default near-zero timeout surfacing as an
+            # immediate "database is locked" OperationalError.
+            'OPTIONS': {'timeout': 20},
         }
     }
 
@@ -217,7 +304,12 @@ if os.environ.get('REDIS_HOST'):
     CACHES = {
         'default': {
             'BACKEND': 'django_redis.cache.RedisCache',
-            'LOCATION': f"redis://{os.environ['REDIS_HOST']}:{os.environ.get('REDIS_PORT', '6379')}/1",
+            # REDIS_DB defaults to '1' (production's existing, unchanged
+            # value) — only set to something else for an isolated
+            # environment (e.g. staging load testing) sharing the same
+            # Memorystore instance, so its cache reads/writes never
+            # collide with production's under overlapping row ids.
+            'LOCATION': f"redis://{os.environ['REDIS_HOST']}:{os.environ.get('REDIS_PORT', '6379')}/{os.environ.get('REDIS_DB', '1')}",
             'OPTIONS': {
                 'CLIENT_CLASS': 'django_redis.client.DefaultClient',
                 'IGNORE_EXCEPTIONS': True,

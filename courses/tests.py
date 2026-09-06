@@ -210,3 +210,25 @@ class BackfillEnrollmentFromSubscriptionMigrationTests(APITestCase):
 
         self.assertEqual(Enrollment.objects.filter(user=student, course=course).count(), 1)
         self.assertEqual(Enrollment.objects.get(user=student, course=course).access_type, 'free')  # untouched
+
+
+class EnrollmentListBoundedPaginationTests(APITestCase):
+    """Scalability audit fix: GET /enrollments/ (Admin's students page) had
+    no pagination_class — an unbounded query as enrollment volume grows.
+    Confirms the new safety cap doesn't change the existing bare-array
+    response shape."""
+
+    def setUp(self):
+        self.staff = User.objects.create_user(
+            username='staff1', email='staff1@example.com', password='pw12345', is_staff=True, admin_role='admin',
+        )
+        self.student = User.objects.create_user(username='student1', email='student1@example.com', password='pw12345')
+        self.course = Course.objects.create(name='CEE-MD Ayurveda', prefix='AYU')
+        Enrollment.objects.create(user=self.student, course=self.course)
+        self.client.force_authenticate(user=self.staff)
+
+    def test_list_is_still_a_bare_array(self):
+        resp = self.client.get('/api/enrollments/')
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsInstance(resp.data, list)
+        self.assertEqual(len(resp.data), 1)

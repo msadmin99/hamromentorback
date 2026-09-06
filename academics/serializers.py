@@ -16,10 +16,12 @@ class TopicSerializer(serializers.ModelSerializer):
         extra_kwargs = {'chapter': {'required': False}}
 
     def get_question_count(self, obj):
-        return obj.questions.count()
+        val = getattr(obj, 'annotated_question_count', None)
+        return val if val is not None else obj.questions.count()
 
     def get_video_count(self, obj):
-        return obj.videos.count()
+        val = getattr(obj, 'annotated_video_count', None)
+        return val if val is not None else obj.videos.count()
 
 
 class ChapterSerializer(serializers.ModelSerializer):
@@ -38,16 +40,21 @@ class ChapterSerializer(serializers.ModelSerializer):
         extra_kwargs = {'slug': {'required': False, 'default': ''}}
 
     def get_mcq_count(self, obj):
-        return obj.questions.count()
+        val = getattr(obj, 'annotated_mcq_count', None)
+        return val if val is not None else obj.questions.count()
 
     def get_solved_count(self, obj):
         user = self.context.get('request').user if self.context.get('request') else None
         if not user or not user.is_authenticated:
             return 0
+        precomputed = self.context.get('solved_count_by_chapter')
+        if precomputed is not None:
+            return precomputed.get(obj.id, 0)
         return QuestionAttempt.objects.filter(user=user, question__chapter=obj).values('question').distinct().count()
 
     def get_video_count(self, obj):
-        return obj.videos.count()
+        val = getattr(obj, 'annotated_video_count', None)
+        return val if val is not None else obj.videos.count()
 
 
 class SubjectListSerializer(serializers.ModelSerializer):
@@ -71,13 +78,16 @@ class SubjectListSerializer(serializers.ModelSerializer):
         extra_kwargs = {'slug': {'required': False}, 'prefix': {'required': False}}
 
     def get_module_count(self, obj):
-        return obj.chapters.count()
+        val = getattr(obj, 'annotated_module_count', None)
+        return val if val is not None else obj.chapters.count()
 
     def get_question_count(self, obj):
-        return obj.questions.count()
+        val = getattr(obj, 'annotated_question_count', None)
+        return val if val is not None else obj.questions.count()
 
     def get_video_count(self, obj):
-        return obj.videos.count()
+        val = getattr(obj, 'annotated_video_count', None)
+        return val if val is not None else obj.videos.count()
 
     def get_has_access(self, obj):
         from billing.access import has_qbank_access
@@ -94,6 +104,9 @@ class SubjectListSerializer(serializers.ModelSerializer):
         user = self.context.get('request').user if self.context.get('request') else None
         if not user or not user.is_authenticated:
             return 0
+        precomputed = self.context.get('solved_modules_by_subject')
+        if precomputed is not None:
+            return precomputed.get(obj.id, 0)
         return (
             QuestionAttempt.objects.filter(user=user, question__subject=obj)
             .values('question__chapter').distinct().count()
@@ -106,6 +119,9 @@ class SubjectListSerializer(serializers.ModelSerializer):
         user = self.context.get('request').user if self.context.get('request') else None
         if not user or not user.is_authenticated:
             return 0
+        precomputed = self.context.get('attempted_count_by_subject')
+        if precomputed is not None:
+            return precomputed.get(obj.id, 0)
         return QuestionAttempt.objects.filter(user=user, question__subject=obj).count()
 
     def get_percent_practiced(self, obj):
@@ -288,7 +304,22 @@ class QuestionResultSerializer(serializers.ModelSerializer):
     """Post-submission review shape (Test Mode result screen, and the
     shared piece of QuestionViewSet.answer()'s own response) — safe to
     reveal is_correct/pick_percentage/key_takeaway/reference here, since
-    the student has already answered (or the test is already submitted)."""
+    the student has already answered (or the test is already submitted).
+
+    Phase 7: solution-revealing content (is_correct, explanation and its
+    variants, key_takeaway, reference detail, per-option is_correct/
+    explanation/pick stats, and the aggregate correctness stats) is now
+    conditional on `context['show_solutions']` — defaults to True, so
+    QuestionViewSet.answer() (the QBank immediate-explanation feature,
+    unrelated to any Test's solutions_visibility policy) is completely
+    unaffected without needing any change there. TestResultSerializer
+    (the Test Mode caller this was actually built for) explicitly passes
+    `show_solutions=can_view_solutions(...).allowed`. The student's own
+    selected_option_id is NEVER stripped — seeing what you picked is
+    CanReview's territory, not CanViewSolutions', and is exactly the
+    "don't accidentally reveal the correct answer merely because the
+    student can see their own answer" distinction this phase's spec asks
+    for."""
     options = OptionAdminSerializer(many=True, read_only=True)
     subject_name = serializers.CharField(source='subject.name', read_only=True)
     selected_option_id = serializers.SerializerMethodField()
@@ -346,6 +377,35 @@ class QuestionResultSerializer(serializers.ModelSerializer):
     def get_is_correct(self, obj):
         attempt = self.context.get('attempt_map', {}).get(obj.id)
         return attempt.is_correct if attempt else False
+
+    # Fields stripped when solutions are locked — deliberately everything
+    # that either IS the answer key (explanation/is_correct/key_takeaway/
+    # reference detail) or could be combined to infer it (per-question and
+    # per-option correctness stats). `options` is rebuilt via
+    # OptionAdminSerializer above (which always includes is_correct/
+    # explanation/pick stats, correctly, for its OTHER caller — staff
+    # editing) — those specific keys are stripped per-option here instead
+    # of touching that serializer, so staff editing is never affected.
+    _SOLUTION_QUESTION_FIELDS = (
+        'is_correct', 'explanation', 'explanation_image', 'explanation_image_data', 'explanation_latex',
+        'explanation_video_url', 'key_takeaway', 'references',
+        'reference_book_name', 'reference_edition', 'reference_chapter', 'reference_page', 'reference_url',
+        'stats_available', 'students_correct_percent', 'total_responses',
+    )
+    _SOLUTION_OPTION_FIELDS = ('is_correct', 'explanation', 'pick_count', 'pick_percentage')
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        show_solutions = self.context.get('show_solutions', True)
+        data['solutions_locked'] = not show_solutions
+        if show_solutions:
+            return data
+        for field in self._SOLUTION_QUESTION_FIELDS:
+            data.pop(field, None)
+        for option in data.get('options') or []:
+            for field in self._SOLUTION_OPTION_FIELDS:
+                option.pop(field, None)
+        return data
 
 
 class QuestionReportSerializer(serializers.ModelSerializer):

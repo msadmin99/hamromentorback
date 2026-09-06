@@ -118,6 +118,21 @@ class Test(models.Model):
                    'clear this flag. Never set for exams created after this feature shipped.',
     )
 
+    # Phase 7 — only meaningful when solutions_visibility='manual': set once
+    # an admin explicitly releases solutions for this Test's session-less
+    # (anytime) attempts. See tests_app.lifecycle.can_view_solutions_for
+    # /entitlements.services.can_view_solutions for the read side, and
+    # TestViewSet.release_solutions for the write side. NULL = not yet
+    # released. Irrelevant when solutions_visibility='auto' (see that
+    # field's own help_text — 'auto' is computed from timing, not this).
+    # ExamSession has its own, independent pair of these same two fields
+    # for session-scoped attempts (a re-released Daily Test's Session #2
+    # must never inherit Session #1's release).
+    solutions_released_at = models.DateTimeField(null=True, blank=True)
+    solutions_released_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='+',
+    )
+
     # --- Reschedule / Exam Versioning ---
     # A Test row IS an "Exam Version" (it already holds the question set, duration,
     # marks, negative marking). exam_template groups multiple versions of the same
@@ -138,6 +153,15 @@ class Test(models.Model):
 
     class Meta:
         ordering = ['-scheduled_start', '-created_at']
+        indexes = [
+            # Scalability audit Phase 1.5: TestViewSet.get_queryset() filters
+            # by exam_type + is_draft together on essentially every list
+            # request (public listing always filters is_draft=False; Admin
+            # Exam Management filters both independently) — see
+            # tests_app/views.py get_queryset() and tests_app/access.py
+            # visible_test_queryset().
+            models.Index(fields=['exam_type', 'is_draft'], name='test_examtype_isdraft_idx'),
+        ]
 
     def __str__(self):
         return self.title
@@ -149,6 +173,54 @@ class Test(models.Model):
     @property
     def question_count(self):
         return self.questions.count()
+
+
+class ExamTypePolicy(models.Model):
+    """Phase 5 — one canonical, admin-overridable default-config template per
+    exam category (Practice/QBank, Mock, Daily, Grand, Past Year Questions).
+
+    This is a TEMPLATE consumed once, at Test-creation time, to fill in
+    unspecified fields on a new Test — never a live reference a Test keeps
+    pointing back to. Changing a row here never mutates any Test already
+    created; only Tests created *after* the change use the new values (see
+    tests_app/policy.py: get_exam_type_defaults(), the only reader of this
+    model, and TestAdminSerializer.create(), the only place its output is
+    consumed). No Test field is a ForeignKey to this model, by design.
+
+    Admin-configurable via the Django admin only, matching the same
+    precedent used by entitlements.FreeStarterPolicy in Phase 2 — a new
+    custom Admin-panel UI screen was judged unnecessary scope for Phase 5.
+    """
+    EXAM_TYPE_CHOICES = Test.EXAM_TYPE_CHOICES
+    SOLUTIONS_VISIBILITY_CHOICES = Test.SOLUTIONS_VISIBILITY_CHOICES
+
+    exam_type = models.CharField(max_length=20, choices=EXAM_TYPE_CHOICES, unique=True, primary_key=True)
+
+    default_duration_minutes = models.PositiveIntegerField(default=60)
+    default_questions_per_page = models.PositiveIntegerField(default=1)
+    default_negative_marking = models.BooleanField(default=True)
+    default_shuffle_questions = models.BooleanField(default=True)
+    default_shuffle_options = models.BooleanField(default=True)
+    default_max_attempts = models.PositiveIntegerField(default=1)
+    default_solutions_visibility = models.CharField(max_length=10, choices=SOLUTIONS_VISIBILITY_CHOICES, default='auto')
+    default_is_draft = models.BooleanField(
+        default=True,
+        help_text='On (recommended) = new exams of this category start as drafts, invisible to students until an '
+                   'admin explicitly publishes them — matches Test.is_draft\'s own safe-by-default documentation.',
+    )
+    default_is_pro = models.BooleanField(default=False)
+    default_free_preview_questions = models.PositiveIntegerField(default=0)
+    default_price = models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)
+
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Exam type policy'
+        verbose_name_plural = 'Exam type policies'
+        ordering = ['exam_type']
+
+    def __str__(self):
+        return f'{self.get_exam_type_display()} policy'
 
 
 class TestQuestion(models.Model):
@@ -205,6 +277,16 @@ class ExamSession(models.Model):
         'self', on_delete=models.SET_NULL, null=True, blank=True, related_name='occurrences',
     )
 
+    # Phase 7 — session-scoped counterpart of Test.solutions_released_at/by
+    # (see that field's comment). Independent per session on purpose: a
+    # Daily Test re-release (Phase 6) creates a brand new ExamSession, and
+    # releasing Session #1's solutions must never leak into a still-live
+    # Session #2 for the same Test.
+    solutions_released_at = models.DateTimeField(null=True, blank=True)
+    solutions_released_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='+',
+    )
+
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='+',
     )
@@ -223,19 +305,16 @@ class ExamSession(models.Model):
 
     def refresh_status(self):
         """Auto-transitions based on current time. Never moves a session out
-        of 'cancelled' or 'draft' — those are explicit admin actions only."""
-        from django.utils import timezone as tz
-        if self.status in ('cancelled', 'draft', 'completed'):
-            return self.status
-        now = tz.now()
-        if now > self.end_datetime:
-            new_status = 'completed'
-        elif now >= self.start_datetime:
-            new_status = 'live'
-        elif self.registration_deadline and now >= self.registration_deadline:
-            new_status = 'scheduled'
-        else:
-            new_status = 'registration_open' if self.registration_deadline else 'scheduled'
+        of 'cancelled' or 'draft' — those are explicit admin actions only.
+        Phase 6: the transition rule itself now lives in
+        tests_app.lifecycle.compute_effective_session_status() (a pure,
+        read-only function reused by ExamSessionSerializer.get_effective_
+        status() for list/retrieve reads, which never write) — this method
+        is just that rule plus the actual DB write, so a session's status
+        can never drift between what a read shows and what a write
+        commits."""
+        from .lifecycle import compute_effective_session_status
+        new_status = compute_effective_session_status(self)
         if new_status != self.status:
             self.status = new_status
             self.save(update_fields=['status'])
@@ -264,9 +343,46 @@ class TestAttempt(models.Model):
     percentile = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
     accuracy = models.DecimalField(max_digits=5, decimal_places=2, default=0)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='in_progress')
+    auto_submitted = models.BooleanField(
+        default=False,
+        help_text="Phase 6: True when this attempt was finalized by the server because its effective deadline "
+                   "(MIN(start_time + test.duration_minutes, session.end_datetime)) passed, rather than by the "
+                   "student's own Submit action. Deliberately NOT a separate status value — an auto-submitted "
+                   "attempt is 'submitted' in every way that matters (scored, ranked, reviewable) — this is purely "
+                   "an informational marker so the UI can show 'time ran out' instead of 'you submitted this' "
+                   "(see tests_app/lifecycle.py's module docstring for the full reasoning).",
+    )
+
+    stats_applied_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text='Deadlock-fix audit: set when this attempt\'s cross-student Question/Option aggregate stat '
+                   'deltas (total_attempts, correct_attempts, pick_count, pick_percentage — NOT scoring/ranking/'
+                   'QuestionAttempt, which stay synchronous) have been applied by the async stats worker (see '
+                   'tests_app/stats_tasks.py). Written only inside the same transaction as the apply itself (a '
+                   'locked check-then-apply-then-mark), so it can only ever be non-NULL after the deltas actually '
+                   'landed — never as a claim taken before the work, which a crash mid-task could otherwise leave '
+                   'stuck "done" with the stats never applied. NULL is always safe to retry.',
+    )
 
     class Meta:
         ordering = ['-start_time']
+        indexes = [
+            # Scalability audit Phase 1.5 — three real, confirmed query
+            # shapes, not speculative:
+            # (test, status, score): SubmitTestView's ranking pool
+            # (tests_app/views.py) and the test-wide average-score
+            # aggregation (tests_app/performance.py comparative()).
+            models.Index(fields=['test', 'status', 'score'], name='ta_test_status_score_idx'),
+            # (user, test, status): "this user's submitted attempts on this
+            # specific test" — tests_app/performance.py comparative().
+            models.Index(fields=['user', 'test', 'status'], name='ta_user_test_status_idx'),
+            # (user, status): the base queryset behind the whole, uncached
+            # performance dashboard — tests_app/performance.py
+            # _attempts_qs()/_activity_streak()/activity_calendar(), each
+            # hit on every dashboard load. A narrower prefix than the index
+            # above, needed because these don't also filter by test.
+            models.Index(fields=['user', 'status'], name='ta_user_status_idx'),
+        ]
 
     def __str__(self):
         return f'{self.user} - {self.test} (#{self.attempt_number})'
@@ -282,6 +398,164 @@ class Answer(models.Model):
 
     class Meta:
         unique_together = ('attempt', 'question')
+
+
+class AttemptQuestion(models.Model):
+    """Phase 9 — the frozen, ordered list of questions belonging to one
+    TestAttempt, persisted exactly once at attempt-creation time
+    (tests_app.lifecycle.freeze_attempt_questions(), called from
+    _start_attempt() immediately after the TestAttempt row is created),
+    never modified afterward.
+
+    Fixes the root cause of the Daily Test "white screen / questions
+    disappearing / refresh shows Submit" production incident:
+    TestAttemptSerializer.get_questions() used to re-derive the question
+    set/order from Test.questions on every single GET — including a
+    fresh random.shuffle() whenever Test.shuffle_questions=True (the
+    model's own default) and a fresh preview-eligibility slice for a
+    student without full access — so the specific questions an
+    in-progress attempt showed could silently change between page loads,
+    down to an empty set in the worst case. Every GET/answer/submit for
+    an attempt now reads this table instead of recomputing anything.
+
+    For a preview-only attempt (billing.access.is_preview_only() was True
+    at start time), only the free_preview_questions questions actually
+    selected are persisted here at all — exactly matching what the
+    student's UI displays, so "a question shown as preview" and "a
+    question the answer endpoint recognizes as preview" can never
+    diverge again. `is_preview` records this for every row of that
+    attempt purely for audit/debugging traceability — it is not consulted
+    by any access decision; entitlement itself is decided once via
+    lifecycle.attempt_is_preview_only() and never re-derived per question.
+
+    `question` is SET_NULL, not CASCADE — matching AttemptQuestionSnapshot's
+    own precedent below — so if a live Question is later deleted (already
+    blocked by QuestionViewSet.destroy() while the question has any
+    attempt history at all, but this is the defense-in-depth backstop for
+    every other deletion path: the Django admin site, a management
+    command, a bulk queryset .delete()), this row survives and the
+    attempt stays resumable for every OTHER question in its frozen list;
+    only the one row loses its live question content (get_questions()
+    skips a null-question row when building the display list — the
+    attempt's remaining questions and their order are otherwise
+    untouched).
+
+    Deliberately does NOT duplicate question text/options here (unlike
+    AttemptQuestionSnapshot, which does — but only once, at finalize
+    time, for the immutable post-submission review). During the
+    in-progress phase, content is still read live via the `question` FK:
+    freezing content this early would duplicate the Phase 8 snapshot
+    mechanism for no benefit before the attempt is even finalized. Only
+    WHICH questions and WHAT ORDER are frozen here — that was the one
+    thing actually unstable."""
+    attempt = models.ForeignKey(TestAttempt, on_delete=models.CASCADE, related_name='attempt_questions')
+    question = models.ForeignKey(Question, on_delete=models.SET_NULL, null=True, blank=True, related_name='+')
+    order = models.PositiveIntegerField(default=0)
+    is_preview = models.BooleanField(
+        default=False,
+        help_text='Whether this row exists because the attempt was frozen in preview-only mode at start time. '
+                   'Informational/audit only — no access decision reads this field directly.',
+    )
+
+    class Meta:
+        ordering = ['order']
+        # Not ('attempt', 'question') — matching AttemptQuestionSnapshot's
+        # own reasoning below: `question` can legitimately be null, and a
+        # unique constraint with a nullable column doesn't reliably
+        # enforce uniqueness across multiple NULLs. `order` is always
+        # populated (assigned from enumerate() at creation) and is
+        # naturally unique per attempt by construction.
+        unique_together = ('attempt', 'order')
+
+    def __str__(self):
+        return f'AttemptQuestion(attempt={self.attempt_id}, order={self.order})'
+
+
+class AttemptQuestionSnapshot(models.Model):
+    """Phase 8 — an immutable, point-in-time capture of exactly what one
+    question (text/options/explanation/correctness) looked like when a
+    specific TestAttempt was finalized, plus which option (by original,
+    non-FK identity) the student selected.
+
+    Created exactly once, inside finalize_attempt()'s own transaction
+    (tests_app/lifecycle.py) — never updated afterward; no code anywhere
+    calls .save()/.update() on an existing row. Exists specifically so a
+    later edit to the live Question/Option (text, correct answer,
+    explanation) — or even the live row's deletion — can never change what
+    an already-finalized attempt's review page shows or silently null out
+    which option the student picked (Answer.selected_option/QuestionAttempt.
+    selected_option are both SET_NULL and do get nulled by an ordinary
+    options edit — see QuestionAdminSerializer.update()). See
+    docs/QUESTION_VERSIONING_DESIGN.md for the full audit and the
+    versioning-vs-snapshot analysis behind this design.
+
+    `question` is SET_NULL (not CASCADE) specifically so this row survives
+    even if the live Question is later deleted — though that path is
+    already blocked while historical attempts exist (see
+    QuestionViewSet.destroy()), SET_NULL is the correct defensive choice
+    regardless, since every field actually needed for display is already
+    duplicated here, not re-derived from the live FK.
+
+    Deliberately NOT created for attempts finalized before this model
+    existed — backfilling from CURRENT (already-possibly-drifted) content
+    would not recover the true original content and risks looking more
+    authoritative than it is. Pre-Phase-8 attempts have no rows here; the
+    result serializer falls back to the exact pre-Phase-8 live-read
+    behavior for them (see docs/QUESTION_VERSIONING_DESIGN.md §7)."""
+    attempt = models.ForeignKey(TestAttempt, on_delete=models.CASCADE, related_name='question_snapshots')
+    question = models.ForeignKey(
+        'academics.Question', on_delete=models.SET_NULL, null=True, blank=True, related_name='+',
+        help_text='The live Question this was captured from, if it still exists — for admin/debugging traceability '
+                   'only. Every field actually used for display below is a duplicated, frozen copy, not derived '
+                   'from this FK, so it stays correct even if this goes null.',
+    )
+    order = models.PositiveIntegerField(default=0, help_text="This question's position in the test at finalization time.")
+
+    text = models.TextField()
+    image_data = models.JSONField(null=True, blank=True, help_text='Resolved {url, variants, width, height} — see media_library.serializers.resolve_image_data.')
+    latex = models.TextField(blank=True)
+
+    explanation = models.TextField(blank=True)
+    explanation_image_data = models.JSONField(null=True, blank=True)
+    explanation_latex = models.TextField(blank=True)
+    explanation_video_url = models.URLField(blank=True)
+    key_takeaway = models.TextField(blank=True)
+    references = models.JSONField(default=list, blank=True)
+    reference_book_name = models.CharField(max_length=255, blank=True)
+    reference_edition = models.CharField(max_length=50, blank=True)
+    reference_chapter = models.CharField(max_length=255, blank=True)
+    reference_page = models.CharField(max_length=50, blank=True)
+    reference_url = models.URLField(blank=True)
+
+    subject_name = models.CharField(max_length=255, blank=True)
+    marks = models.DecimalField(max_digits=5, decimal_places=2, default=1)
+    negative_marks = models.DecimalField(max_digits=5, decimal_places=2, default=0)
+
+    # [{id, text, image_data, latex, is_correct, explanation, order}, ...] —
+    # a JSON list, not a child table: options are only ever read as a unit
+    # alongside their question, never queried independently, so a
+    # table+FK graph would add real complexity for no benefit here (see
+    # docs/QUESTION_VERSIONING_DESIGN.md §5).
+    options_snapshot = models.JSONField(default=list)
+    # Plain integer, deliberately NOT a ForeignKey — the one field that
+    # actually solves the SET_NULL problem above: nothing can null this by
+    # deleting/recreating the live Option table. Matched against
+    # options_snapshot[i]['id'] at read time.
+    selected_option_original_id = models.PositiveIntegerField(null=True, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['order']
+        # Not ('attempt', 'question') — `question` can legitimately be
+        # null (§ above), and a unique constraint with a nullable column
+        # doesn't reliably enforce uniqueness across multiple NULLs. `order`
+        # is always populated (assigned from enumerate() at creation) and
+        # is naturally unique per attempt by construction.
+        unique_together = ('attempt', 'order')
+
+    def __str__(self):
+        return f'Snapshot: {self.text[:40]} (attempt #{self.attempt_id})'
 
 
 class SavedExamView(models.Model):

@@ -1,10 +1,13 @@
+from django.db.models import Prefetch
 from django.utils import timezone
 from rest_framework import serializers
 
-from academics.models import Question
+from academics.models import Option, Question
 from academics.serializers import OptionSerializer, QuestionResultSerializer
 
-from .models import Answer, ExamSession, ExamTemplate, SavedExamView, Test, TestAttempt, TestQuestion
+from .lifecycle import effective_attempt_end
+from .models import AttemptQuestionSnapshot, Answer, ExamSession, ExamTemplate, SavedExamView, Test, TestAttempt, TestQuestion
+from .policy import POLICY_CONTROLLED_FIELDS, get_exam_type_defaults
 
 
 def _staff_name(user):
@@ -15,12 +18,13 @@ def _staff_name(user):
 
 class TestListSerializer(serializers.ModelSerializer):
     subject_name = serializers.CharField(source='subject.name', read_only=True)
-    question_count = serializers.IntegerField(read_only=True)
+    question_count = serializers.SerializerMethodField()
     total_marks = serializers.SerializerMethodField()
     status = serializers.SerializerMethodField()
     best_score = serializers.SerializerMethodField()
     courses_detail = serializers.SerializerMethodField()
     card_status = serializers.SerializerMethodField()
+    access = serializers.SerializerMethodField()
     attempts_used = serializers.SerializerMethodField()
     created_by_name = serializers.SerializerMethodField()
     in_progress_answered_count = serializers.SerializerMethodField()
@@ -37,7 +41,8 @@ class TestListSerializer(serializers.ModelSerializer):
             'academic_year', 'university', 'scheduled_start', 'scheduled_end', 'status', 'best_score',
             'courses_detail', 'card_status', 'attempts_used', 'created_by_name', 'created_at',
             'is_draft', 'exam_template_id', 'exam_code', 'version_number', 'in_progress_answered_count',
-            'latest_attempt_id',
+            'latest_attempt_id', 'solutions_visibility', 'solutions_released_at',
+            'access',
         ]
 
     def get_created_by_name(self, obj):
@@ -45,7 +50,21 @@ class TestListSerializer(serializers.ModelSerializer):
             return ''
         return obj.created_by.first_name or obj.created_by.email
 
+    def get_question_count(self, obj):
+        # annotated_question_count (TestViewSet.get_queryset) replaces a
+        # live COUNT query per Test with one DB-side aggregate computed in
+        # the same query as the row fetch. Can't just annotate a queryset
+        # with the name `question_count` directly — Test.question_count is
+        # already a model @property, and Django raises trying to set an
+        # annotated value over an existing property descriptor — hence the
+        # differently-named annotation plus this explicit field/fallback.
+        annotated = getattr(obj, 'annotated_question_count', None)
+        return annotated if annotated is not None else obj.question_count
+
     def get_total_marks(self, obj):
+        annotated = getattr(obj, 'annotated_total_marks', None)
+        if annotated is not None:
+            return float(annotated)
         return float(obj.total_marks)
 
     def get_status(self, obj):
@@ -56,17 +75,35 @@ class TestListSerializer(serializers.ModelSerializer):
             return 'ended'
         return 'live'
 
+    def _user_attempts(self, obj):
+        # TestViewSet.get_queryset() prefetches this user's attempts across
+        # every Test in the page in one query — reuse that in-memory list
+        # instead of the 3 separate live per-row queries
+        # (best-score/in-progress/attempts-used) this replaced. Falls back
+        # to a real query so this serializer still works correctly (just
+        # not as cheaply) if ever used without that prefetch.
+        if hasattr(obj, '_prefetched_user_attempts'):
+            return obj._prefetched_user_attempts
+        user = self.context.get('request').user if self.context.get('request') else None
+        if not user or not user.is_authenticated:
+            return []
+        return list(obj.attempts.filter(user=user))
+
     def _best_attempt(self, obj):
         # Cached per-instance — get_best_score() and get_latest_attempt_id()
         # both need this same row (DRF calls SerializerMethodFields
         # independently, so without this every card would run it twice).
-        user = self.context.get('request').user if self.context.get('request') else None
         cache_attr = '_best_attempt_cache'
         if not hasattr(obj, cache_attr):
-            if not user or not user.is_authenticated:
-                setattr(obj, cache_attr, None)
-            else:
-                setattr(obj, cache_attr, obj.attempts.filter(user=user, status='submitted').order_by('-score').first())
+            # sorted() is stable, so ties keep _user_attempts' own order
+            # (most-recent-first, the model's default ordering) — a
+            # deterministic tiebreak, unlike the plain .order_by('-score')
+            # this replaces, which had no secondary sort key at all.
+            submitted = sorted(
+                (a for a in self._user_attempts(obj) if a.status == 'submitted'),
+                key=lambda a: a.score, reverse=True,
+            )
+            setattr(obj, cache_attr, submitted[0] if submitted else None)
         return getattr(obj, cache_attr)
 
     def get_best_score(self, obj):
@@ -87,31 +124,74 @@ class TestListSerializer(serializers.ModelSerializer):
         request = self.context.get('request')
         if not request or not request.user.is_authenticated:
             return 0
-        return obj.attempts.filter(user=request.user).count()
+        return len(self._user_attempts(obj))
 
     def _in_progress_attempt(self, obj):
-        user = self.context.get('request').user if self.context.get('request') else None
-        if not user or not user.is_authenticated:
-            return None
         # Cached on the instance per request — get_card_status() and
         # get_in_progress_answered_count() both need this and DRF calls
         # SerializerMethodFields independently, so without this every row
-        # would run the same attempt lookup twice.
+        # would run the same lookup twice.
         cache_attr = '_in_progress_attempt_cache'
         if not hasattr(obj, cache_attr):
-            setattr(obj, cache_attr, obj.attempts.filter(user=user, status='in_progress').order_by('-start_time').first())
+            in_progress = sorted(
+                (a for a in self._user_attempts(obj) if a.status == 'in_progress'),
+                key=lambda a: a.start_time, reverse=True,
+            )
+            setattr(obj, cache_attr, in_progress[0] if in_progress else None)
         return getattr(obj, cache_attr)
 
     def get_in_progress_answered_count(self, obj):
         attempt = self._in_progress_attempt(obj)
-        return attempt.answers.count() if attempt else None
+        if not attempt:
+            return None
+        # answered_count is annotated on the prefetched queryset — falls
+        # back to a live count for the no-prefetch case _user_attempts
+        # itself already falls back to.
+        annotated = getattr(attempt, 'answered_count', None)
+        return annotated if annotated is not None else attempt.answers.count()
+
+    def get_access(self, obj):
+        """Phase 10 — the server-authoritative card contract (state,
+        can_start/continue/review, reason_code, upgrade_available, source).
+        See tests_app/card_access.py.
+
+        The snapshot is built once per request and cached on the serializer
+        context, so a 20-card page costs a fixed handful of entitlement
+        queries rather than 20 × that. `_user_attempts` is already
+        prefetched for the whole page by TestViewSet.get_queryset()."""
+        from .card_access import StudentEntitlementSnapshot, resolve_card_access
+        from .preview import resolve_preview_user
+
+        request = self.context.get('request')
+        user = request.user if request else None
+        # Phase 10 plan bullet 3 — admin "preview as student": resolve the
+        # card as that student, read-only (read_only=True suppresses the
+        # lazy Free Starter provisioning a normal check would perform, so
+        # previewing cannot write to their account). None for everyone else.
+        preview_user = resolve_preview_user(request)
+        if preview_user is not None:
+            user = preview_user
+        snapshot = self.context.get('_entitlement_snapshot')
+        if snapshot is None or snapshot.user is not user:
+            snapshot = StudentEntitlementSnapshot(user, read_only=preview_user is not None)
+            # self.context is shared across every item in a many=True
+            # render, which is exactly the scope this should live in.
+            self.context['_entitlement_snapshot'] = snapshot
+        return resolve_card_access(obj, snapshot, self._user_attempts(obj))
 
     def get_card_status(self, obj):
         """Available / Upcoming / Completed / Missed / In Progress — for the
         dashboard exam card. In Progress (a real TestAttempt exists but
         hasn't been submitted yet) previously fell through to 'available',
         which showed 'Start Test' instead of 'Continue Test' and lost the
-        distinction the new status tabs need."""
+        distinction the new status tabs need.
+
+        Phase 10 note: kept for backward compatibility with existing
+        clients, but `access.state` (above) is now the authoritative field
+        — this one is derived from the legacy Test.scheduled_start/end
+        fields rather than the ExamSession that actually schedules a Daily/
+        Grand exam (Phase 6), and knows nothing about entitlement. New UI
+        should read `access`."""
         now = timezone.now()
         has_attempted = self.get_best_score(obj) is not None
         if has_attempted:
@@ -149,14 +229,31 @@ class QuestionForAttemptSerializer(serializers.ModelSerializer):
 class TestDetailSerializer(TestListSerializer):
     has_access = serializers.SerializerMethodField()
     requires_password = serializers.SerializerMethodField()
+    # Phase 10: the authoritative preview flag, straight from
+    # billing.access.is_preview_only — the student detail page used to
+    # re-derive this client-side as
+    # `is_pro && !has_access && free_preview_questions > 0 && type !== grand`,
+    # a fourth place answering a question the backend already answers.
+    preview_only = serializers.SerializerMethodField()
 
     class Meta(TestListSerializer.Meta):
         fields = TestListSerializer.Meta.fields + [
             'shuffle_questions', 'shuffle_options', 'negative_marking', 'max_attempts',
-            'free_preview_questions', 'has_access', 'requires_password',
+            'free_preview_questions', 'has_access', 'requires_password', 'preview_only',
         ]
 
+    def get_preview_only(self, obj):
+        from billing.access import is_preview_only
+
+        request = self.context.get('request')
+        return is_preview_only(request.user if request else None, obj)
+
     def get_has_access(self, obj):
+        """Kept for backward compatibility with existing clients. Note it
+        answers a narrower question than `access` (above) — it knows
+        nothing about Free Starter, assignment, attempt limits or session
+        windows, so a student who can genuinely start a test can still see
+        `has_access: false` here. New UI should read `access`."""
         from billing.access import get_grand_test_access, has_daily_test_access, has_mock_test_access
 
         if not obj.is_pro:
@@ -184,6 +281,8 @@ class TestAdminSerializer(serializers.ModelSerializer):
     total_marks = serializers.SerializerMethodField()
     created_by_name = serializers.SerializerMethodField()
     exam_code = serializers.CharField(source='exam_template.exam_code', read_only=True, default=None)
+    # Phase 7 — read-only, written only by TestViewSet.release_solutions.
+    solutions_released_by_name = serializers.SerializerMethodField()
 
     class Meta:
         model = Test
@@ -194,8 +293,12 @@ class TestAdminSerializer(serializers.ModelSerializer):
             'is_pro', 'is_new', 'price', 'access_password', 'free_preview_questions', 'academic_year', 'university',
             'scheduled_start', 'scheduled_end', 'is_draft', 'question_ids', 'questions', 'question_count', 'total_marks',
             'created_by_name', 'exam_template', 'exam_code', 'version_number',
+            'solutions_released_at', 'solutions_released_by_name',
         ]
-        read_only_fields = ['exam_template', 'version_number']
+        read_only_fields = ['exam_template', 'version_number', 'solutions_released_at']
+
+    def get_solutions_released_by_name(self, obj):
+        return _staff_name(obj.solutions_released_by)
 
     def get_total_marks(self, obj):
         return float(obj.total_marks)
@@ -217,6 +320,19 @@ class TestAdminSerializer(serializers.ModelSerializer):
         request = self.context.get('request')
         if request and request.user.is_authenticated:
             validated_data['created_by'] = request.user
+        # Phase 5: backend-authoritative exam-type policy defaults. Both
+        # known frontends (Create Exam Wizard, Import & Create Test) always
+        # send every field explicitly today, so this is dormant for them —
+        # an admin's explicit per-exam value always wins, exactly as before.
+        # This exists so the backend, not just frontend fetch logic, is the
+        # real source of truth for any caller that sends a partial payload.
+        # update() never applies this — an existing Test is never touched
+        # by a later policy change.
+        exam_type = validated_data.get('exam_type', Test._meta.get_field('exam_type').get_default())
+        defaults = get_exam_type_defaults(exam_type)
+        for field in POLICY_CONTROLLED_FIELDS:
+            if field not in validated_data:
+                validated_data[field] = defaults[field]
         test = Test.objects.create(**validated_data)
         if courses:
             test.courses.set(courses)
@@ -268,23 +384,66 @@ class ExamSessionSerializer(serializers.ModelSerializer):
     participant_count = serializers.IntegerField(read_only=True)
     created_by_name = serializers.SerializerMethodField()
     password = serializers.CharField(required=False, allow_blank=True, write_only=True)
+    # Phase 6 — additive: `status` is the last value a WRITE (the start
+    # action, or an explicit admin edit) actually persisted, which can be
+    # stale on a plain list/retrieve if nothing has written to this
+    # session since its time window changed (audit finding: "session
+    # state refresh was partly lazy"). `effective_status` is always
+    # correct, computed live, and never writes — see
+    # tests_app.lifecycle.compute_effective_session_status().
+    effective_status = serializers.SerializerMethodField()
+    # 'not_started' | 'in_progress' | 'submitted' | 'missed' | 'cancelled' | None (anonymous).
+    # One extra query per row (this attempt lookup isn't annotated onto the
+    # queryset) — accepted for now: session lists are small/curated
+    # (typically one Daily Test's worth of occurrences, or an admin's
+    # schedule view), not catalog-scale like the QBank listing Phase 3 had
+    # to optimize. Flagged, not silently ignored, if this ever needs to
+    # move to a query-level annotation.
+    my_status = serializers.SerializerMethodField()
+    # Phase 7 — read-only, written only by ExamSessionViewSet.release_solutions.
+    solutions_released_by_name = serializers.SerializerMethodField()
 
     class Meta:
         model = ExamSession
         fields = [
             'id', 'exam_template', 'exam_template_title', 'exam_code', 'exam_version', 'session_name',
             'start_datetime', 'end_datetime', 'registration_deadline', 'timezone', 'access_type',
-            'access_courses', 'password', 'max_attempts', 'status', 'recurrence', 'question_count',
-            'total_marks', 'duration_minutes', 'negative_marking', 'participant_count',
-            'created_by_name', 'created_at', 'updated_at',
+            'access_courses', 'password', 'max_attempts', 'status', 'effective_status', 'my_status',
+            'recurrence', 'question_count', 'total_marks', 'duration_minutes', 'negative_marking',
+            'participant_count', 'created_by_name', 'created_at', 'updated_at',
+            'solutions_released_at', 'solutions_released_by_name',
         ]
-        read_only_fields = ['exam_template', 'exam_version', 'status']
+        read_only_fields = ['exam_template', 'exam_version', 'status', 'solutions_released_at']
 
     def get_total_marks(self, obj):
         return float(obj.exam_version.total_marks)
 
     def get_created_by_name(self, obj):
         return _staff_name(obj.created_by)
+
+    def get_solutions_released_by_name(self, obj):
+        return _staff_name(obj.solutions_released_by)
+
+    def get_effective_status(self, obj):
+        from .lifecycle import compute_effective_session_status
+        return compute_effective_session_status(obj)
+
+    def get_my_status(self, obj):
+        from .lifecycle import compute_effective_session_status
+
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        if not user or not user.is_authenticated:
+            return None
+        attempt = obj.attempts.filter(user=user).order_by('-start_time').first()
+        if attempt:
+            return attempt.status  # 'in_progress' or 'submitted'
+        effective = compute_effective_session_status(obj)
+        if effective == 'completed':
+            return 'missed'
+        if effective == 'cancelled':
+            return 'cancelled'
+        return 'not_started'
 
 
 class ExamTemplateSerializer(serializers.ModelSerializer):
@@ -373,26 +532,69 @@ class TestAttemptSerializer(serializers.ModelSerializer):
     questions_per_page = serializers.IntegerField(source='test.questions_per_page', read_only=True)
     preview_only = serializers.SerializerMethodField()
     session_name = serializers.CharField(source='session.session_name', read_only=True, default=None)
+    # Phase 6 — additive, display-only timing info. The frontend timer must
+    # never be authoritative (every attempt-mutating endpoint independently
+    # re-checks the deadline server-side regardless of what these say) —
+    # these exist purely so the UI can render an accurate countdown/"time's
+    # up" state instead of guessing from duration_minutes alone, which
+    # ignores a shorter session window.
+    effective_end_at = serializers.SerializerMethodField()
+    server_time = serializers.SerializerMethodField()
 
     class Meta:
         model = TestAttempt
         fields = [
             'id', 'test', 'test_title', 'duration_minutes', 'questions_per_page', 'attempt_number',
-            'start_time', 'status', 'questions', 'answers', 'preview_only', 'session', 'session_name',
+            'start_time', 'status', 'auto_submitted', 'questions', 'answers', 'preview_only', 'session',
+            'session_name', 'effective_end_at', 'server_time',
         ]
 
     def get_preview_only(self, obj):
-        from billing.access import is_preview_only
-        request = self.context.get('request')
-        return is_preview_only(request.user if request else None, obj.test)
+        # Phase 9: the frozen, immutable-once-started verdict — see
+        # tests_app.lifecycle.attempt_is_preview_only's own docstring for
+        # why this must not re-derive from the student's current
+        # entitlement state once the attempt is already in progress.
+        from .lifecycle import attempt_is_preview_only
+
+        return attempt_is_preview_only(obj)
+
+    def get_effective_end_at(self, obj):
+        return effective_attempt_end(obj) if obj.status == 'in_progress' else None
+
+    def get_server_time(self, obj):
+        from django.utils import timezone
+        return timezone.now()
 
     def get_questions(self, obj):
-        qs = list(obj.test.questions.all().prefetch_related('options'))
-        if obj.test.shuffle_questions:
-            import random
-            random.shuffle(qs)
-        if self.get_preview_only(obj):
-            qs = qs[:obj.test.free_preview_questions]
+        # Phase 9: the frozen, persisted question set/order for this
+        # attempt — the fix for the proven incident where this method
+        # re-shuffled Test.questions (and re-sliced a fresh preview
+        # subset) on every single GET, so the same in-progress attempt
+        # could show a different question set/order on every reload.
+        frozen = list(
+            obj.attempt_questions.select_related('question').prefetch_related('question__options').order_by('order')
+        )
+        if frozen:
+            # A null question means the live Question was deleted after
+            # this attempt froze its list (see AttemptQuestion's own
+            # docstring) — skip it rather than error; the attempt's
+            # remaining questions and their order are otherwise untouched.
+            qs = [aq.question for aq in frozen if aq.question_id and aq.question is not None]
+        else:
+            # Legacy compatibility: an in-progress attempt started before
+            # this feature shipped has no frozen AttemptQuestion rows at
+            # all. Preserves the exact pre-fix behavior for that
+            # naturally-shrinking population only (it never regains
+            # frozen rows retroactively) — never applied to a SUBMITTED
+            # attempt, which this method is never called for at all (see
+            # AttemptDetailView.get(), which routes a reviewable attempt
+            # to TestResultSerializer/AttemptQuestionSnapshot instead).
+            qs = list(obj.test.questions.all().prefetch_related('options'))
+            if obj.test.shuffle_questions:
+                import random
+                random.shuffle(qs)
+            if self.get_preview_only(obj):
+                qs = qs[:obj.test.free_preview_questions]
 
         request = self.context.get('request')
         user = request.user if request else None
@@ -437,7 +639,7 @@ class TestAttemptSummarySerializer(serializers.ModelSerializer):
         model = TestAttempt
         fields = [
             'id', 'test', 'test_title', 'exam_type', 'score', 'total_marks', 'rank',
-            'percentile', 'accuracy', 'status', 'start_time', 'end_time', 'time_taken_seconds',
+            'percentile', 'accuracy', 'status', 'auto_submitted', 'start_time', 'end_time', 'time_taken_seconds',
             'session', 'session_name',
         ]
 
@@ -463,29 +665,205 @@ class SessionAttemptSerializer(TestAttemptSummarySerializer):
         return f'{obj.user.first_name} {obj.user.last_name}'.strip() or obj.user.email
 
 
+class AttemptQuestionSnapshotResultSerializer(serializers.Serializer):
+    """Phase 8 — renders an immutable AttemptQuestionSnapshot into the
+    exact same output shape QuestionResultSerializer produces (same key
+    names), so the frontend needs zero changes for fields it already
+    reads — only the CONTENT source changed (frozen snapshot instead of a
+    live Question/Option query), never the shape or the access-control
+    architecture. See docs/QUESTION_VERSIONING_DESIGN.md.
+
+    Same `context['show_solutions']` gating as QuestionResultSerializer,
+    reusing that class's own field-name lists (`_SOLUTION_QUESTION_FIELDS`/
+    `_SOLUTION_OPTION_FIELDS`) so the two can never independently drift on
+    what counts as "solution content" to strip.
+
+    A plain Serializer, not a ModelSerializer — snapshot field names
+    (`options_snapshot`, `selected_option_original_id`) deliberately don't
+    match the output 1:1, and building this by hand is clearer than
+    fighting a ModelSerializer's field-name inference for that mapping.
+    """
+    text = serializers.CharField()
+    latex = serializers.CharField()
+    image_data = serializers.JSONField()
+    explanation = serializers.CharField()
+    explanation_latex = serializers.CharField()
+    explanation_image_data = serializers.JSONField()
+    explanation_video_url = serializers.CharField()
+    references = serializers.JSONField()
+    key_takeaway = serializers.CharField()
+    reference_book_name = serializers.CharField()
+    reference_edition = serializers.CharField()
+    reference_chapter = serializers.CharField()
+    reference_page = serializers.CharField()
+    reference_url = serializers.CharField()
+    subject_name = serializers.CharField()
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        # Legacy raw-URL image fields — image_data alone is sufficient
+        # (RichContent.js prefers it and only falls back to `image` when
+        # image_data is absent), so these are always null from a snapshot.
+        data['image'] = None
+        data['explanation_image'] = None
+        data['id'] = instance.question_id  # may be null if the live Question was since deleted
+        data['public_id'] = None
+
+        answer = self.context.get('attempt_map', {}).get(instance.question_id)
+        data['selected_option_id'] = instance.selected_option_original_id
+        data['is_correct'] = answer.is_correct if answer else False
+
+        # Peer "% of students got this right" stats are inherently live,
+        # ever-changing aggregates (Question.total_attempts/correct_attempts),
+        # never a point-in-time fact the way correctness/explanation are —
+        # deliberately kept live (via the still-existing Question FK) rather
+        # than frozen, matching docs/QUESTION_VERSIONING_DESIGN.md §5's
+        # reasoning for what is and isn't snapshotted. Unavailable once the
+        # live Question is gone (nothing left to read it from).
+        min_attempts = self.context.get('min_attempts_for_option_stats')
+        if min_attempts is None:
+            from academics.models import QuestionBankConfig
+            min_attempts = QuestionBankConfig.load().min_attempts_for_option_stats
+        q = instance.question
+        if q and q.total_attempts >= min_attempts:
+            data['stats_available'] = True
+            data['students_correct_percent'] = round(q.correct_attempts / q.total_attempts * 100)
+            data['total_responses'] = q.total_attempts
+        else:
+            data['stats_available'] = False
+            data['students_correct_percent'] = None
+            data['total_responses'] = None
+
+        data['options'] = [
+            {
+                'id': o.get('id'), 'text': o.get('text', ''), 'image': None,
+                'image_data': o.get('image_data'), 'latex': o.get('latex', ''), 'order': o.get('order', 0),
+                'is_correct': o.get('is_correct', False), 'explanation': o.get('explanation', ''),
+                'pick_count': None, 'pick_percentage': None,
+            }
+            for o in (instance.options_snapshot or [])
+        ]
+
+        show_solutions = self.context.get('show_solutions', True)
+        data['solutions_locked'] = not show_solutions
+        if not show_solutions:
+            for field in QuestionResultSerializer._SOLUTION_QUESTION_FIELDS:
+                data.pop(field, None)
+            for option in data['options']:
+                for field in QuestionResultSerializer._SOLUTION_OPTION_FIELDS:
+                    option.pop(field, None)
+        return data
+
+
 class TestResultSerializer(serializers.ModelSerializer):
     questions = serializers.SerializerMethodField()
     test_title = serializers.CharField(source='test.title', read_only=True)
     total_marks = serializers.SerializerMethodField()
     session_name = serializers.CharField(source='session.session_name', read_only=True, default=None)
+    # Phase 7 — server-authoritative capability state, additive. The
+    # frontend should show/hide rank and the solutions section based on
+    # these, not on its own guess — the per-question `solutions_locked`
+    # flag inside each item of `questions` is the actual enforcement
+    # (this is a convenience summary of the same decision).
+    can_view_solutions = serializers.SerializerMethodField()
+    can_view_rank = serializers.SerializerMethodField()
 
     class Meta:
         model = TestAttempt
         fields = [
             'id', 'test', 'test_title', 'score', 'total_marks', 'rank',
-            'percentile', 'accuracy', 'status', 'start_time', 'end_time', 'questions',
-            'session', 'session_name',
+            'percentile', 'accuracy', 'status', 'auto_submitted', 'start_time', 'end_time', 'questions',
+            'session', 'session_name', 'can_view_solutions', 'can_view_rank',
         ]
 
     def get_total_marks(self, obj):
         return float(obj.test.total_marks)
 
+    def _show_solutions(self, obj):
+        # Memoized per-instance — get_questions() below and this field both
+        # need the same decision; DRF instantiates one serializer per
+        # attempt here (never `many=True`), so this is safe and avoids
+        # computing it twice for one response.
+        if not hasattr(self, '_show_solutions_cache'):
+            from entitlements.services import can_view_solutions as _can_view_solutions
+            request = self.context.get('request')
+            self._show_solutions_cache = _can_view_solutions(request.user if request else None, obj).allowed
+        return self._show_solutions_cache
+
+    def get_can_view_solutions(self, obj):
+        return self._show_solutions(obj)
+
+    def get_can_view_rank(self, obj):
+        from entitlements.services import can_view_rank as _can_view_rank
+        request = self.context.get('request')
+        return _can_view_rank(request.user if request else None, obj).allowed
+
     def get_questions(self, obj):
+        # Phase 7: whether solution content (is_correct/explanation/
+        # correct-option/aggregate stats) is included in each question
+        # below — see entitlements.services.can_view_solutions and
+        # QuestionResultSerializer's own docstring.
+        show_solutions = self._show_solutions(obj)
+
         filter_type = self.context.get('filter', 'all')
+        if not show_solutions:
+            # The wrong/correct filter is itself a soft solution leak (it
+            # tells the student which questions they missed, which — for a
+            # small option set — can narrow down the correct answer) —
+            # disabled while solutions are locked, same as the per-question
+            # is_correct field it depends on.
+            filter_type = 'all'
         answers = {a.question_id: a for a in obj.answers.select_related('question', 'selected_option')}
+
+        from academics.models import QuestionBankConfig
+        min_attempts = QuestionBankConfig.load().min_attempts_for_option_stats
+
+        # Phase 8: an attempt finalized after this phase shipped has one
+        # AttemptQuestionSnapshot per question, captured immutably at
+        # finalization — reading from these instead of the live Question/
+        # Option table is what makes review content immune to a later edit
+        # (or deletion) of that content. See docs/QUESTION_VERSIONING_
+        # DESIGN.md. Pre-Phase-8 attempts have none (deliberately never
+        # backfilled — see that doc's §7) and fall through unchanged to
+        # this method's original live-read behavior below.
+        snapshots = list(obj.question_snapshots.select_related('question').order_by('order'))
+        if snapshots:
+            attempt_map = {
+                s.question_id: answers.get(s.question_id) or Answer(question_id=s.question_id, selected_option=None, is_correct=False)
+                for s in snapshots
+            }
+            if filter_type == 'wrong':
+                snapshots = [s for s in snapshots if not attempt_map[s.question_id].is_correct]
+            elif filter_type == 'correct':
+                snapshots = [s for s in snapshots if attempt_map[s.question_id].is_correct]
+            context = {
+                'attempt_map': attempt_map, 'show_solutions': show_solutions,
+                'min_attempts_for_option_stats': min_attempts,
+            }
+            return AttemptQuestionSnapshotResultSerializer(snapshots, many=True, context=context).data
+
+        # --- Pre-Phase-8 fallback: the exact, unchanged original behavior ---
         # Every question in the test is reviewable, not just the ones the student answered —
         # a skipped question is still "wrong", and should still show up with its solution.
-        questions = list(obj.test.questions.all())
+        #
+        # Scalability audit Phase 1: QuestionResultSerializer (below) reads
+        # subject_name, reference_book_name, image_data, explanation_image_data,
+        # and the full options list for every question it serializes. Without
+        # these, each was a separate lazy query per question — select_related
+        # for the single-object FKs, and a Prefetch (with its own
+        # select_related for each option's image_asset, mirroring the same
+        # pattern already used for Question Bank browsing) for the options
+        # reverse-FK — collapsing what was ~4-5 queries/question down to a
+        # fixed handful for the whole list. Same base queryset
+        # (obj.test.questions), so question set and ordering are unchanged —
+        # only the relations attached to each row differ.
+        questions = list(
+            obj.test.questions.select_related(
+                'subject', 'reference_book', 'image_asset', 'explanation_image_asset',
+            ).prefetch_related(
+                Prefetch('options', queryset=Option.objects.select_related('image_asset')),
+            )
+        )
         attempt_map = {
             q.id: answers.get(q.id) or Answer(question_id=q.id, selected_option=None, is_correct=False)
             for q in questions
@@ -495,9 +873,9 @@ class TestResultSerializer(serializers.ModelSerializer):
         elif filter_type == 'correct':
             questions = [q for q in questions if attempt_map[q.id].is_correct]
 
-        from academics.models import QuestionBankConfig
         context = {
             'attempt_map': attempt_map,
-            'min_attempts_for_option_stats': QuestionBankConfig.load().min_attempts_for_option_stats,
+            'min_attempts_for_option_stats': min_attempts,
+            'show_solutions': show_solutions,
         }
         return QuestionResultSerializer(questions, many=True, context=context).data

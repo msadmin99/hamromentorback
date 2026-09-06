@@ -146,6 +146,78 @@ class RejectionTests(BillingTestCase):
         self.assertEqual(entry.reason, 'Amount mismatch')
 
 
+class PurchaseApprovalRoleGateTests(BillingTestCase):
+    """P0 security-audit regression: approve/reject/request-resubmission/
+    audit-log previously used bare IsAdminUser (checks only is_staff), the
+    only four sensitive billing endpoints in this file that didn't use
+    IsAdminRoleOrAbove like their siblings (CouponViewSet, ScholarshipViewSet,
+    GrantAccessView, AnalyticsView) — meaning an Editor or Teacher-role
+    account, explicitly denied the 'billing' feature everywhere else, could
+    still approve/reject real payments and read the payment audit trail.
+    Now all four correctly block Editor/Teacher and allow Admin+."""
+
+    def setUp(self):
+        super().setUp()
+        self.editor = User.objects.create_user(
+            username='purchase_gate_editor', email='purchase_gate_editor@example.com', password='pw12345',
+            is_staff=True, admin_role='editor',
+        )
+        self.teacher = User.objects.create_user(
+            username='purchase_gate_teacher', email='purchase_gate_teacher@example.com', password='pw12345',
+            is_staff=True, admin_role='teacher',
+        )
+
+    def test_editor_cannot_approve(self):
+        purchase = self._create_purchase()
+        self._submit(purchase['id'])
+        self.client.force_authenticate(user=self.editor)
+
+        resp = self.client.post(f'/api/purchases/{purchase["id"]}/approve/', {})
+
+        self.assertEqual(resp.status_code, 403)
+        self.assertFalse(Subscription.objects.filter(user=self.student).exists())
+
+    def test_teacher_cannot_reject(self):
+        purchase = self._create_purchase()
+        self._submit(purchase['id'])
+        self.client.force_authenticate(user=self.teacher)
+
+        resp = self.client.post(f'/api/purchases/{purchase["id"]}/reject/', {'admin_note': 'x'})
+
+        self.assertEqual(resp.status_code, 403)
+
+    def test_editor_cannot_request_resubmission(self):
+        purchase = self._create_purchase()
+        self._submit(purchase['id'])
+        self.client.force_authenticate(user=self.editor)
+
+        resp = self.client.post(f'/api/purchases/{purchase["id"]}/request-resubmission/', {'admin_note': 'x'})
+
+        self.assertEqual(resp.status_code, 403)
+
+    def test_editor_cannot_read_audit_log(self):
+        purchase = self._create_purchase()
+        self._submit(purchase['id'])
+        self.client.force_authenticate(user=self.editor)
+
+        resp = self.client.get(f'/api/purchases/{purchase["id"]}/audit-log/')
+
+        self.assertEqual(resp.status_code, 403)
+
+    def test_admin_role_can_still_approve(self):
+        """Regression guard: the fix must not also lock out the legitimate
+        admin_role='admin'/'super_admin' tier — self.staff already covers
+        this via the existing ApprovalActivatesAccessTests below, this just
+        asserts it explicitly alongside the new denial tests."""
+        purchase = self._create_purchase()
+        self._submit(purchase['id'])
+        self.client.force_authenticate(user=self.staff)
+
+        resp = self.client.post(f'/api/purchases/{purchase["id"]}/approve/', {})
+
+        self.assertEqual(resp.status_code, 200)
+
+
 class ApprovalActivatesAccessTests(BillingTestCase):
     def test_approve_activates_subscription_audits_and_notifies(self):
         purchase = self._create_purchase()
@@ -730,3 +802,26 @@ class GrantAccessCreatesEnrollmentTests(BillingTestCase):
         self.assertIn(resp.status_code, (200, 201), resp.data)
         self.assertIn('scholarship_id', resp.data)
         self.assertIn(self.course.id, eligible_course_ids(self.student))
+
+
+class PurchaseListBoundedPaginationTests(BillingTestCase):
+    """Scalability audit fix: GET /purchases/ had no pagination_class at
+    all — an admin's "all purchases" view was an unbounded query. Confirms
+    the new safety cap doesn't change the existing bare-array shape for
+    either the student's-own-purchases path or the staff all-purchases
+    path."""
+
+    def test_student_own_purchases_still_a_bare_array(self):
+        self._create_purchase()
+        resp = self.client.get('/api/purchases/')
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsInstance(resp.data, list)
+        self.assertEqual(len(resp.data), 1)
+
+    def test_staff_all_purchases_still_a_bare_array(self):
+        self._create_purchase()
+        self.client.force_authenticate(user=self.staff)
+        resp = self.client.get('/api/purchases/')
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsInstance(resp.data, list)
+        self.assertGreaterEqual(len(resp.data), 1)

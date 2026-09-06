@@ -10,7 +10,7 @@ from . import services
 from .access import SourceScopeError, resolve_source_scope
 from .models import SmartPracticeConfig, SmartPracticeSession
 from .serializers import SmartPracticeSessionSerializer
-from .services import bookmarked_candidates, due_review_candidates, new_question_candidates
+from .services import bookmarked_candidates, due_review_candidates, new_question_pool
 from .source_performance import source_missed_questions, source_topic_mastery
 
 MODE_LABELS = dict(SmartPracticeSession.MODE_CHOICES)
@@ -58,7 +58,7 @@ class EligibilityView(APIView):
         topics = source_topic_mastery(ctx, config.weak_topic_accuracy_max_pct)
         weak_topic_count = sum(1 for t in topics if t['is_weak'])
         due_count = len(due_review_candidates(ctx, request.user))
-        new_count = len(new_question_candidates(ctx, request.user))
+        new_count = new_question_pool(ctx, request.user).count()
         bookmarked_count = len(bookmarked_candidates(ctx, request.user))
 
         # Eligible if ANY practice path has something real to offer — the
@@ -100,7 +100,7 @@ class RecommendationsView(APIView):
         topics = source_topic_mastery(ctx, config.weak_topic_accuracy_max_pct)
         weak_topics = [t for t in topics if t['is_weak']]
         due_count = len(due_review_candidates(ctx, request.user))
-        new_count = len(new_question_candidates(ctx, request.user))
+        new_count = new_question_pool(ctx, request.user).count()
         bookmarked_count = len(bookmarked_candidates(ctx, request.user))
         mixed_count = min(missed_count + len(weak_topics) + due_count + new_count, config.max_questions_per_session)
 

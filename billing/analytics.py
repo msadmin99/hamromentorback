@@ -24,6 +24,8 @@ computes it, and echoed back in the API response as a `note`):
 from django.db.models import Count, Q, Sum
 from django.utils import timezone
 
+from entitlements.analytics import free_starter_metrics
+
 from .models import NotificationLog, Purchase, Subscription
 
 
@@ -177,9 +179,14 @@ def build_analytics(period_days=30):
         'coupon_usage': coupon_usage(),
         'payment_outcomes': payment_outcomes(),
         'geographic_distribution': geographic_distribution(),
+        # Phase 11 (plan bullet 1) — free-tier reach/usage/conversion, sourced
+        # from Phase 3's FreeStarterEntitlement and Phase 2's event log. Lives
+        # in entitlements/analytics.py because it aggregates that app's own
+        # tables; composed in here so the dashboard stays one request.
+        'free_starter': free_starter_metrics(period_start, now),
         'notes': {
             'mrr_arr': 'Computed from active, non-scholarship subscriptions only — scholarship-granted access carries zero revenue.',
-            'conversion': "No formal trial period exists on this platform, so this is a free-to-paid conversion figure (registered users who made >=1 approved purchase).",
+            'conversion': "No formal trial period exists on this platform, so this is a free-to-paid conversion figure (registered users who made >=1 approved purchase). NOTE: `free_starter.free_to_paid` reports a different, narrower figure — students who actually consumed free allowance and then paid. Both are intentional; they answer different questions and will disagree.",
             'renewals': 'Scoped to subscriptions whose expiry fell within the selected period; a "renewal" is one that received a renewal_confirmation notification.',
             'payment_outcomes': 'Purchases are manually verified (bank/eSewa/Khalti reference), not live gateway callbacks — this is the admin review outcome distribution, not a gateway decline rate.',
             'geographic_distribution': 'Based on StudentProfile.province, a free-text field (not normalized) — treat as approximate.',

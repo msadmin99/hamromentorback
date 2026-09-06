@@ -13,6 +13,7 @@ academics.services.record_question_result.
 from collections import defaultdict
 from datetime import datetime, timedelta
 
+from django.core.cache import cache
 from django.db.models import Avg, Count, Q, Sum
 from django.utils import timezone
 
@@ -22,6 +23,12 @@ from .access import visible_test_queryset
 from .models import Answer, Test, TestAttempt
 
 MIN_ATTEMPTS_FOR_SUBJECT_RANK = 5
+# Scalability audit Phase 3: how long a subject's cross-student ranking
+# table is cached for — see _subject_rank_table(). A few minutes' staleness
+# in "how do I rank against everyone else in this subject" is an
+# acceptable trade for not re-scanning every student's QuestionAttempt/
+# Answer rows for that subject on every single dashboard load.
+SUBJECT_RANK_CACHE_SECONDS = 900
 
 
 def _effective_course_ids(user, course=None):
@@ -62,6 +69,56 @@ def _answer_stats_by_attempt(attempt_ids):
         .annotate(answered=Count('id', filter=Q(selected_option__isnull=False)), correct=Count('id', filter=Q(is_correct=True)))
     )
     return {row['attempt_id']: row for row in rows}
+
+
+# --- Request-scoped memoization (scalability audit: /api/performance/overview/
+# query-count fix) -----------------------------------------------------------
+#
+# StudentPerformanceOverviewView calls 7 of the functions below in one
+# request; several of them independently re-fetch the exact same
+# TestAttempt/Answer/QuestionAttempt data (e.g. kpi_overview and
+# trend_series both call _attempts_qs with identical arguments;
+# strengths_and_weaknesses re-derives _combined_question_state and re-runs
+# mock_test_analytics from scratch even though the view already computed
+# both). None of that data is shared across users or requests — `memo` is a
+# plain dict the CALLER creates fresh per request (see
+# StudentPerformanceOverviewView.get()) and passes down; when a function is
+# called with memo=None (every pre-existing caller: topic_mastery,
+# chapter_breakdown, comparative, activity_calendar, the standalone
+# ExamTypeStatsView, etc.), these helpers behave exactly as before — a
+# fresh query every time, byte-identical output. Memoizing only collapses
+# an *exact* repeated (user, course, filter) signature into one query; it
+# never changes what any function computes.
+def _memo_get_attempts(memo, user, course=None, date_from=None, date_to=None, exam_types=None):
+    """Materialized, start_time-ascending list of the same rows
+    _attempts_qs(...) would return. Callers that need a different order
+    or a slice operate on the returned list in Python instead of
+    re-querying — see kpi_overview/trend_series/mock_test_analytics/
+    question_analytics/strengths_and_weaknesses/recommendations below."""
+    if memo is None:
+        return list(_attempts_qs(user, course, date_from, date_to, exam_types).order_by('start_time'))
+    key = ('attempts', user.id, course, date_from, date_to, tuple(exam_types) if exam_types else None)
+    if key not in memo:
+        memo[key] = list(_attempts_qs(user, course, date_from, date_to, exam_types).order_by('start_time'))
+    return memo[key]
+
+
+def _memo_answer_stats(memo, attempt_ids):
+    if memo is None:
+        return _answer_stats_by_attempt(attempt_ids)
+    key = ('answer_stats', tuple(sorted(attempt_ids)))
+    if key not in memo:
+        memo[key] = _answer_stats_by_attempt(attempt_ids)
+    return memo[key]
+
+
+def _memo_combined_state(memo, user, course=None):
+    if memo is None:
+        return _combined_question_state(user, course)
+    key = ('combined_state', user.id, course)
+    if key not in memo:
+        memo[key] = _combined_question_state(user, course)
+    return memo[key]
 
 
 def _activity_streak(user, course=None):
@@ -108,10 +165,10 @@ def _activity_streak(user, course=None):
     return {'current': current, 'longest': longest}
 
 
-def kpi_overview(user, course=None, date_from=None, date_to=None):
-    attempts = list(_attempts_qs(user, course, date_from, date_to))
+def kpi_overview(user, course=None, date_from=None, date_to=None, memo=None):
+    attempts = _memo_get_attempts(memo, user, course, date_from, date_to)
     attempt_ids = [a.id for a in attempts]
-    answer_stats = _answer_stats_by_attempt(attempt_ids)
+    answer_stats = _memo_answer_stats(memo, attempt_ids)
 
     question_count_cache = {}
     total_questions = total_answered = total_correct = 0
@@ -168,9 +225,12 @@ def kpi_overview(user, course=None, date_from=None, date_to=None):
     }
 
 
-def trend_series(user, course=None, date_from=None, date_to=None, granularity='day'):
-    attempts = list(_attempts_qs(user, course, date_from, date_to).order_by('start_time'))
-    answer_stats = _answer_stats_by_attempt([a.id for a in attempts])
+def trend_series(user, course=None, date_from=None, date_to=None, granularity='day', memo=None):
+    # Same (course, date_from, date_to) signature as kpi_overview's fetch
+    # above — when both are called from StudentPerformanceOverviewView with
+    # a shared `memo`, this reuses that one query instead of repeating it.
+    attempts = _memo_get_attempts(memo, user, course, date_from, date_to)
+    answer_stats = _memo_answer_stats(memo, [a.id for a in attempts])
 
     buckets = defaultdict(lambda: {'scores': [], 'accuracies': [], 'seconds_per_q': [], 'ranks': [], 'percentiles': []})
     for a in attempts:
@@ -254,13 +314,16 @@ def _combined_question_state(user, course=None):
     return {qid: rec['is_correct'] for qid, rec in state.items()}
 
 
-def _subject_rank(user, subject):
-    """Cross-student ranking. Unlike _combined_question_state (which dedupes
-    to one 'current mastery' state per question for the owning student's own
-    dashboard), ranking sums every solve-event from both sources per user —
-    a coarse, defensible 'how much have you engaged with this subject and
-    how accurately' figure, without needing a latest-wins merge across every
-    student's data in one query."""
+def _compute_subject_rank_table(subject):
+    """The expensive, cross-student part of subject ranking — two full
+    GROUP-BY scans over every student's QuestionAttempt/Answer rows for
+    this subject, independent of which student is asking. Returns
+    {user_id: (rank, out_of)} for every eligible (>= MIN_ATTEMPTS_FOR_
+    SUBJECT_RANK) student. Split out from _subject_rank so the result can
+    be cached per-subject (see SUBJECT_RANK_CACHE_SECONDS) — every student
+    viewing this subject's breakdown around the same time previously
+    triggered their own full re-scan just to extract their own one
+    position out of it."""
     combined = defaultdict(lambda: {'attempted': 0, 'correct': 0})
 
     for row in (
@@ -281,16 +344,41 @@ def _subject_rank(user, subject):
 
     eligible = {uid: v for uid, v in combined.items() if v['attempted'] >= MIN_ATTEMPTS_FOR_SUBJECT_RANK}
     ranked = sorted(eligible.items(), key=lambda kv: kv[1]['correct'] / kv[1]['attempted'], reverse=True)
-    for idx, (uid, _v) in enumerate(ranked, start=1):
-        if uid == user.id:
-            return {'rank': idx, 'out_of': len(ranked)}
-    return None
+    out_of = len(ranked)
+    return {uid: (idx, out_of) for idx, (uid, _v) in enumerate(ranked, start=1)}
 
 
-def subject_breakdown(user, course=None):
+def _subject_rank(user, subject):
+    """Cross-student ranking. Unlike _combined_question_state (which dedupes
+    to one 'current mastery' state per question for the owning student's own
+    dashboard), ranking sums every solve-event from both sources per user —
+    a coarse, defensible 'how much have you engaged with this subject and
+    how accurately' figure, without needing a latest-wins merge across every
+    student's data in one query.
+
+    The actual per-subject table is Redis-cached (see
+    _compute_subject_rank_table) — nothing here is user-specific data
+    subject to eligibility rules of its own: the *caller* (subject_
+    breakdown) has already restricted which subjects this user is even
+    allowed to see before calling this, so caching the cross-student
+    ranking table for an already-authorized subject can't leak anything
+    a real query wouldn't have."""
+    cache_key = f'perf:subject_rank_table:{subject.id}'
+    table = cache.get(cache_key)
+    if table is None:
+        table = _compute_subject_rank_table(subject)
+        cache.set(cache_key, table, SUBJECT_RANK_CACHE_SECONDS)
+    result = table.get(user.id)
+    if result is None:
+        return None
+    idx, out_of = result
+    return {'rank': idx, 'out_of': out_of}
+
+
+def subject_breakdown(user, course=None, memo=None):
     from academics.models import Question
 
-    state = _combined_question_state(user, course)
+    state = _memo_combined_state(memo, user, course)
     questions = Question.objects.filter(id__in=state.keys()).values('id', 'subject_id', 'marks', 'negative_marks')
     q_by_id = {q['id']: q for q in questions}
 
@@ -315,7 +403,13 @@ def subject_breakdown(user, course=None):
     from django.db.models import Q as _Q
 
     course_ids = _effective_course_ids(user, course)
-    subjects_qs = Subject.objects.filter(_Q(courses__isnull=True) | _Q(courses__id__in=course_ids))
+    # annotated_question_count replaces a subject.questions.count() call
+    # inside the loop below (scalability audit Phase 3: one extra query
+    # per subject on every dashboard load) — Count(..., distinct=True) so
+    # the courses__id__in join above can't inflate it via fan-out.
+    subjects_qs = Subject.objects.filter(_Q(courses__isnull=True) | _Q(courses__id__in=course_ids)).annotate(
+        annotated_question_count=Count('questions', distinct=True),
+    )
 
     rows = []
     for subject in subjects_qs.distinct():
@@ -323,7 +417,7 @@ def subject_breakdown(user, course=None):
         attempted = agg['attempted']
         correct = agg['correct']
         accuracy = round(correct / attempted * 100, 2) if attempted else 0.0
-        total_questions = subject.questions.count()
+        total_questions = subject.annotated_question_count
         completion = round(attempted / total_questions * 100, 2) if total_questions else 0.0
 
         if attempted == 0 and total_questions == 0:
@@ -446,8 +540,8 @@ def chapter_breakdown(user, subject_id):
     return {'chapters': rows, 'topics': topic_mastery(user, subject_id, state=state)}
 
 
-def mock_test_analytics(user, course=None):
-    attempts = list(_attempts_qs(user, course, exam_types=['mock']).order_by('start_time'))
+def mock_test_analytics(user, course=None, memo=None):
+    attempts = _memo_get_attempts(memo, user, course, exam_types=['mock'])
     if not attempts:
         return {'total_taken': 0, 'avg_score': 0, 'best_score': 0, 'worst_score': 0, 'trend': []}
     scores = [float(a.score) for a in attempts]
@@ -486,37 +580,70 @@ def exam_type_stats(user, exam_type, course=None):
     }
 
 
-def question_analytics(user, course=None):
-    attempt_ids = list(_attempts_qs(user, course).values_list('id', flat=True))
+def question_analytics(user, course=None, memo=None):
+    # Same bare (course, no date range, no exam_types) signature as the
+    # attempts fetch strengths_and_weaknesses() uses for its recent_attempts
+    # below — shares the query via `memo` when both run in one request.
+    attempts = _memo_get_attempts(memo, user, course)
+    attempt_ids = [a.id for a in attempts]
     answers = Answer.objects.filter(attempt_id__in=attempt_ids)
 
     qa_qs = QuestionAttempt.objects.filter(user=user)
     if course:
         qa_qs = qa_qs.filter(question__courses__id=course)
 
+    # Scalability audit: was 8 separate .count() round trips (5 on Answer,
+    # 3 on QuestionAttempt) — collapsed into 2 conditional-aggregate
+    # queries. Count(..., filter=Q(...)) is exactly equivalent to
+    # .filter(...).count(), just computed in one pass over each table
+    # instead of one pass per condition.
+    answer_agg = answers.aggregate(
+        exam_answered=Count('id', filter=Q(selected_option__isnull=False)),
+        exam_correct=Count('id', filter=Q(is_correct=True)),
+        exam_incorrect=Count('id', filter=Q(is_correct=False, selected_option__isnull=False)),
+        exam_skipped=Count('id', filter=Q(selected_option__isnull=True)),
+        exam_flagged_for_review=Count('id', filter=Q(is_marked_for_review=True)),
+    )
+    qa_agg = qa_qs.aggregate(
+        qbank_solved=Count('id'),
+        qbank_correct=Count('id', filter=Q(is_correct=True)),
+        qbank_bookmarked=Count('id', filter=Q(is_bookmarked=True)),
+    )
+
     return {
-        'exam_answered': answers.filter(selected_option__isnull=False).count(),
-        'exam_correct': answers.filter(is_correct=True).count(),
-        'exam_incorrect': answers.filter(is_correct=False, selected_option__isnull=False).count(),
-        'exam_skipped': answers.filter(selected_option__isnull=True).count(),
-        'exam_flagged_for_review': answers.filter(is_marked_for_review=True).count(),
-        'qbank_solved': qa_qs.count(),
-        'qbank_correct': qa_qs.filter(is_correct=True).count(),
-        'qbank_bookmarked': qa_qs.filter(is_bookmarked=True).count(),
+        'exam_answered': answer_agg['exam_answered'] or 0,
+        'exam_correct': answer_agg['exam_correct'] or 0,
+        'exam_incorrect': answer_agg['exam_incorrect'] or 0,
+        'exam_skipped': answer_agg['exam_skipped'] or 0,
+        'exam_flagged_for_review': answer_agg['exam_flagged_for_review'] or 0,
+        'qbank_solved': qa_agg['qbank_solved'] or 0,
+        'qbank_correct': qa_agg['qbank_correct'] or 0,
+        'qbank_bookmarked': qa_agg['qbank_bookmarked'] or 0,
         'not_tracked': ['reattempts', 'correct_after_revision', 'difficulty_breakdown'],
     }
 
 
-def strengths_and_weaknesses(user, course=None):
+def strengths_and_weaknesses(user, course=None, subjects=None, memo=None):
+    """`subjects`: pass an already-computed subject_breakdown(user, course)
+    result to skip recomputing it (scalability audit Phase 3 — see
+    StudentPerformanceOverviewView, which calls subject_breakdown() once
+    and shares it here and with recommendations() instead of each
+    independently re-running the same _combined_question_state scan +
+    per-subject aggregation). Standalone callers omit it and this
+    self-computes exactly as before. `memo`: see _memo_get_attempts'
+    docstring — shares this function's own re-fetches (the combined
+    question state, mock_test_analytics, the attempts list) with whatever
+    the rest of the same request already computed."""
     from academics.models import Question
 
-    subjects = subject_breakdown(user, course)
+    if subjects is None:
+        subjects = subject_breakdown(user, course, memo=memo)
     attempted_subjects = [s for s in subjects if s['attempted'] >= MIN_ATTEMPTS_FOR_SUBJECT_RANK]
 
     strong = sorted([s for s in attempted_subjects if s['accuracy'] >= 75], key=lambda s: -s['accuracy'])[:3]
     weak = sorted([s for s in attempted_subjects if s['accuracy'] < 50], key=lambda s: s['accuracy'])[:3]
 
-    state = _combined_question_state(user, course)
+    state = _memo_combined_state(memo, user, course)
     wrong_question_ids = [qid for qid, is_correct in state.items() if not is_correct]
     wrong_questions = Question.objects.filter(id__in=wrong_question_ids).values('subject_id', 'negative_marks')
     marks_lost_by_subject = defaultdict(float)
@@ -530,7 +657,7 @@ def strengths_and_weaknesses(user, course=None):
     ]
     negative_impact.sort(key=lambda r: -r['marks_lost'])
 
-    mock = mock_test_analytics(user, course)
+    mock = mock_test_analytics(user, course, memo=memo)
     recent_scores = [t['score'] for t in mock['trend'][-5:]]
     consistent_scores = False
     if len(recent_scores) >= 3:
@@ -538,8 +665,13 @@ def strengths_and_weaknesses(user, course=None):
         variance = sum((x - mean) ** 2 for x in recent_scores) / len(recent_scores)
         consistent_scores = mean > 0 and (variance ** 0.5) < (mean * 0.15)
 
-    recent_attempts = list(_attempts_qs(user, course).order_by('-start_time')[:10])
-    answer_stats = _answer_stats_by_attempt([a.id for a in recent_attempts])
+    # Same bare (course) signature as question_analytics' fetch above —
+    # _memo_get_attempts returns it ascending by start_time; take the last
+    # 10 and reverse for "most recent first", exactly what
+    # .order_by('-start_time')[:10] returned before.
+    all_attempts = _memo_get_attempts(memo, user, course)
+    recent_attempts = list(reversed(all_attempts[-10:]))
+    answer_stats = _memo_answer_stats(memo, [a.id for a in recent_attempts])
     fast_count = slow_count = 0
     for a in recent_attempts:
         if not a.end_time:
@@ -564,11 +696,14 @@ def strengths_and_weaknesses(user, course=None):
     }
 
 
-def recommendations(user, course=None):
+def recommendations(user, course=None, subjects=None, memo=None):
+    """`subjects`: see strengths_and_weaknesses' docstring — same
+    share-instead-of-recompute optimization."""
     from tests_app.models import Test as TestModel
     from videos_app.models import Video
 
-    subjects = subject_breakdown(user, course)
+    if subjects is None:
+        subjects = subject_breakdown(user, course, memo=memo)
     attempted = [s for s in subjects if s['attempted'] >= 3]
     weakest = sorted(attempted, key=lambda s: s['accuracy'])[:3]
 
@@ -601,7 +736,11 @@ def recommendations(user, course=None):
             'suggested_test_id': practice_test.id if practice_test else None,
         })
 
-    last_mock = _attempts_qs(user, course, exam_types=['mock']).order_by('-start_time').first()
+    # Same (course, exam_types=['mock']) signature as mock_test_analytics'
+    # fetch — shares that query when both run in the same request (mock_
+    # test_analytics always runs first in StudentPerformanceOverviewView).
+    mock_attempts = _memo_get_attempts(memo, user, course, exam_types=['mock'])
+    last_mock = mock_attempts[-1] if mock_attempts else None
     if not last_mock:
         suggestions.append({'type': 'take_mock_test', 'message': "You haven't taken a mock test yet — try one to see where you stand."})
     else:

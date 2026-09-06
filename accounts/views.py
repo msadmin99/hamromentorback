@@ -594,10 +594,57 @@ class TeacherListView(APIView):
 
 
 class RolePermissionViewSet(viewsets.ModelViewSet):
+    """Super-Admin-only editing of what feature keys the Admin and Editor
+    roles may use.
+
+    Every successful mutation is audited to the existing
+    AdminEditAuditLog — see accounts/role_audit.py for why, and for the
+    full list of mutation paths. Authorization, validation and the
+    response shape are all unchanged by that: the audit write is purely
+    internal, so no existing client sees a difference.
+
+    DELETE is excluded by http_method_names below (it always has been), so
+    there is no delete path here to audit.
+    """
     queryset = RolePermission.objects.all()
     serializer_class = RolePermissionSerializer
     permission_classes = [IsSuperAdmin]
     http_method_names = ['get', 'post', 'put', 'patch', 'head', 'options']
+
+    def perform_create(self, serializer):
+        from django.db import transaction
+
+        from .role_audit import record_role_permission_change, snapshot
+
+        # Audit inside the same transaction as the mutation, so the two
+        # cannot diverge in either direction: a rolled-back create leaves
+        # no record claiming success, and a failed audit write rolls the
+        # create back rather than silently losing the trail. This is
+        # deliberately stricter than the student_edit precedent (which
+        # records after its atomic block) because this row governs
+        # platform-wide administrative capability.
+        with transaction.atomic():
+            serializer.save()
+            record_role_permission_change(
+                self.request, before={}, after=snapshot(serializer.instance),
+                instance=serializer.instance,
+            )
+
+    def perform_update(self, serializer):
+        from django.db import transaction
+
+        from .role_audit import record_role_permission_change, snapshot
+
+        # Snapshot BEFORE save(): at this point serializer.instance still
+        # holds the values loaded from the database by get_object(), and
+        # snapshot() copies the features list rather than referencing it.
+        before = snapshot(serializer.instance)
+        with transaction.atomic():
+            serializer.save()
+            record_role_permission_change(
+                self.request, before=before, after=snapshot(serializer.instance),
+                instance=serializer.instance,
+            )
 
 
 class AccountSettingsView(APIView):

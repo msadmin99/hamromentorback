@@ -41,6 +41,18 @@ class SubscriptionPlan(models.Model):
         help_text='Only for Mock Test plans — how many mock tests this package includes. Blank = unlimited.',
     )
     price = models.DecimalField(max_digits=9, decimal_places=2)
+    # Phase 10: what this plan actually includes, as the admin configures it.
+    # The student plans page used to hold four hardcoded feature arrays
+    # (QBANK_FEATURES, MOCK_FEATURES, …) in the frontend, so a plan's real
+    # configuration and its advertised contents could — and did — drift
+    # apart with nobody noticing. Blank falls back to a short line derived
+    # from this plan's own real fields (duration, quota), so existing plans
+    # keep rendering something true rather than an empty card.
+    features = models.JSONField(
+        default=list, blank=True,
+        help_text='Bullet points shown on the plan card, e.g. ["All subjects", "Detailed solutions"]. '
+                   'Leave empty to show a line generated from this plan\'s own duration/quota.',
+    )
     is_active = models.BooleanField(default=True)
     is_popular = models.BooleanField(default=False, help_text='Shows a "Popular" badge on the plan card.')
     is_best_value = models.BooleanField(default=False, help_text='Shows a "Best Value" badge on the plan card.')
@@ -307,6 +319,12 @@ class Purchase(models.Model):
         ('rejected', 'Rejected'),
         ('expired', 'Expired'),
         ('cancelled', 'Cancelled'),
+        # Phase 9: a previously-approved purchase whose money was returned.
+        # Terminal — only reachable from 'approved', and only via
+        # payment_service.refund(), which also reverses exactly the
+        # entitlements THIS purchase granted (see PurchaseEntitlementGrant)
+        # and nothing else.
+        ('refunded', 'Refunded'),
     ]
     # Statuses that still count as "in flight or won" for coupon/referral usage
     # counting — an abandoned unpaid cart or an in-review resubmission shouldn't
@@ -368,6 +386,21 @@ class Purchase(models.Model):
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='+',
     )
 
+    # Phase 9 refund trail. Kept as fields on Purchase rather than a separate
+    # Refund model: this platform has no payment gateway (verification is a
+    # human admin reviewing a screenshot — see billing/payment_providers.py),
+    # so a refund here is a single administrative decision about one order,
+    # not a multi-step gateway transaction needing its own lifecycle. Partial
+    # refunds are deliberately NOT supported (no field for a partial amount) —
+    # that's a business decision nobody has made yet, and inventing it would
+    # mean inventing the matching partial-entitlement semantics too. See
+    # docs/PHASE_9_ARCHITECTURE.md.
+    refunded_at = models.DateTimeField(null=True, blank=True)
+    refunded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='+',
+    )
+    refund_reason = models.CharField(max_length=255, blank=True)
+
     # How long a QR-payable order stays in 'unpaid' before the expiry cron
     # (see PurchaseViewSet / payment_service.expire) flips it to 'expired'.
     EXPIRY_MINUTES = 30
@@ -402,6 +435,68 @@ class PurchaseComboItem(models.Model):
 
     def __str__(self):
         return f'{self.purchase_id}: {self.plan.name} (Rs.{self.price})'
+
+
+class PurchaseEntitlementGrant(models.Model):
+    """Phase 9 — the explicit, reversible link between one Purchase and each
+    access record it actually granted. This is the "purchase-to-entitlement
+    linkage" the audit found missing: before this, a `Subscription` carried no
+    trace of which Purchase paid for it, so a refund had no safe way to know
+    what to undo (only `GrandTestAccess.purchase` was traceable).
+
+    Written by payment_service._activate_product() at approval time, read only
+    by payment_service.refund(). One purchase can produce several rows (a
+    combo grants one Subscription per bundled plan).
+
+    The `previous_*` fields are what make a refund *reversible instead of
+    destructive*: when a purchase RENEWED an existing subscription rather than
+    creating it, refunding must roll the expiry back to what it was before —
+    not deactivate the row, which would also destroy the earlier, separately
+    paid-for time. `was_created` distinguishes the two cases.
+
+    Deliberately NOT a general "UserAccess" table: it records only what a
+    Purchase did, so it can be undone. Every access *decision* still runs
+    through the Phase 4 engine reading the real Subscription/GrandTestAccess/
+    Enrollment rows — this ledger is never consulted to grant anything."""
+    purchase = models.ForeignKey(Purchase, on_delete=models.CASCADE, related_name='entitlement_grants')
+
+    subscription = models.ForeignKey(
+        Subscription, on_delete=models.SET_NULL, null=True, blank=True, related_name='purchase_grants',
+    )
+    grand_test_access = models.ForeignKey(
+        'GrandTestAccess', on_delete=models.SET_NULL, null=True, blank=True, related_name='purchase_grants',
+    )
+    course_enrollment = models.ForeignKey(
+        'marketplace.CourseEnrollment', on_delete=models.SET_NULL, null=True, blank=True, related_name='purchase_grants',
+    )
+
+    was_created = models.BooleanField(
+        default=True,
+        help_text='True = this purchase created the access record (refund deactivates it). '
+                   'False = it extended an existing one (refund restores previous_expires_at instead).',
+    )
+    previous_expires_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text="The access record's expiry BEFORE this purchase touched it — what a refund restores. "
+                   'Null when was_created (there was nothing before) or for a lifetime grant.',
+    )
+    granted_expires_at = models.DateTimeField(
+        null=True, blank=True, help_text='What the expiry became after this purchase. Informational/auditing.',
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    revoked_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text='Set when a refund reversed this grant. Non-null = already reversed, so a repeated refund '
+                   'is a safe no-op (idempotency marker).',
+    )
+
+    class Meta:
+        ordering = ['id']
+
+    def __str__(self):
+        target = self.subscription or self.grand_test_access or self.course_enrollment
+        return f'Purchase #{self.purchase_id} → {target}'
 
 
 class Scholarship(models.Model):
@@ -481,6 +576,12 @@ class GrandTestAccess(models.Model):
     password = models.CharField(max_length=20, unique=True, blank=True)
     granted_at = models.DateTimeField(null=True, blank=True)
     email_sent_at = models.DateTimeField(null=True, blank=True)
+    # Phase 9: set when the paying purchase was refunded. Access is otherwise
+    # presence-based (billing.access.get_grand_test_access just looks the row
+    # up), so revocation needs an explicit flag rather than deleting the row —
+    # deleting would destroy the issued-password record and the audit trail of
+    # what was granted. Filtered out by get_grand_test_access().
+    revoked_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         unique_together = ('user', 'test')
@@ -508,6 +609,10 @@ class PaymentAuditLog(models.Model):
         ('resubmission_requested', 'Resubmission requested'),
         ('expired', 'Expired'),
         ('cancelled', 'Cancelled'),
+        # Phase 9. Its metadata carries a `reversed` list naming exactly which
+        # entitlements the refund undid, so the trail answers "what access did
+        # this student actually lose, and why" without re-deriving it later.
+        ('refunded', 'Refunded'),
     ]
 
     purchase = models.ForeignKey(Purchase, on_delete=models.CASCADE, related_name='audit_log')

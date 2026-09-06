@@ -2,6 +2,7 @@ from django.conf import settings
 from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -101,10 +102,23 @@ class CoursePackageViewSet(viewsets.ModelViewSet):
         return qs
 
 
+class _BoundedListPagination(PageNumberPagination):
+    """Caps GET /enrollments/ at a real DB-level LIMIT without changing its
+    response shape — Admin's students page reads the response as a bare
+    array. This is the safety net for the unfiltered "all enrollments"
+    case as enrollment volume grows."""
+    page_size = 500
+    max_page_size = 500
+
+    def get_paginated_response(self, data):
+        return Response(data)
+
+
 class EnrollmentViewSet(viewsets.ModelViewSet):
     queryset = Enrollment.objects.select_related('user', 'course').all()
     serializer_class = EnrollmentSerializer
     permission_classes = [IsAdminRoleOrAbove]
+    pagination_class = _BoundedListPagination
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -229,6 +243,11 @@ class DashboardStatsView(APIView):
 
 
 def _check_cron_secret(request):
+    """Phase 9: fails closed on an unconfigured secret — without the
+    `settings.CRON_SECRET` guard, a blank configured secret would match a
+    blank/missing header and leave these endpoints wide open."""
+    if not settings.CRON_SECRET:
+        return False
     provided = request.headers.get('X-Cron-Secret') or request.query_params.get('secret')
     return provided == settings.CRON_SECRET
 

@@ -7,7 +7,8 @@ from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
-from rest_framework.permissions import AllowAny, IsAdminUser, IsAuthenticated
+from rest_framework.pagination import PageNumberPagination
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.throttling import UserRateThrottle
 from rest_framework.views import APIView
@@ -213,12 +214,14 @@ class GrantAccessView(APIView):
         mock_test_quota = request.data.get('mock_test_quota')
         mock_test_quota = int(mock_test_quota) if mock_test_quota not in (None, '') else (plan.mock_test_quota if plan else None)
 
+        is_scholarship = bool(request.data.get('is_scholarship'))
         subscription, _was_renewal = _extend_or_create_subscription(
             user, course, product_type, duration, plan=plan, mock_test_quota=mock_test_quota,
+            is_scholarship=is_scholarship,
         )
 
         response_data = {'subscription': SubscriptionSerializer(subscription).data}
-        if request.data.get('is_scholarship'):
+        if is_scholarship:
             scholarship = Scholarship.objects.create(
                 user=user, course=course, product_type=product_type, plan=plan, subscription=subscription,
                 reason=request.data.get('reason', ''), granted_by=request.user,
@@ -429,12 +432,26 @@ class MyCouponsView(APIView):
         })
 
 
+class _BoundedListPagination(PageNumberPagination):
+    """Caps GET /purchases/ at a real DB-level LIMIT without changing its
+    response shape — every confirmed caller (Frontend's subscriptions page
+    and its children, Admin's payments page) reads the response as a bare
+    array. A student's own purchase history is naturally small; the risk
+    is the admin/staff "all purchases" view, which this bounds."""
+    page_size = 500
+    max_page_size = 500
+
+    def get_paginated_response(self, data):
+        return Response(data)
+
+
 class PurchaseViewSet(viewsets.ModelViewSet):
     queryset = Purchase.objects.select_related(
         'user', 'plan', 'grand_test', 'teacher_course', 'combo_plan', 'coupon', 'grand_test_access',
     ).prefetch_related('combo_items__plan').all()
     permission_classes = [IsAuthenticated]
     http_method_names = ['get', 'post', 'head', 'options']
+    pagination_class = _BoundedListPagination
 
     def get_serializer_class(self):
         if self.action == 'create':
@@ -582,7 +599,16 @@ class PurchaseViewSet(viewsets.ModelViewSet):
             return Response({'detail': exc.message}, status=400)
         return Response(PurchaseSerializer(purchase).data)
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAdminUser])
+    # FIX (P0 security audit): these four actions previously used bare
+    # IsAdminUser (checks only is_staff), unlike every other sensitive
+    # billing endpoint in this file (CouponViewSet, ScholarshipViewSet,
+    # GrantAccessView, AnalyticsView), which correctly use this app's own
+    # IsAdminRoleOrAbove — the class that blocks Editor/Teacher-role staff
+    # accounts. That meant an Editor or Teacher account, explicitly denied
+    # the "billing" feature everywhere else in the product, could still
+    # approve/reject real payments and read the payment audit trail via
+    # direct API calls. Do not revert to IsAdminUser here.
+    @action(detail=True, methods=['post'], permission_classes=[IsAdminRoleOrAbove])
     def approve(self, request, pk=None):
         purchase = self.get_object()
         try:
@@ -591,7 +617,7 @@ class PurchaseViewSet(viewsets.ModelViewSet):
             return Response({'detail': exc.message}, status=400)
         return Response(PurchaseSerializer(purchase).data)
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAdminUser])
+    @action(detail=True, methods=['post'], permission_classes=[IsAdminRoleOrAbove])
     def reject(self, request, pk=None):
         purchase = self.get_object()
         note = request.data.get('admin_note') or ''
@@ -601,7 +627,22 @@ class PurchaseViewSet(viewsets.ModelViewSet):
             return Response({'detail': exc.message}, status=400)
         return Response(PurchaseSerializer(purchase).data)
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAdminUser], url_path='request-resubmission')
+    @action(detail=True, methods=['post'], permission_classes=[IsAdminRoleOrAbove])
+    def refund(self, request, pk=None):
+        """Phase 9 — refund an approved purchase and reverse exactly the
+        entitlements it granted (see payment_service.refund). Same
+        IsAdminRoleOrAbove gate as approve/reject: this is a financial
+        decision, not general staff work (Phase 1's authorization fix).
+        A reason is required and lands in the PaymentAuditLog trail."""
+        purchase = self.get_object()
+        reason = request.data.get('reason') or request.data.get('admin_note') or ''
+        try:
+            purchase = payment_service.refund(purchase.id, reason, actor=request.user, request=request)
+        except PaymentError as exc:
+            return Response({'detail': exc.message}, status=400)
+        return Response(PurchaseSerializer(purchase).data)
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAdminRoleOrAbove], url_path='request-resubmission')
     def request_resubmission(self, request, pk=None):
         purchase = self.get_object()
         note = request.data.get('admin_note') or ''
@@ -637,7 +678,7 @@ class PurchaseViewSet(viewsets.ModelViewSet):
             return Response({'detail': 'No screenshot on file for this purchase.'}, status=404)
         return Response({'url': url})
 
-    @action(detail=True, methods=['get'], permission_classes=[IsAdminUser], url_path='audit-log')
+    @action(detail=True, methods=['get'], permission_classes=[IsAdminRoleOrAbove], url_path='audit-log')
     def audit_log(self, request, pk=None):
         purchase = self.get_object()
         entries = purchase.audit_log.select_related('actor').all()
@@ -729,6 +770,11 @@ REMINDER_SCHEDULE = {
 
 
 def _check_cron_secret(request):
+    """Phase 9: fails closed on an unconfigured secret — without the
+    `settings.CRON_SECRET` guard, a blank configured secret would match a
+    blank/missing header and leave these endpoints wide open."""
+    if not settings.CRON_SECRET:
+        return False
     provided = request.headers.get('X-Cron-Secret') or request.query_params.get('secret')
     return provided == settings.CRON_SECRET
 

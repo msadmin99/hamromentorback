@@ -10,6 +10,7 @@ from .views import (
     MarkForReviewView,
     MyAttemptsView,
     PerformanceCalendarView,
+    QuestionStatsProcessingHandlerView,
     SavedExamViewViewSet,
     StudentPerformanceOverviewView,
     SubjectPerformanceDetailView,
@@ -27,6 +28,7 @@ router.register('saved-exam-views', SavedExamViewViewSet, basename='saved-exam-v
 
 urlpatterns = router.urls + [
     path('attempts/mine/', MyAttemptsView.as_view(), name='my-attempts'),
+    path('attempts/stats-process/', QuestionStatsProcessingHandlerView.as_view(), name='attempt-stats-process'),
     path('attempts/<int:attempt_id>/', AttemptDetailView.as_view(), name='attempt-detail'),
     path('attempts/<int:attempt_id>/answer/', SubmitAnswerView.as_view(), name='attempt-answer'),
     path('attempts/<int:attempt_id>/mark-review/', MarkForReviewView.as_view(), name='attempt-mark-review'),

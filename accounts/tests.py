@@ -1,9 +1,9 @@
 import threading
 
 from django.contrib.auth import get_user_model
+from django.test.utils import CaptureQueriesContext
 from django.db import connection
 from django.test import TransactionTestCase
-from django.test.utils import CaptureQueriesContext
 from rest_framework import status
 from rest_framework.test import APIClient, APITestCase
 
@@ -15,6 +15,62 @@ from marketplace.models import TeacherCourse
 from tests_app.models import Test, TestAttempt
 
 User = get_user_model()
+
+
+class RolePermissionEditorCeilingTests(APITestCase):
+    """P0 security-audit regression: EDITOR_ALLOWED_FEATURES was documented
+    as a hard ceiling ("anything outside this set is Admin/Super-Admin only
+    regardless of what's saved in RolePermission") but nothing enforced it —
+    a RolePermission row for 'editor' could contain any feature key at all,
+    and get_permissions()/the frontend's hasFeature() would honor it
+    verbatim. Now enforced at both write time (RolePermissionSerializer)
+    and read time (accounts.models.user_feature_list), so a stored row can
+    never grant an Editor more than the documented ceiling."""
+
+    def setUp(self):
+        from accounts.models import RolePermission
+
+        self.super_admin = User.objects.create_user(
+            username='roleperm_super', email='roleperm_super@example.com', password='pw12345',
+            is_staff=True, is_superuser=True, admin_role='super_admin',
+        )
+        self.editor = User.objects.create_user(
+            username='roleperm_editor', email='roleperm_editor@example.com', password='pw12345',
+            is_staff=True, admin_role='editor',
+        )
+        self.RolePermission = RolePermission
+        self.client.force_authenticate(user=self.super_admin)
+
+    def test_saving_a_disallowed_feature_for_editor_is_rejected(self):
+        resp = self.client.post('/api/auth/role-permissions/', {
+            'role': 'editor', 'features': ['question_bank', 'billing'],
+        }, format='json')
+
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('billing', str(resp.data))
+        self.assertFalse(self.RolePermission.objects.filter(role='editor').exists())
+
+    def test_saving_allowed_features_for_editor_succeeds(self):
+        resp = self.client.post('/api/auth/role-permissions/', {
+            'role': 'editor', 'features': ['question_bank', 'exam_schedule'],
+        }, format='json')
+
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+
+    def test_read_time_ceiling_clamps_a_row_that_bypassed_write_validation(self):
+        """Defense in depth: even if a row somehow ends up over the ceiling
+        (a direct DB write, Django admin, or a future bug), user_feature_list
+        — the single source both the serializer and HasFeature call — must
+        never actually grant the disallowed feature."""
+        from accounts.models import user_feature_list
+
+        self.RolePermission.objects.create(role='editor', features=['question_bank', 'billing', 'advanced'])
+
+        features = user_feature_list(self.editor)
+
+        self.assertIn('question_bank', features)
+        self.assertNotIn('billing', features)
+        self.assertNotIn('advanced', features)
 
 
 class AdminAccountDeleteTests(APITestCase):
@@ -610,8 +666,6 @@ class AdminStudentEditConcurrencyTests(TransactionTestCase):
         self.assertEqual(AdminEditAuditLog.objects.filter(resource_id=str(self.student.id)).count(), 2)
 
 
-
-
 class AdminStudentBrowseTests(APITestCase):
     """Phase 3: GET /auth/users/browse/ — real pagination, embedded
     enrollment summary, annotated device_count, permissions, and that
@@ -835,6 +889,17 @@ class AdminStudentBrowseTests(APITestCase):
         resp = self.client.get('/api/auth/users/?search=Browse0')
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         self.assertIsInstance(resp.data, list)
+
+    def test_student_detail_and_edit_still_work(self):
+        student = self.multi_enroll_student
+        resp = self.client.get(f'/api/auth/users/{student.id}/detail/')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertIn('activity_summary', resp.data)
+
+        resp = self.client.patch(f'/api/auth/users/{student.id}/edit/', {'first_name': 'BrowseEdited'}, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        student.refresh_from_db()
+        self.assertEqual(student.first_name, 'BrowseEdited')
 
     def test_block_unblock_still_works_via_plain_patch(self):
         student = self.students[4]

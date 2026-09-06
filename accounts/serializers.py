@@ -67,19 +67,9 @@ class UserSerializer(serializers.ModelSerializer):
         return {'id': c.id, 'name': c.name, 'prefix': c.prefix, 'program_group': c.program_group}
 
     def get_permissions(self, obj):
-        from .models import ALL_FEATURES, EDITOR_ALLOWED_FEATURES, TEACHER_ALLOWED_FEATURES
+        from .models import user_feature_list
 
-        if not obj.is_staff:
-            return []
-        if obj.is_superuser or obj.admin_role in (None, '', 'super_admin'):
-            return ALL_FEATURES
-        if obj.admin_role == 'teacher':
-            # Fixed ceiling — not admin-configurable via RolePermission (see model comment).
-            return TEACHER_ALLOWED_FEATURES
-        role_permission = RolePermission.objects.filter(role=obj.admin_role).first()
-        if role_permission:
-            return role_permission.features
-        return ALL_FEATURES if obj.admin_role == 'admin' else EDITOR_ALLOWED_FEATURES
+        return user_feature_list(obj)
 
 
 class RegisterSerializer(serializers.ModelSerializer):
@@ -148,11 +138,10 @@ class RegisterSerializer(serializers.ModelSerializer):
         # capability change. A student who never bought anything still
         # can't Start a Pro test; they can now see it exists.
         #
-        # Best-effort, matching the same "never fail registration" contract
-        # this codebase already uses elsewhere: an unmatched/blank course
-        # must never fail registration — the student can still pick a
-        # course later via ActiveCourseView once an admin (or a future
-        # self-service flow) enrolls them.
+        # Best-effort, matching the Free Starter provisioning immediately
+        # above: an unmatched/blank course must never fail registration —
+        # the student can still pick a course later via ActiveCourseView
+        # once an admin (or a future self-service flow) enrolls them.
         course_prefix = (getattr(user, 'course', '') or '').strip()
         if course_prefix:
             try:
@@ -166,6 +155,19 @@ class RegisterSerializer(serializers.ModelSerializer):
                     )
             except Exception:
                 pass
+
+        # Phase 2 Entitlement Foundation, Step 14: provision Free Starter at
+        # registration. Idempotent (safe if this ever runs twice for the
+        # same user) and deliberately best-effort — a failure here must
+        # never fail registration itself. entitlements.services'
+        # _try_free_starter also lazily re-attempts this for any student
+        # who somehow reaches an access check without it having run.
+        try:
+            from entitlements.provisioning import provision_free_starter
+
+            provision_free_starter(user)
+        except Exception:
+            pass
 
         return user
 
@@ -477,3 +479,23 @@ class RolePermissionSerializer(serializers.ModelSerializer):
     class Meta:
         model = RolePermission
         fields = ['id', 'role', 'features']
+
+    def validate(self, attrs):
+        # FIX (P0 security audit): EDITOR_ALLOWED_FEATURES was documented as
+        # a hard ceiling ("anything outside this set is Admin/Super-Admin
+        # only regardless of what's saved in RolePermission") but nothing
+        # actually enforced it at write time — a PATCH could save any
+        # feature key onto the 'editor' row. accounts.models.user_feature_list
+        # now also clamps at read time, but rejecting here too means the
+        # stored row itself never silently disagrees with its own ceiling.
+        from .models import EDITOR_ALLOWED_FEATURES
+
+        role = attrs.get('role') or getattr(self.instance, 'role', None)
+        features = attrs.get('features')
+        if role == 'editor' and features is not None:
+            disallowed = [f for f in features if f not in EDITOR_ALLOWED_FEATURES]
+            if disallowed:
+                raise serializers.ValidationError(
+                    {'features': f'Editor role cannot be granted: {", ".join(disallowed)}.'}
+                )
+        return attrs

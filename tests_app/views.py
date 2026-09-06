@@ -1,6 +1,7 @@
+import logging
 from datetime import datetime
 
-from django.db import OperationalError
+from django.db import OperationalError, transaction
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
@@ -8,26 +9,40 @@ from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound, ValidationError
 from rest_framework.pagination import PageNumberPagination
-from rest_framework.permissions import IsAdminUser, IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAdminUser, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from academics.models import Option
-from academics.services import record_question_result
 from billing.access import (
     consume_quota,
     get_grand_test_access,
     has_daily_test_access,
     has_mock_test_access,
     has_pyq_access,
-    is_preview_only,
 )
-from hamromentor.permissions import IsStaffOrReadOnly
+from entitlements.provisioning import ensure_and_consume_free_starter, has_free_starter_available
+from entitlements.services import can_review_attempt
+from hamromentor.permissions import HasFeature, IsStaffOrReadOnly
 
 from . import performance
 from .access import can_access_test, visible_test_queryset
 from .exam_versioning import RescheduleError, clone_test_as_new_version, create_reschedule_session
+from .lifecycle import (
+    attempt_is_preview_only,
+    attempt_preview_question_ids,
+    effective_attempt_end,
+    ensure_finalized_if_expired,
+    finalize_attempt,
+    freeze_attempt_questions,
+    is_attempt_expired,
+)
 from .models import Answer, ExamSession, ExamTemplate, SavedExamView, Test, TestAttempt
+from .policy import get_all_exam_type_defaults
+from .preview import resolve_preview_user
+from .stats_tasks import process_question_stats
+
+logger = logging.getLogger(__name__)
 from .serializers import (
     ExamSessionSerializer,
     ExamTemplateSerializer,
@@ -56,6 +71,64 @@ class _ExamBrowsePagination(PageNumberPagination):
     page_size_query_param = 'page_size'
 
 
+class _BoundedListPagination(PageNumberPagination):
+    """Caps GET /tests/ at a real DB-level LIMIT without changing its
+    response shape — every one of its 7 confirmed callers (student test
+    listings across Daily/Mock/Grand/PYQ/home, the Admin videos page,
+    the teacher course editor) reads the response as a bare array, and
+    none of them is the "browse the whole catalog" use case (the Admin
+    Exam Management dashboard already uses the paginated `browse` action
+    above for that). This still issues LIMIT 200 at the query level —
+    every one of these callers is already filtered by exam_type/course/
+    university/etc. and realistically returns far fewer rows than that;
+    the cap exists purely so a request with no filters at all can never
+    return the entire table as it scales toward 100k+ questions' worth
+    of exams."""
+    page_size = 200
+    max_page_size = 200
+
+    def get_paginated_response(self, data):
+        return Response(data)
+
+
+def _free_starter_denied_payload():
+    """Phase 3, Step 19 — a machine-readable denial shape the frontend can
+    use to render an upgrade prompt, additive alongside the existing
+    `detail`/`code` fields these 402 responses already return. Not a
+    breaking response-shape change."""
+    return {'reason': 'free_limit_reached', 'source': 'free_starter', 'upgrade_available': True}
+
+
+def _free_starter_eligibility(user, has_prior_attempt, resource_type):
+    """Returns (eligible, should_consume) for a free-starter fallback
+    check inside _start_attempt.
+
+    A student who already has ANY prior attempt of this specific test
+    (any status) necessarily reached it via free-starter — this branch is
+    only ever reached when the student LACKS real commercial access
+    (has_mock_test_access/has_daily_test_access/has_pyq_access/
+    GrandTestAccess all already failed above), so a prior attempt without
+    real access can only mean a previous free-starter grant. Such a
+    student is always allowed through again (resume, or a second attempt
+    if the test's own max_attempts permits it) without a second
+    consumption — matches Step 11's "do not consume a Mock Test quota
+    repeatedly" rule, generalized to every resource type gated here.
+
+    A genuinely first-time attempt is gated on, and (by the caller, once
+    every other check has also passed) consumes, real remaining
+    free-starter quota.
+
+    Staff/admin accounts are never eligible at all (Step 31: must never
+    be treated as normal free users, must never accidentally consume free
+    quota) — preserves the exact pre-Phase-3 behavior for staff.
+    """
+    if user.is_staff:
+        return False, False
+    if has_prior_attempt:
+        return True, False
+    return has_free_starter_available(user, resource_type), True
+
+
 def _start_attempt(request, test, session=None):
     """Shared by TestViewSet.start (legacy route, session=None — behavior is
     byte-for-byte what it was before Exam Sessions existed) and
@@ -73,6 +146,14 @@ def _start_attempt(request, test, session=None):
     if not can_access_test(request.user, test):
         return Response({'detail': 'You do not have access to this exam.'}, status=status.HTTP_403_FORBIDDEN)
 
+    # Phase 3 Free Starter: whether this student has EVER attempted this
+    # specific Test before (any status) — computed once, up front. Fed
+    # into _free_starter_eligibility() below, which distinguishes "first
+    # attempt, gate and consume" from "already unlocked this test before,
+    # always allow, never re-consume." See
+    # docs/FREE_STARTER_USAGE_RULES.md §3/4/5.
+    has_prior_attempt = test.attempts.filter(user=request.user).exists()
+
     if session:
         session.refresh_status()
         if session.status == 'cancelled':
@@ -87,40 +168,95 @@ def _start_attempt(request, test, session=None):
         if session.access_type == 'private' and submitted_password != session.password:
             return Response({'detail': 'Incorrect session password.'}, status=status.HTTP_403_FORBIDDEN)
 
+    # Phase 3 Free Starter: which resource_type (if any) this attempt is
+    # being granted through free-starter fallback — checked (never
+    # consumed) here, so a later gate in this same function (a wrong
+    # password, an exhausted attempt count) can still deny the request
+    # without having already burned the student's quota. Actually consumed
+    # only once, right before the attempt is created below — see
+    # docs/FREE_STARTER_USAGE_RULES.md §3-6 and the has_free_starter_
+    # available() docstring for exactly why consumption is deferred this
+    # way (a real bug caught by this phase's own tests: consuming
+    # immediately on "no Grand Test purchase found" let a wrong-password
+    # guess burn the student's one free grant before they got to enter the
+    # real password).
+    free_starter_resource = None
+
     if test.exam_type == 'grand' and test.is_pro:
         access = get_grand_test_access(request.user, test)
         if not access:
-            return Response(
-                {'detail': 'This Grand Test requires purchase.', 'code': 'purchase_required'},
-                status=status.HTTP_402_PAYMENT_REQUIRED,
-            )
-        if submitted_password != access.password:
+            eligible, should_consume = _free_starter_eligibility(request.user, has_prior_attempt, 'grand_test')
+            if not eligible:
+                return Response(
+                    {
+                        'detail': 'This Grand Test requires purchase.', 'code': 'purchase_required',
+                        'access_denied': _free_starter_denied_payload(),
+                    },
+                    status=status.HTTP_402_PAYMENT_REQUIRED,
+                )
+            # Free-starter-eligible entry still respects the exam's own
+            # optional password (an additional layer, never a substitute
+            # for entitlement — GrandTestAccess.password doesn't apply here
+            # since no GrandTestAccess grant exists on this path).
+            if test.access_password and submitted_password != test.access_password:
+                return Response({'detail': 'Incorrect test password.'}, status=status.HTTP_403_FORBIDDEN)
+            if should_consume:
+                free_starter_resource = 'grand_test'
+        elif submitted_password != access.password:
             return Response({'detail': 'Incorrect exam password.'}, status=status.HTTP_403_FORBIDDEN)
     elif test.access_password and submitted_password != test.access_password:
         return Response({'detail': 'Incorrect test password.'}, status=status.HTTP_403_FORBIDDEN)
     elif test.exam_type in ('mock', 'qbank') and test.is_pro and not has_mock_test_access(request.user, test):
-        return Response(
-            {'detail': 'This Mock Test requires an active subscription.', 'code': 'purchase_required'},
-            status=status.HTTP_402_PAYMENT_REQUIRED,
-        )
+        eligible, should_consume = _free_starter_eligibility(request.user, has_prior_attempt, 'mock_test')
+        if not eligible:
+            return Response(
+                {
+                    'detail': 'This Mock Test requires an active subscription.', 'code': 'purchase_required',
+                    'access_denied': _free_starter_denied_payload(),
+                },
+                status=status.HTTP_402_PAYMENT_REQUIRED,
+            )
+        if should_consume:
+            free_starter_resource = 'mock_test'
     elif (
         test.exam_type == 'daily' and test.is_pro
         and not has_daily_test_access(request.user, test) and test.free_preview_questions <= 0
     ):
-        return Response(
-            {'detail': 'This Daily Test requires an active subscription.', 'code': 'purchase_required'},
-            status=status.HTTP_402_PAYMENT_REQUIRED,
-        )
+        eligible, should_consume = _free_starter_eligibility(request.user, has_prior_attempt, 'daily_test')
+        if not eligible:
+            return Response(
+                {
+                    'detail': 'This Daily Test requires an active subscription.', 'code': 'purchase_required',
+                    'access_denied': _free_starter_denied_payload(),
+                },
+                status=status.HTTP_402_PAYMENT_REQUIRED,
+            )
+        if should_consume:
+            free_starter_resource = 'daily_test'
     elif test.exam_type == 'pyq' and test.is_pro and not has_pyq_access(request.user, test):
-        return Response(
-            {'detail': 'This Past Year Questions test requires an active membership.', 'code': 'purchase_required'},
-            status=status.HTTP_402_PAYMENT_REQUIRED,
-        )
+        eligible, should_consume = _free_starter_eligibility(request.user, has_prior_attempt, 'pyq')
+        if not eligible:
+            return Response(
+                {
+                    'detail': 'This Past Year Questions test requires an active membership.', 'code': 'purchase_required',
+                    'access_denied': _free_starter_denied_payload(),
+                },
+                status=status.HTTP_402_PAYMENT_REQUIRED,
+            )
+        if should_consume:
+            free_starter_resource = 'pyq'
 
     attempt_qs = test.attempts.filter(user=request.user, session=session)
     existing = attempt_qs.filter(status='in_progress').first()
     if existing:
-        return Response(TestAttemptSerializer(existing, context={'request': request}).data)
+        # Phase 6: a "resume" that lands after the effective deadline has
+        # passed finalizes the stale attempt instead of handing back a
+        # dead attempt for the frontend to render as if still answerable
+        # — then falls through to the ordinary attempt-count/new-attempt
+        # logic below, exactly as if this had never been in progress.
+        existing = ensure_finalized_if_expired(existing)
+        if existing.status == 'in_progress':
+            return Response(TestAttemptSerializer(existing, context={'request': request}).data)
 
     attempt_count = attempt_qs.count()
     max_attempts = session.max_attempts if session else test.max_attempts
@@ -130,8 +266,15 @@ def _start_attempt(request, test, session=None):
     attempt = TestAttempt.objects.create(
         user=request.user, test=test, session=session, attempt_number=attempt_count + 1,
     )
+    # Phase 9: freeze this attempt's question set/order exactly once, right
+    # here — the single point every subsequent GET/answer/submit reads
+    # from instead of recomputing. See freeze_attempt_questions' own
+    # docstring for the incident this fixes.
+    freeze_attempt_questions(attempt)
 
-    if test.exam_type in ('mock', 'qbank') and test.is_pro:
+    if free_starter_resource:
+        ensure_and_consume_free_starter(request.user, free_starter_resource)
+    elif test.exam_type in ('mock', 'qbank') and test.is_pro:
         consume_quota(request.user, 'mock_test')
 
     return Response(
@@ -181,6 +324,24 @@ def _exam_stats(program=None):
 class TestViewSet(viewsets.ModelViewSet):
     queryset = Test.objects.all()
     permission_classes = [IsStaffOrReadOnly]
+    pagination_class = _BoundedListPagination
+
+    def get_permissions(self):
+        # FIX (P0 security audit): plain IsStaffOrReadOnly meant ANY staff
+        # account — including Editor/Teacher roles the product explicitly
+        # scopes via the 'exam_delete' feature key everywhere else
+        # (RolePermission, EXAM_MANAGEMENT_FEATURES) — could delete any
+        # exam. Only 'destroy' is gated here; every other action keeps its
+        # existing IsStaffOrReadOnly behavior unchanged (see the note on
+        # .reschedule below for the second gated action, and the note in
+        # MASTER_PLATFORM_AUDIT_REPORT.md §36 for why publish/archive
+        # (a generic PATCH of is_draft, not a distinct action) and
+        # .duplicate are deliberately NOT gated here — no EXAM_MANAGEMENT_
+        # FEATURES key claims to cover them, and inferring one from a PATCH
+        # payload is a bigger, separate change).
+        if self.action == 'destroy':
+            return [HasFeature('exam_delete')()]
+        return super().get_permissions()
 
     def destroy(self, request, *args, **kwargs):
         from core.deletion_audit import record_deletion
@@ -269,6 +430,13 @@ class TestViewSet(viewsets.ModelViewSet):
             qs = qs.filter(is_pro=False)
 
         user = self.request.user
+        # Phase 10 "preview as student" (plan bullet 3): an admin can ask
+        # for the catalog as one specific student sees it. Read-only and
+        # GET-only by construction — see tests_app/preview.py. Returns None
+        # (i.e. no change at all) for everyone else.
+        preview_user = resolve_preview_user(self.request)
+        if preview_user is not None:
+            user = preview_user
         # Always-applied, server-derived eligibility filter — never opt-in on
         # whether the client happened to send ?course=, and never widened by
         # a client-supplied course id the student isn't actually enrolled in.
@@ -280,7 +448,44 @@ class TestViewSet(viewsets.ModelViewSet):
             qs = qs.filter(courses__id=course_id)
         if user.is_authenticated and getattr(user, 'admin_role', None) == 'teacher' and not user.can_manage_all_content:
             qs = qs.filter(created_by=user)
-        return qs.distinct()
+
+        # TestListSerializer needs subject.name, created_by.first_name/email,
+        # and the full courses list per row — select_related/prefetch_related
+        # these instead of one query per field per row (scalability audit:
+        # ~8 queries/row -> ~163 queries for a 20-row page). annotated_*
+        # replace the question_count/total_marks @property lookups (each of
+        # which re-queried every related Question) with two DB-side
+        # aggregates computed in the same query as the row fetch; distinct=True
+        # on both guards against the classic Django multi-aggregate fan-out
+        # since they aggregate over the same `questions` join.
+        from django.db.models import Count, Prefetch, Sum
+
+        qs = qs.select_related('subject', 'created_by').prefetch_related('courses').annotate(
+            annotated_question_count=Count('questions', distinct=True),
+            annotated_total_marks=Sum('questions__marks', distinct=True),
+        )
+        if user.is_authenticated:
+            # One query for this user's attempts across every Test in the
+            # page, instead of the 3 separate live queries per row
+            # (best-score, in-progress, attempts-used) TestListSerializer
+            # used to run. answered_count is annotated here too, so the
+            # in-progress card's "answered_count" field needs zero further
+            # queries even in the rare case a row does have one.
+            # Explicit order, not a reliance on Meta.ordering combining
+            # predictably with the annotate()-induced GROUP BY (it doesn't,
+            # confirmed by a failing test — the "most recent among tied
+            # scores" tiebreak in TestListSerializer._best_attempt needs a
+            # genuinely deterministic input order to be stable, not an
+            # assumed one).
+            user_attempts_qs = TestAttempt.objects.filter(user=user).annotate(
+                answered_count=Count('answers', distinct=True),
+            ).order_by('-start_time')
+            qs = qs.prefetch_related(Prefetch('attempts', queryset=user_attempts_qs, to_attr='_prefetched_user_attempts'))
+        # Explicit order (matching Test.Meta.ordering) rather than relying on
+        # the model default combining predictably with .distinct() — DRF's
+        # paginator warns ("may yield inconsistent results") when it can't
+        # positively confirm the queryset is deterministically ordered.
+        return qs.distinct().order_by('-scheduled_start', '-created_at', '-id')
 
     @action(detail=False, methods=['get'])
     def universities(self, request):
@@ -395,13 +600,17 @@ class TestViewSet(viewsets.ModelViewSet):
         test = get_object_or_404(Test, pk=pk)
         return _start_attempt(request, test)
 
-    @action(detail=True, methods=['post'])
+    @action(detail=True, methods=['post'], permission_classes=[HasFeature('exam_schedule')])
     def reschedule(self, request, pk=None):
         """Reschedule / Schedule Again — creates a new ExamSession reusing
         this Test's question set and configuration by default. See
         exam_versioning.create_reschedule_session for the full flow
         (lazy template/session-1 adoption, double-click-safe locking,
-        optional Create New Version when questions are being changed)."""
+        optional Create New Version when questions are being changed).
+
+        Gated on 'exam_schedule' (P0 security audit fix) — previously any
+        staff account could reschedule any exam via plain IsStaffOrReadOnly.
+        """
         test = self.get_object()
         serializer = RescheduleSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -511,6 +720,46 @@ class TestViewSet(viewsets.ModelViewSet):
         )
         return Response([{'program': p, **_exam_stats(p)} for p in programs])
 
+    @action(detail=False, methods=['get'], permission_classes=[IsAdminUser])
+    def exam_type_policies(self, request):
+        """Phase 5 — the canonical per-exam-category default-config
+        template, read-only. Sole intended callers: the Create Exam Wizard
+        (Admin/src/app/exam-management/page.js) and the Import & Create Test
+        UI (Admin/src/components/import/TestConfigStep.js), both of which
+        used to hardcode their own independent, drifted default objects.
+        Writing a policy is Django-admin-only (see tests_app/admin.py) —
+        no write endpoint exists here, matching the entitlements.
+        FreeStarterPolicy precedent from Phase 2."""
+        return Response(get_all_exam_type_defaults())
+
+    @action(detail=True, methods=['post'], permission_classes=[HasFeature('exam_release_solutions')])
+    def release_solutions(self, request, pk=None):
+        """Phase 7 — the manual-release action solutions_visibility='manual'
+        requires. Releases this Test's own session-less (anytime) attempts
+        only — a scheduled attempt releases per-session instead (see
+        ExamSessionViewSet.release_solutions), deliberately not cascaded
+        from here, so releasing one occurrence never leaks into another
+        still-open one. Idempotent: calling this again after release is a
+        no-op (returns the already-released state), never re-stamps
+        released_by/released_at."""
+        test = self.get_object()
+        if test.solutions_visibility != 'manual':
+            return Response(
+                {'detail': "This exam's solutions visibility is not set to manual release — there is nothing to release."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not test.solutions_released_at:
+            from core.edit_audit import record_admin_edit
+
+            test.solutions_released_at = timezone.now()
+            test.solutions_released_by = request.user
+            test.save(update_fields=['solutions_released_at', 'solutions_released_by'])
+            record_admin_edit(
+                request, resource_type='Test', resource_id=test.id, resource_label=test.title,
+                changed_fields={'solutions_released_at': {'old': None, 'new': test.solutions_released_at.isoformat()}},
+            )
+        return Response(TestAdminSerializer(test, context={'request': request}).data)
+
 
 def _teacher_scope(qs, user, field='created_by'):
     if user.is_authenticated and getattr(user, 'admin_role', None) == 'teacher' and not user.can_manage_all_content:
@@ -557,7 +806,7 @@ class ExamTemplateViewSet(viewsets.ModelViewSet):
             qs = qs.filter(versions__is_pro=False).distinct()
         return _teacher_scope(qs, self.request.user)
 
-    @action(detail=True, methods=['get'])
+    @action(detail=True, methods=['get'], permission_classes=[IsAdminUser])
     def sessions(self, request, pk=None):
         template = self.get_object()
         sessions = template.sessions.select_related('exam_version').all()
@@ -626,11 +875,19 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
         session = self.get_object()
         return _start_attempt(request, session.exam_version, session=session)
 
-    @action(detail=True, methods=['get'])
+    @action(detail=True, methods=['get'], permission_classes=[IsAdminUser])
     def attempts(self, request, pk=None):
-        """Participants/Results for this session (Admin-only, staff already
-        enforced by the ViewSet's default IsStaffOrReadOnly for GET-as-staff
-        vs this being a detail action requiring the same permission)."""
+        """Participants/Results for this session — admin-only.
+
+        FIX (P0 security audit): the ViewSet's default IsStaffOrReadOnly
+        does NOT enforce staff-only here — GET is a SAFE_METHOD, so that
+        permission class returns True unconditionally for any caller,
+        authenticated or not. This action returns participant names,
+        emails, scores, and ranks (see SessionAttemptSerializer), so an
+        explicit IsAdminUser override is required, not optional. Do not
+        remove this override without replacing it with an equally strict
+        one — the previous state was a real unauthenticated PII leak.
+        """
         session = self.get_object()
         qs = session.attempts.select_related('user', 'test').order_by('-score')
         return Response(SessionAttemptSerializer(qs, many=True, context={'request': request}).data)
@@ -642,6 +899,32 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
             return Response({'detail': 'A completed session cannot be cancelled.'}, status=status.HTTP_400_BAD_REQUEST)
         session.status = 'cancelled'
         session.save(update_fields=['status'])
+        return Response(ExamSessionSerializer(session, context={'request': request}).data)
+
+    @action(detail=True, methods=['post'], permission_classes=[HasFeature('exam_release_solutions')])
+    def release_solutions(self, request, pk=None):
+        """Phase 7 — session-scoped counterpart of TestViewSet.
+        release_solutions, for solutions_visibility='manual' attempts made
+        through this specific session. Deliberately independent of every
+        other session under the same exam_template/Test — releasing
+        Session #1's solutions must never affect a still-open Session #2
+        (see ExamSession.solutions_released_at's own comment). Idempotent."""
+        session = self.get_object()
+        if session.exam_version.solutions_visibility != 'manual':
+            return Response(
+                {'detail': "This exam's solutions visibility is not set to manual release — there is nothing to release."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not session.solutions_released_at:
+            from core.edit_audit import record_admin_edit
+
+            session.solutions_released_at = timezone.now()
+            session.solutions_released_by = request.user
+            session.save(update_fields=['solutions_released_at', 'solutions_released_by'])
+            record_admin_edit(
+                request, resource_type='ExamSession', resource_id=session.id, resource_label=session.session_name,
+                changed_fields={'solutions_released_at': {'old': None, 'new': session.solutions_released_at.isoformat()}},
+            )
         return Response(ExamSessionSerializer(session, context={'request': request}).data)
 
 
@@ -663,7 +946,25 @@ class AttemptDetailView(APIView):
 
     def get(self, request, attempt_id):
         attempt = get_object_or_404(TestAttempt, pk=attempt_id, user=request.user)
-        if attempt.status == 'submitted':
+        # Phase 6: the resume/continue entry point — lazily finalizes a
+        # still-'in_progress' attempt whose effective deadline (session
+        # window or personal duration, whichever is sooner — see
+        # lifecycle.effective_attempt_end) has already passed. Mirrors the
+        # ExamSession.refresh_status() lazy-reactive pattern already
+        # established in this codebase: a student (or admin) revisiting an
+        # expired attempt is what actually finalizes it if no one has
+        # touched it since the deadline passed — see
+        # tests_app/lifecycle.py's module docstring for the full picture
+        # (the finalize_expired_attempts management command is the
+        # complementary backstop for an attempt no one ever revisits).
+        attempt = ensure_finalized_if_expired(attempt)
+        # Phase 4: routed through the shared can_review_attempt() capability
+        # instead of an inline status check duplicated a second, slightly
+        # different way in TestResultView (see that view's own comment and
+        # docs/ACCESS_DECISION_MATRIX.md discrepancy #1 for the real bug
+        # this was found alongside) — same condition as before
+        # (attempt.status == 'submitted'), now centralized.
+        if can_review_attempt(request.user, attempt).allowed:
             return Response(TestResultSerializer(attempt, context={'request': request}).data)
         return Response(TestAttemptSerializer(attempt, context={'request': request}).data)
 
@@ -673,14 +974,33 @@ class SubmitAnswerView(APIView):
 
     def post(self, request, attempt_id):
         attempt = get_object_or_404(TestAttempt, pk=attempt_id, user=request.user, status='in_progress')
+        # Phase 6: server-authoritative deadline enforcement — never trust
+        # that the browser timer stopped the student from sending this
+        # request. An attempt whose effective deadline has passed is
+        # finalized right here (auto-submitted, using whatever was legally
+        # answered before now) and this specific late answer is rejected —
+        # "student must no longer be allowed to answer" past the deadline,
+        # per the Phase 6 spec.
+        if is_attempt_expired(attempt):
+            finalize_attempt(attempt, auto_submitted=True)
+            return Response(
+                {'detail': 'This exam has ended and your attempt was automatically submitted.', 'code': 'exam_closed'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
         serializer = SubmitAnswerSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
-        if is_preview_only(request.user, attempt.test):
-            allowed_ids = set(
-                attempt.test.questions.all()[:attempt.test.free_preview_questions].values_list('id', flat=True)
-            )
+        # Phase 9: both the preview verdict and, if preview, the exact set
+        # of allowed question IDs now come from this attempt's own frozen
+        # AttemptQuestion rows — not a fresh, independently-derived
+        # is_preview_only()/questions.all()[:N] computation. Fixes the
+        # proven case where a question the student was actually shown as
+        # preview (per a differently-shuffled get_questions() response)
+        # could be rejected here as "not preview" by a second, disagreeing
+        # derivation.
+        if attempt_is_preview_only(attempt):
+            allowed_ids = attempt_preview_question_ids(attempt)
             if data['question_id'] not in allowed_ids:
                 return Response(
                     {'detail': 'Subscribe to unlock this question.', 'code': 'purchase_required'},
@@ -716,6 +1036,15 @@ class MarkForReviewView(APIView):
 
     def post(self, request, attempt_id):
         attempt = get_object_or_404(TestAttempt, pk=attempt_id, user=request.user, status='in_progress')
+        # Phase 6: same server-authoritative deadline enforcement as
+        # SubmitAnswerView — marking a question for review is still a form
+        # of interacting with an in-progress attempt.
+        if is_attempt_expired(attempt):
+            finalize_attempt(attempt, auto_submitted=True)
+            return Response(
+                {'detail': 'This exam has ended and your attempt was automatically submitted.', 'code': 'exam_closed'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
         question_id = request.data.get('question_id')
         marked = request.data.get('marked') in (True, 'true', 'True', '1', 1)
         if not question_id:
@@ -732,61 +1061,105 @@ class SubmitTestView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request, attempt_id):
+        # Phase 6: the scoring/ranking body that used to live inline here
+        # (record_question_result() per answer, rank/percentile via one
+        # aggregate query, deferred stats via transaction.on_commit()) is
+        # now tests_app.lifecycle.finalize_attempt() — the exact same
+        # logic, unchanged, extracted so a manual Submit and a
+        # server-triggered auto-submit (an expired attempt discovered by
+        # SubmitAnswerView/AttemptDetailView/TestResultView, or by the
+        # finalize_expired_attempts management command) are byte-for-byte
+        # the same code path, never two independently-drifting scoring
+        # implementations. See lifecycle.py's module docstring.
+        #
+        # get_object_or_404(..., status='in_progress') still 404s a
+        # request for an attempt that's already submitted, exactly as
+        # before. finalize_attempt() itself is what's race-safe now (its
+        # own select_for_update() + idempotent re-check) — a concurrent
+        # double-submit can no longer double-score (still enforced,
+        # SubmitTestDoubleSubmissionRaceTests), though the "loser" of a
+        # true race now gets a 200 with the same already-final result
+        # instead of a 404 (an intentional, tested UX improvement — a
+        # double-click no longer surfaces an error to the student).
         attempt = get_object_or_404(TestAttempt, pk=attempt_id, user=request.user, status='in_progress')
 
-        if is_preview_only(request.user, attempt.test):
+        # Phase 9: the frozen, immutable-once-started verdict (see
+        # attempt_is_preview_only's own docstring for why this must not
+        # re-derive from the student's current entitlement state).
+        if attempt_is_preview_only(attempt):
             return Response(
                 {'detail': 'Subscribe to submit this test.', 'code': 'purchase_required'},
                 status=status.HTTP_402_PAYMENT_REQUIRED,
             )
 
-        score = 0.0
-        correct = 0
-        answered = attempt.answers.count()
-        for answer in attempt.answers.select_related('question'):
-            q = answer.question
-            if answer.selected_option_id:
-                if answer.is_correct:
-                    score += float(q.marks)
-                    correct += 1
-                elif attempt.test.negative_marking:
-                    score -= float(q.negative_marks)
-                # Once per submitted attempt, not per answer-change (SubmitAnswerView
-                # is update_or_create and can be hit many times while the student is
-                # still deciding) — this is the platform-wide feed into Weak/Mastered/
-                # Mistake Bank alongside QBank practice. Additive only: doesn't touch
-                # Answer/TestAttempt/scoring above.
-                record_question_result(
-                    request.user, q, answer.is_correct, source='test',
-                    selected_option=answer.selected_option, time_taken_seconds=answer.time_taken_seconds,
-                )
-
-        attempt.score = round(score, 2)
-        attempt.accuracy = round((correct / answered) * 100, 2) if answered else 0
-        attempt.end_time = timezone.now()
-        attempt.status = 'submitted'
-        attempt.save()
-
-        # Ranking pool is scoped to the session when this attempt was made through
-        # one, so rescheduled occurrences of the same exam never merge rankings —
-        # every legacy attempt (session=None) keeps ranking exactly as it always
-        # has, against every other session=None attempt on the same Test.
-        ranking_pool = TestAttempt.objects.filter(test=attempt.test, session=attempt.session, status='submitted')
-        submitted = list(ranking_pool.order_by('-score').values_list('id', flat=True))
-        if attempt.id in submitted:
-            attempt.rank = submitted.index(attempt.id) + 1
-            total = len(submitted)
-            attempt.percentile = round((total - attempt.rank) / total * 100, 2) if total > 1 else 100
-            attempt.save(update_fields=['rank', 'percentile'])
-
+        attempt = finalize_attempt(attempt, auto_submitted=False)
         return Response(TestResultSerializer(attempt, context={'request': request}).data)
+
+
+class QuestionStatsProcessingHandlerView(APIView):
+    """
+    POST /api/attempts/stats-process/ — internal endpoint invoked by Cloud
+    Tasks (or directly, synchronously, only when STATS_PROCESSING_ASYNC=
+    False, local dev only — see tests_app/stats_tasks.py). Auth is a
+    shared secret header, matching this project's existing
+    X-Media-Processing-Secret / X-Import-Processing-Secret convention.
+    Returns a non-2xx status if process_question_stats() raises, so Cloud
+    Tasks' built-in retry kicks in — safe because process_question_stats()
+    releases its claim on failure (see its docstring), so a retry can
+    still apply the same stats without double-counting.
+    """
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        import json
+
+        from django.conf import settings
+
+        provided = request.headers.get('X-Stats-Processing-Secret')
+        if provided != settings.STATS_PROCESSING_SECRET:
+            return Response({'detail': 'Invalid secret.'}, status=status.HTTP_401_UNAUTHORIZED)
+
+        try:
+            body = json.loads(request.body)
+            attempt_id = body['attempt_id']
+            deltas = body['deltas']
+        except (json.JSONDecodeError, KeyError):
+            return Response({'detail': 'attempt_id and deltas required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            process_question_stats(attempt_id, deltas)
+        except Exception as exc:  # noqa: BLE001 - deliberately surfaced as a 500 so Cloud Tasks retries
+            return Response({'detail': f'Stats processing failed: {exc}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        return Response({'ok': True})
 
 
 class TestResultView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request, attempt_id):
+        # FIX (Phase 4 access-decision-matrix audit, discrepancy #1): this
+        # endpoint previously had NO status check at all — only the
+        # ownership filter below — meaning a student could GET their own
+        # still-in_progress attempt's result here and see full solutions/
+        # correct-answer content before submitting, even though the
+        # sibling AttemptDetailView already correctly gated the identical
+        # TestResultSerializer behind attempt.status == 'submitted'. Now
+        # routed through the same can_review_attempt() capability that
+        # view uses, closing the gap rather than leaving two endpoints
+        # disagreeing on the same data.
         attempt = get_object_or_404(TestAttempt, pk=attempt_id, user=request.user)
+        # Phase 6: same lazy finalization as AttemptDetailView — a student
+        # checking their result right after time ran out (before anything
+        # else has touched this attempt) is finalized here rather than
+        # finding a confusing "not submitted yet" 403 for an exam that's
+        # actually over.
+        attempt = ensure_finalized_if_expired(attempt)
+        decision = can_review_attempt(request.user, attempt)
+        if not decision.allowed:
+            return Response(
+                {'detail': 'This attempt has not been submitted yet.', 'access_denied': decision.as_dict()},
+                status=status.HTTP_403_FORBIDDEN,
+            )
         filter_type = request.query_params.get('filter', 'all')
         return Response(
             TestResultSerializer(attempt, context={'request': request, 'filter': filter_type}).data
@@ -824,23 +1197,102 @@ def _parse_date_range(request):
     return timezone.now() - timezone.timedelta(days=days_int), None
 
 
+def _deny_if_cannot_view_own_analytics(request):
+    """Phase 7: CanViewAnalytics, wired in explicitly rather than left as
+    only an implicit property of "this view never accepts a target user
+    parameter" (Phase 4 built the capability specifically to make that
+    invariant real and testable — see its own docstring). Every analytics
+    view below is self-scoped by construction (never takes a target user
+    id), so this always allows — but it's now a real, tested enforcement
+    point rather than a claim about query shape alone. Returns a 403
+    Response if denied, None if allowed."""
+    from entitlements.services import can_view_analytics
+    decision = can_view_analytics(request.user, request.user)
+    if not decision.allowed:
+        return Response({'detail': decision.reason, 'access_denied': decision.as_dict()}, status=status.HTTP_403_FORBIDDEN)
+    return None
+
+
 class StudentPerformanceOverviewView(APIView):
     permission_classes = [IsAuthenticated]
 
+    # Scalability audit: this endpoint used to issue ~60-90 separate
+    # queries per request (7 independent aggregation functions, several
+    # re-fetching the exact same TestAttempt/Answer/QuestionAttempt rows —
+    # see tests_app/performance.py's memoization helpers). Response cached
+    # per-user for a short window on top of that fix. The cache key always
+    # includes request.user.id, so one user can never be served another
+    # user's cached response — this is the only variable that determines
+    # which cache entry is read/written, making cross-user leakage
+    # impossible by construction, not just by convention. Course/date-
+    # range/granularity are part of the key too, so different filtered
+    # views for the same user never collide. TTL is short (not the
+    # 900s used for the platform-wide subject-rank table) because this
+    # response is the student's OWN live activity — a longer TTL would
+    # mean "I just submitted a test and my dashboard doesn't show it yet",
+    # a real, noticeable staleness bug, not just a performance trade-off.
+    OVERVIEW_CACHE_SECONDS = 30
+
     def get(self, request):
+        from django.core.cache import cache
+
+        denied = _deny_if_cannot_view_own_analytics(request)
+        if denied:
+            return denied
+
         course = _parse_course(request)
         date_from, date_to = _parse_date_range(request)
         granularity = request.query_params.get('granularity', 'day')
 
-        return Response({
-            'kpis': performance.kpi_overview(request.user, course, date_from, date_to),
-            'trend': performance.trend_series(request.user, course, date_from, date_to, granularity),
-            'subjects': performance.subject_breakdown(request.user, course),
-            'mock_tests': performance.mock_test_analytics(request.user, course),
-            'questions': performance.question_analytics(request.user, course),
-            'strengths_weaknesses': performance.strengths_and_weaknesses(request.user, course),
-            'recommendations': performance.recommendations(request.user, course),
-        })
+        # Keyed on the RAW request params (days=/from=/to=), not the
+        # resolved date_from/date_to above — _parse_date_range's default
+        # path computes date_from as timezone.now() - N days, which is a
+        # different microsecond-precision value on every single call, so
+        # keying on it would make every request a cache miss and silently
+        # defeat the cache entirely (caught during Phase A validation: repeat
+        # requests weren't actually getting faster). The raw params are
+        # stable across calls within the same window, which is what "the
+        # same logical request" actually means here — a few seconds'
+        # difference in exactly where a 30-day window starts doesn't change
+        # which TestAttempts fall in range in any way that matters for a
+        # 30-second cache.
+        cache_key = (
+            f'perf:overview:{request.user.id}:{course}:'
+            f"{request.query_params.get('days', '')}:{request.query_params.get('from', '')}:"
+            f"{request.query_params.get('to', '')}:{granularity}"
+        )
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return Response(cached)
+
+        # Request-scoped only (a fresh dict every call, never persisted or
+        # shared across requests/users) — collapses exact-duplicate
+        # fetches across the 7 functions below into one query each. See
+        # tests_app/performance.py's _memo_get_attempts/_memo_answer_stats/
+        # _memo_combined_state docstrings for exactly what this does and
+        # does not change.
+        memo = {}
+
+        # Scalability audit Phase 3: subject_breakdown() (its own
+        # _combined_question_state scan + a per-subject aggregation loop)
+        # used to run three separate times in this one request —
+        # strengths_and_weaknesses() and recommendations() each called it
+        # again internally. Computed once here and shared via the optional
+        # `subjects` param; both functions still self-compute it when
+        # called standalone elsewhere.
+        subjects = performance.subject_breakdown(request.user, course, memo=memo)
+
+        data = {
+            'kpis': performance.kpi_overview(request.user, course, date_from, date_to, memo=memo),
+            'trend': performance.trend_series(request.user, course, date_from, date_to, granularity, memo=memo),
+            'subjects': subjects,
+            'mock_tests': performance.mock_test_analytics(request.user, course, memo=memo),
+            'questions': performance.question_analytics(request.user, course, memo=memo),
+            'strengths_weaknesses': performance.strengths_and_weaknesses(request.user, course, subjects=subjects, memo=memo),
+            'recommendations': performance.recommendations(request.user, course, subjects=subjects, memo=memo),
+        }
+        cache.set(cache_key, data, self.OVERVIEW_CACHE_SECONDS)
+        return Response(data)
 
 
 class SubjectPerformanceDetailView(APIView):
@@ -851,6 +1303,10 @@ class SubjectPerformanceDetailView(APIView):
 
         from academics.models import Subject
         from courses.access import eligible_course_ids
+
+        denied = _deny_if_cannot_view_own_analytics(request)
+        if denied:
+            return denied
 
         user = request.user
         accessible = Subject.objects.filter(pk=subject_id)
@@ -871,6 +1327,9 @@ class ExamTypeStatsView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request, exam_type):
+        denied = _deny_if_cannot_view_own_analytics(request)
+        if denied:
+            return denied
         if exam_type not in dict(Test.EXAM_TYPE_CHOICES):
             return Response({'detail': 'Unknown exam_type.'}, status=400)
         course = _parse_course(request)
@@ -881,6 +1340,9 @@ class PerformanceCalendarView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
+        denied = _deny_if_cannot_view_own_analytics(request)
+        if denied:
+            return denied
         course = _parse_course(request)
         month = request.query_params.get('month') or timezone.now().strftime('%Y-%m')
         try:
@@ -894,6 +1356,17 @@ class AttemptComparativeView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request, attempt_id):
+        # Phase 11 audit: this was the one analytics endpoint of the five
+        # that never ran the CanViewAnalytics check. It was not an IDOR —
+        # the ownership filter below has always been present — but the
+        # capability was unenforced here, so an analytics-visibility policy
+        # change would have silently skipped this endpoint. Checked before
+        # the ownership lookup: capability first, existence second.
+        denied = _deny_if_cannot_view_own_analytics(request)
+        if denied:
+            return denied
+        # Deliberately NotFound, not PermissionDenied: another student's
+        # attempt id must not be distinguishable from a nonexistent one.
         if not TestAttempt.objects.filter(pk=attempt_id, user=request.user).exists():
             raise NotFound('Attempt not found.')
         return Response(performance.comparative(request.user, attempt_id))

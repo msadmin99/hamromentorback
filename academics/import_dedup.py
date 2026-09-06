@@ -20,6 +20,48 @@ SIMILARITY_THRESHOLD = 0.85
 _TAG_RE = re.compile(r'<[^>]+>')
 _WS_RE = re.compile(r'\s+')
 
+# Phase 2 (dedup performance audit): a cheap, mathematically lossless
+# pre-filter on normalized text length, applied before the expensive
+# SequenceMatcher.ratio() call in find_duplicate() below.
+#
+# difflib.SequenceMatcher.ratio() is defined as 2*M / (len(a)+len(b)),
+# where M is the number of matching characters found — and M can never
+# exceed the length of the shorter string (you can't match more characters
+# than the shorter sequence has). So for ANY two strings, always, without
+# exception:
+#
+#     ratio(a, b) <= 2 * min(len(a), len(b)) / (len(a) + len(b))
+#
+# This is exactly SequenceMatcher's own documented real_quick_ratio() upper
+# bound. Solving that inequality for the length ratio (let m = the shorter
+# length, M = the longer length) gives an equivalent, purely arithmetic
+# condition:
+#
+#     2m/(m+M) >= SIMILARITY_THRESHOLD   <=>   M/m <= (2 - SIMILARITY_THRESHOLD) / SIMILARITY_THRESHOLD
+#
+# So if the longer of two normalized texts is more than this ratio times
+# the length of the shorter one, ratio() is GUARANTEED to fall below
+# SIMILARITY_THRESHOLD — it is mathematically impossible for the real,
+# expensive comparison to reach the threshold in that case. Skipping
+# SequenceMatcher for such a pair can never turn a true duplicate (by this
+# module's own existing definition) into a missed one. This is an exact
+# algebraic restatement of the same inequality difflib itself uses for its
+# own fast-path, not an approximation or a new similarity heuristic — the
+# options-similarity check, the threshold, and every score this module
+# returns are completely unchanged.
+_MAX_LENGTH_RATIO = (2 - SIMILARITY_THRESHOLD) / SIMILARITY_THRESHOLD
+
+
+def _length_could_match(len_a, len_b):
+    """True if two normalized texts of these lengths could possibly reach
+    SIMILARITY_THRESHOLD under SequenceMatcher.ratio() — see the proof
+    above. False means ratio() is provably below threshold for this pair,
+    so it's safe to skip the SequenceMatcher call entirely."""
+    if len_a == 0 or len_b == 0:
+        return len_a == len_b  # two empty strings trivially match; one empty and one not, never
+    shorter, longer = (len_a, len_b) if len_a <= len_b else (len_b, len_a)
+    return longer <= shorter * _MAX_LENGTH_RATIO
+
 
 def normalize_text(html_value):
     text = _TAG_RE.sub(' ', html_value or '')
@@ -63,6 +105,12 @@ def find_duplicate(pq, existing_by_id, batch_by_index=None, self_index=None):
     def consider(other_id, other_text, other_options):
         nonlocal best_id, best_score
         if not other_text:
+            return
+        # Cheap, lossless pre-filter (see _length_could_match's docstring
+        # and the proof above _MAX_LENGTH_RATIO) — skips the expensive
+        # SequenceMatcher call for any pair whose length difference alone
+        # already proves ratio() cannot reach SIMILARITY_THRESHOLD.
+        if not _length_could_match(len(candidate_text), len(other_text)):
             return
         text_score = SequenceMatcher(None, candidate_text, other_text).ratio()
         if text_score < SIMILARITY_THRESHOLD:

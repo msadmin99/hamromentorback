@@ -6,6 +6,7 @@ from rest_framework.test import APITestCase
 
 from core.models import DeletionAuditLog
 from media_library.models import MediaAsset
+from media_library.serializers import MediaAssetSerializer
 from media_library.service import delete_media_asset
 
 User = get_user_model()
@@ -66,6 +67,55 @@ class DeleteMediaAssetServiceTests(TestCase):
         delete_media_asset(asset)  # must not raise
 
         self.assertFalse(MediaAsset.objects.filter(id=asset_id).exists())
+
+
+class MediaAssetDetailViewGetPermissionTests(APITestCase):
+    """P0 security-audit regression: GET /media/{uuid}/ previously had no
+    ownership or staff check at all — any authenticated user could poll
+    ANY asset by UUID, not just their own uploads, despite this class's own
+    docstring claiming staff-only intent (which .delete() already correctly
+    enforced). Fixed as owner-or-staff rather than staff-only, since
+    STUDENT_ALLOWED_TYPES (permissions_util.py) lets a plain student account
+    create a 'student_avatar' MediaAsset and must still be able to poll its
+    own processing status."""
+
+    def setUp(self):
+        self.staff = User.objects.create_user(
+            username='media_get_staff', email='media_get_staff@example.com', password='pw12345',
+            is_staff=True, admin_role='admin',
+        )
+        self.owner = User.objects.create_user(
+            username='media_get_owner', email='media_get_owner@example.com', password='pw12345',
+        )
+        self.other_student = User.objects.create_user(
+            username='media_get_other', email='media_get_other@example.com', password='pw12345',
+        )
+        self.asset = _make_asset(owner=self.owner, image_type='student_avatar')
+
+    def test_anonymous_caller_is_rejected(self):
+        resp = self.client.get(f'/api/media/{self.asset.id}/')
+        self.assertEqual(resp.status_code, 401)
+
+    def test_other_authenticated_student_cannot_read_someone_elses_asset(self):
+        self.client.force_authenticate(user=self.other_student)
+
+        resp = self.client.get(f'/api/media/{self.asset.id}/')
+
+        self.assertEqual(resp.status_code, 404)
+
+    def test_owner_can_read_their_own_asset(self):
+        self.client.force_authenticate(user=self.owner)
+
+        resp = self.client.get(f'/api/media/{self.asset.id}/')
+
+        self.assertEqual(resp.status_code, 200)
+
+    def test_staff_can_read_any_asset(self):
+        self.client.force_authenticate(user=self.staff)
+
+        resp = self.client.get(f'/api/media/{self.asset.id}/')
+
+        self.assertEqual(resp.status_code, 200)
 
 
 class MediaAssetDetailViewDeleteTests(APITestCase):
@@ -246,3 +296,212 @@ class SignedUrlComputeEngineCredentialsTests(TestCase):
 
         self.assertEqual(url, 'https://signed.example/normal.jpg')
         mock_blob.generate_signed_url.assert_called_once_with(version='v4', expiration=3600, method='GET')
+
+
+class CachedSignedUrlTests(TestCase):
+    """Scalability audit: Question Bank pages with real images were paying
+    a fresh IAM signBlob round trip for every single (bucket, object_key)
+    variant on every single request — confirmed 260 signBlob calls / ~15-
+    18s for one 500-question page. cached_signed_url() wraps signed_url()
+    with a Redis cache (LocMemCache in this test suite — same public API,
+    same semantics) plus single-flight stampede protection, Redis-failure
+    fallback, and signing-failure passthrough. signed_url() itself is
+    mocked throughout — these tests are entirely about the caching/
+    locking wrapper, not GCS/IAM signing mechanics (already covered by
+    SignedUrlComputeEngineCredentialsTests above)."""
+
+    def setUp(self):
+        from django.core.cache import cache
+
+        cache.clear()
+
+    def test_cold_cache_calls_signed_url_once_and_caches_result(self):
+        from media_library import gcs_storage
+
+        with patch('media_library.gcs_storage.signed_url', return_value='https://signed.example/a.jpg') as mock_sign:
+            url = gcs_storage.cached_signed_url('bucket', 'a.jpg')
+
+        self.assertEqual(url, 'https://signed.example/a.jpg')
+        mock_sign.assert_called_once_with('bucket', 'a.jpg', 3600)
+
+    def test_warm_cache_never_calls_signed_url_again(self):
+        from media_library import gcs_storage
+
+        with patch('media_library.gcs_storage.signed_url', return_value='https://signed.example/a.jpg') as mock_sign:
+            first = gcs_storage.cached_signed_url('bucket', 'a.jpg')
+            second = gcs_storage.cached_signed_url('bucket', 'a.jpg')
+            third = gcs_storage.cached_signed_url('bucket', 'a.jpg')
+
+        self.assertEqual(first, second, third)
+        mock_sign.assert_called_once()  # only the first (cold) call actually signed
+
+    def test_different_object_keys_never_collide(self):
+        """Cache keys must include bucket + object_key exactly."""
+        from media_library import gcs_storage
+
+        def fake_sign(bucket, object_key, expires_seconds=3600):
+            return f'https://signed.example/{bucket}/{object_key}'
+
+        with patch('media_library.gcs_storage.signed_url', side_effect=fake_sign) as mock_sign:
+            url_a = gcs_storage.cached_signed_url('bucket', 'a.jpg')
+            url_b = gcs_storage.cached_signed_url('bucket', 'b.jpg')
+            url_a_other_bucket = gcs_storage.cached_signed_url('other-bucket', 'a.jpg')
+
+        self.assertEqual(mock_sign.call_count, 3)  # three distinct (bucket, key) pairs, no cross-contamination
+        self.assertEqual(url_a, 'https://signed.example/bucket/a.jpg')
+        self.assertEqual(url_b, 'https://signed.example/bucket/b.jpg')
+        self.assertEqual(url_a_other_bucket, 'https://signed.example/other-bucket/a.jpg')
+        self.assertNotEqual(url_a, url_a_other_bucket)
+
+    def test_multiple_variants_of_same_image_each_cached_independently(self):
+        """Mirrors MediaAssetSerializer.get_urls()'s loop over an asset's
+        several width/format variants — each variant is a different
+        object_key, so each gets its own cache entry and its own single
+        signBlob call, but repeat requests for the SAME variant set hit
+        cache for all of them."""
+        from media_library import gcs_storage
+
+        variants = {'480_webp': 'q/1/480.webp', '800_webp': 'q/1/800.webp', '1200_webp': 'q/1/1200.webp'}
+
+        with patch('media_library.gcs_storage.signed_url', side_effect=lambda b, k, e=3600: f'https://signed/{k}') as mock_sign:
+            first_pass = {name: gcs_storage.cached_signed_url('bucket', key) for name, key in variants.items()}
+            second_pass = {name: gcs_storage.cached_signed_url('bucket', key) for name, key in variants.items()}
+
+        self.assertEqual(first_pass, second_pass)
+        self.assertEqual(mock_sign.call_count, 3)  # 3 distinct variants signed once each, not 6
+
+    def test_concurrent_requests_for_same_object_cause_only_one_signblob_call(self):
+        """Cache-stampede protection: 100 threads racing for the same
+        (bucket, object_key) must result in exactly one real signBlob call
+        — every other thread waits briefly and reuses the winner's cached
+        URL, never independently hitting the IAM API."""
+        import threading
+
+        from media_library import gcs_storage
+
+        call_count = {'n': 0}
+        call_lock = threading.Lock()
+
+        def slow_sign(bucket, object_key, expires_seconds=3600):
+            with call_lock:
+                call_count['n'] += 1
+            import time
+            time.sleep(0.2)  # simulate a real signBlob round trip long enough for other threads to queue up
+            return 'https://signed.example/stampede.jpg'
+
+        results = []
+        results_lock = threading.Lock()
+
+        def worker():
+            url = gcs_storage.cached_signed_url('bucket', 'stampede.jpg')
+            with results_lock:
+                results.append(url)
+
+        # patch() applied ONCE around the whole threaded section (not per
+        # thread — unittest.mock.patch's enter/exit is not safe to race
+        # across threads, confirmed the hard way: an earlier per-thread-
+        # patch version of this test leaked a corrupted signed_url mock
+        # into unrelated tests later in the same run). This still
+        # exercises the real race this test is for: the cache.add() lock
+        # inside cached_signed_url() itself, called concurrently by 100
+        # real threads.
+        with patch('media_library.gcs_storage.signed_url', side_effect=slow_sign):
+            threads = [threading.Thread(target=worker) for _ in range(100)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=10)
+
+        self.assertEqual(len(results), 100)
+        self.assertTrue(all(r == 'https://signed.example/stampede.jpg' for r in results))
+        self.assertEqual(call_count['n'], 1, f'expected exactly 1 signBlob call, got {call_count["n"]}')
+
+    def test_redis_failure_falls_back_to_direct_signed_url_and_still_delivers_image(self):
+        """Every cache.get/add/set/delete failing must never break image
+        delivery — falls back to calling signed_url() directly each time,
+        exactly today's (uncached) behavior, not an error."""
+        from media_library import gcs_storage
+
+        with patch('media_library.gcs_storage.signed_url', return_value='https://signed.example/a.jpg') as mock_sign, \
+                patch('django.core.cache.cache.get', side_effect=Exception('redis down')), \
+                patch('django.core.cache.cache.add', side_effect=Exception('redis down')), \
+                patch('django.core.cache.cache.set', side_effect=Exception('redis down')), \
+                patch('django.core.cache.cache.delete', side_effect=Exception('redis down')):
+            url = gcs_storage.cached_signed_url('bucket', 'a.jpg')
+
+        self.assertEqual(url, 'https://signed.example/a.jpg')
+        mock_sign.assert_called_once()
+
+    def test_signing_failure_is_never_cached_and_propagates(self):
+        """A failed signing attempt must not be cached (so the next
+        request retries for real, not returns a broken/empty result
+        forever), and must raise the same way signed_url() itself does."""
+        from media_library import gcs_storage
+
+        with patch('media_library.gcs_storage.signed_url', side_effect=RuntimeError('IAM signBlob failed')):
+            with self.assertRaises(RuntimeError):
+                gcs_storage.cached_signed_url('bucket', 'a.jpg')
+
+        # A subsequent, successful call must actually retry signing (not
+        # return a cached failure/None).
+        with patch('media_library.gcs_storage.signed_url', return_value='https://signed.example/a.jpg') as mock_sign:
+            url = gcs_storage.cached_signed_url('bucket', 'a.jpg')
+        self.assertEqual(url, 'https://signed.example/a.jpg')
+        mock_sign.assert_called_once()
+
+    def test_cache_ttl_is_shorter_than_the_signed_url_expiration(self):
+        """Requirement: the Redis cache entry must expire well before the
+        signed URL itself does, so nothing served from cache is ever
+        near-expired."""
+        from media_library import gcs_storage
+
+        self.assertLess(gcs_storage.SIGNED_URL_CACHE_SECONDS, 3600)
+        self.assertEqual(gcs_storage.SIGNED_URL_CACHE_SECONDS, 2700)
+
+
+class MediaAssetSerializerImageUrlCachingTests(TestCase):
+    """The actual integration point Question/Option serialization goes
+    through — get_urls() must keep using cached_signed_url() for private
+    assets (behavior change under test) while public assets keep bypassing
+    signing entirely (must NOT change)."""
+
+    def setUp(self):
+        from django.core.cache import cache
+
+        cache.clear()
+
+    @override_settings(MEDIA_GCS_PRIVATE_BUCKET='private-bucket')
+    def test_private_asset_urls_are_cached_across_repeated_serialization(self):
+        asset = _make_asset(visibility='private', processing_status='ready')
+
+        with patch('media_library.gcs_storage.signed_url', return_value='https://signed.example/x') as mock_sign:
+            first = MediaAssetSerializer(asset).data['urls']
+            second = MediaAssetSerializer(asset).data['urls']
+
+        self.assertEqual(first, second)
+        # 2 variants in _make_asset()'s fixture -- signed once each across
+        # BOTH serializations, not once per serialization.
+        self.assertEqual(mock_sign.call_count, 2)
+
+    def test_public_asset_still_bypasses_signing_entirely(self):
+        asset = _make_asset(visibility='public', processing_status='ready')
+
+        with patch('media_library.gcs_storage.cached_signed_url') as mock_cached_sign, \
+                patch('media_library.gcs_storage.signed_url') as mock_sign:
+            urls = MediaAssetSerializer(asset).data['urls']
+
+        mock_cached_sign.assert_not_called()
+        mock_sign.assert_not_called()
+        self.assertTrue(all(u.startswith('https://storage.googleapis.com/') for u in urls.values()))
+
+    def test_response_shape_unchanged(self):
+        """Same keys, same value type (a plain URL string) as before —
+        the caching change must be invisible to API consumers."""
+        asset = _make_asset(visibility='private', processing_status='ready')
+
+        with patch('media_library.gcs_storage.signed_url', return_value='https://signed.example/x'):
+            urls = MediaAssetSerializer(asset).data['urls']
+
+        self.assertEqual(set(urls.keys()), {'480', '480_public'})
+        for v in urls.values():
+            self.assertIsInstance(v, str)

@@ -1,22 +1,27 @@
+import json
 import logging
-import threading
 import zipfile
 
 from courses.models import Course
-from django.db import close_old_connections, transaction
+from django.conf import settings
+from django.db import transaction
+from django.db.models import Count
 from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework import status
-from rest_framework.exceptions import Throttled, ValidationError
-from rest_framework.permissions import IsAdminUser
+from rest_framework.exceptions import ValidationError
+from rest_framework.permissions import AllowAny, IsAdminUser
 from rest_framework.response import Response
 from rest_framework.throttling import UserRateThrottle
 from rest_framework.views import APIView
 
+from hamromentor.permissions import HasFeature
 from tests_app.serializers import TestAdminSerializer
 
 from .import_dedup import existing_texts_for_subject, find_duplicate, normalize_option_set, normalize_text
-from .import_engine import create_question_from_row, question_is_referenced
+from .import_dedup_tasks import enqueue_dedup_task
+from .import_engine import create_question_from_row, question_is_referenced, run_import
+from .import_tasks import enqueue_import_task
 from .import_validation import validate_parsed_question
 from .importers import PARSERS
 from .models import Chapter, ImportBatch, ImportRow, Question, Subject, Topic
@@ -86,39 +91,8 @@ class ImportUploadView(APIView):
     permission_classes = [IsAdminUser]
     throttle_classes = [ImportUploadThrottle]
 
-    def check_throttles(self, request):
-        # Diagnostic phase 2 (upload-500 investigation): DRF calls this from
-        # initial(), before post() ever runs — a failure here was previously
-        # invisible for the same reason the finalization block was (see the
-        # observability-fix phase report). A deliberate rate-limit hit
-        # raises Throttled by design (-> 429) and must stay silent and
-        # unlogged; anything else escaping the throttle check is logged
-        # before propagating, with the response unchanged either way.
-        try:
-            super().check_throttles(request)
-        except Throttled:
-            raise
-        except Exception:
-            logger.exception(
-                'ImportUploadView: unexpected error during throttle check (ImportUploadThrottle) path=%s',
-                request.path,
-            )
-            raise
-
     def post(self, request):
-        # Diagnostic phase 2 (upload-500 investigation): request.FILES is
-        # where DRF actually parses the multipart body, on first access —
-        # a parse failure here (malformed multipart, truncated body, etc.)
-        # was previously unguarded and invisible. Logged then re-raised so
-        # the response Django produces is unchanged.
-        try:
-            file_obj = request.FILES.get('file')
-        except Exception:
-            logger.exception(
-                'ImportUploadView: unexpected error accessing uploaded file (multipart parsing) path=%s',
-                request.path,
-            )
-            raise
+        file_obj = request.FILES.get('file')
         if not file_obj:
             return Response({'detail': 'No file uploaded.'}, status=400)
 
@@ -150,23 +124,10 @@ class ImportUploadView(APIView):
             return Response({'detail': f'Unknown import_mode "{import_mode}".'}, status=400)
 
         parser = PARSERS[file_format]
-        # Diagnostic phase 2 (upload-500 investigation): batch creation is a
-        # database write with no prior exception handling at all — the same
-        # invisible-failure risk as the finalization block already fixed.
-        # Never logs the filename (may reflect uploader-chosen text) or file
-        # contents — only the detected format and byte size, both already
-        # non-secret request metadata.
-        try:
-            batch = ImportBatch.objects.create(
-                uploaded_by=request.user, file_name=file_obj.name, file_format=file_format, status='validating',
-                import_mode=import_mode,
-            )
-        except Exception:
-            logger.exception(
-                'ImportUploadView: unexpected error creating ImportBatch file_format=%s file_size_bytes=%s',
-                file_format, file_obj.size,
-            )
-            raise
+        batch = ImportBatch.objects.create(
+            uploaded_by=request.user, file_name=file_obj.name, file_format=file_format, status='validating',
+            import_mode=import_mode,
+        )
         try:
             parsed_questions = parser(file_obj) if file_format == 'json' else parser(file_obj, batch_id=batch.id)
         except ValueError as exc:
@@ -229,7 +190,14 @@ class ImportUploadView(APIView):
 
 
 def _batch_summary(batch):
-    counts = {s: batch.rows.filter(status=s).count() for s, _ in ImportRow.STATUS_CHOICES}
+    # Bulk-import taxonomy audit: was one .count() query per status (7
+    # separate round trips, every call — this fires after every taxonomy
+    # PATCH, row edit, and row delete) — one grouped aggregate query
+    # returns exactly the same {status: count} shape, including a 0 for
+    # any status with no rows, which the per-status .count() form also
+    # produced implicitly.
+    raw_counts = dict(batch.rows.values('status').annotate(n=Count('id')).values_list('status', 'n'))
+    counts = {s: raw_counts.get(s, 0) for s, _ in ImportRow.STATUS_CHOICES}
     return {
         'id': batch.id, 'file_name': batch.file_name, 'file_format': batch.file_format,
         'status': batch.status, 'total_rows': batch.total_rows,
@@ -241,15 +209,36 @@ def _batch_summary(batch):
         'subject_id': batch.subject_id, 'chapter_id': batch.chapter_id, 'topic_id': batch.topic_id,
         'course_ids': list(batch.courses.values_list('id', flat=True)),
         'started_at': batch.started_at, 'completed_at': batch.completed_at, 'created_at': batch.created_at,
+        'dedup_status': batch.dedup_status, 'dedup_generation': batch.dedup_generation,
+        'dedup_completed_at': batch.dedup_completed_at,
     }
 
 
-def _run_dedup(batch):
+_DEDUP_STALE_CHECK_EVERY = 5
+
+
+def _run_dedup(batch, is_stale=None):
     """(Re)computes duplicate flags for every non-error row against the
     batch's currently-selected Subject plus the other rows in this same
-    file. Called whenever the taxonomy selection changes — a row previously
-    flagged duplicate under one Subject choice is un-flagged if it no longer
-    matches under a different one."""
+    file. Triggered only when the taxonomy PATCH actually changes the
+    Subject (see ImportBatchTaxonomyView.patch) — a row previously flagged
+    duplicate under one Subject choice is un-flagged if it no longer
+    matches under a different one. Chapter/Topic/course changes never
+    trigger this: existing_texts_for_subject() below is Subject-scoped
+    only, so a Chapter/Topic-only change cannot alter which existing
+    questions are duplicates.
+
+    Bulk-import taxonomy audit Phase 3: runs off the request path via
+    import_dedup_tasks.run_dedup_task(), which passes `is_stale` — a
+    zero-arg callable checked every _DEDUP_STALE_CHECK_EVERY rows. If it
+    returns True (a newer Subject change has superseded this run), the
+    loop stops immediately, before writing any further row results — so a
+    slow, now-stale run can never overwrite a newer generation's results.
+    The comparison algorithm itself (find_duplicate, normalize_text,
+    SIMILARITY_THRESHOLD, the length-ratio filter) is completely
+    unaffected; only the row-iteration loop gained this guard. Any caller
+    that omits `is_stale` (there are none left after Phase 3, kept for
+    direct/test use) always runs to completion, exactly as before."""
     if not batch.subject_id:
         return
 
@@ -263,7 +252,9 @@ def _run_dedup(batch):
         for row in rows
     }
 
-    for row in rows:
+    for i, row in enumerate(rows):
+        if is_stale is not None and i % _DEDUP_STALE_CHECK_EVERY == 0 and is_stale():
+            return
         dup_id, score = find_duplicate(row.raw_data, existing, batch_texts, self_index=row.id)
         if dup_id is not None:
             row.status = 'duplicate'
@@ -296,6 +287,7 @@ class ImportBatchTaxonomyView(APIView):
             return Response({'detail': f'Batch is currently "{batch.status}" — cannot change its taxonomy.'}, status=400)
 
         data = request.data
+        previous_subject_id = batch.subject_id
         subject = chapter = topic = None
         if data.get('subject_id') is not None:
             subject = Subject.objects.filter(pk=data['subject_id']).first()
@@ -318,7 +310,30 @@ class ImportBatchTaxonomyView(APIView):
         if 'course_ids' in data:
             batch.courses.set(Course.objects.filter(id__in=data.get('course_ids') or []))
 
-        _run_dedup(batch)
+        # Bulk-import taxonomy audit: _run_dedup() is Subject-scoped only
+        # (existing_texts_for_subject(batch.subject) has no chapter/topic
+        # dependency — see its own docstring). Only a genuine Subject
+        # change (not Chapter/Topic/course-only, not re-selecting the same
+        # Subject) does anything dedup-related here — those cannot change
+        # which existing questions are duplicates, so skipping is exactly
+        # equivalent, not just faster.
+        #
+        # Phase 3: for a subject with thousands of existing questions,
+        # _run_dedup() can cost well over a minute (measured: 133.8s for
+        # 30 rows against 8,702 existing questions) — far too long to run
+        # inline on this request. A genuine Subject change now only bumps
+        # dedup_generation (the version token a stale, superseded worker
+        # checks against — see import_dedup_tasks.py) and enqueues a
+        # durable Cloud Task; the actual comparison work happens off this
+        # request entirely. The response returns immediately either way.
+        new_subject_id = subject.id if subject else None
+        if new_subject_id != previous_subject_id:
+            batch.dedup_generation += 1
+            batch.dedup_status = 'pending'
+            batch.dedup_claimed_at = None
+            batch.dedup_completed_at = None
+            batch.save(update_fields=['dedup_generation', 'dedup_status', 'dedup_claimed_at', 'dedup_completed_at'])
+            enqueue_dedup_task(batch.id, batch.dedup_generation)
 
         return Response(_batch_summary(batch))
 
@@ -404,56 +419,6 @@ class ImportRowDetailView(APIView):
         return Response(_batch_summary(batch))
 
 
-def _run_import(batch_id):
-    close_old_connections()
-    try:
-        batch = ImportBatch.objects.get(pk=batch_id)
-        batch.status = 'importing'
-        batch.started_at = timezone.now()
-        batch.save(update_fields=['status', 'started_at'])
-
-        course_list = list(batch.courses.all())
-        rows = batch.rows.exclude(status='error').order_by('row_number')
-        for row in rows.iterator():
-            try:
-                if row.status == 'duplicate' and row.dedup_action == 'skip':
-                    row.status = 'skipped'
-                    row.save(update_fields=['status'])
-                    ImportBatch.objects.filter(pk=batch_id).update(skipped_count=batch.skipped_count + 1)
-                    batch.skipped_count += 1
-                    continue
-
-                if row.status == 'duplicate' and row.dedup_action == 'replace' and row.duplicate_of_id:
-                    old = Question.objects.filter(pk=row.duplicate_of_id).first()
-                    if old and not question_is_referenced(old):
-                        old.delete()
-                    elif old:
-                        row.warnings = (row.warnings or []) + ['Could not replace — the existing question is already used in a Test.']
-
-                question = create_question_from_row(row.raw_data, batch, course_list)
-                row.created_question = question
-                row.status = 'imported'
-                if row.duplicate_of_id:
-                    batch.duplicate_count += 1
-                row.save(update_fields=['created_question', 'status', 'warnings'])
-                batch.created_count += 1
-            except Exception as exc:  # noqa: BLE001 - one bad row must never abort the whole batch
-                row.status = 'error'
-                row.errors = (row.errors or []) + [str(exc)]
-                row.save(update_fields=['status', 'errors'])
-                batch.failed_count += 1
-            batch.save(update_fields=['created_count', 'failed_count', 'skipped_count', 'duplicate_count'])
-
-        batch.status = 'completed'
-        batch.completed_at = timezone.now()
-        batch.save(update_fields=['status', 'completed_at'])
-    except Exception:
-        ImportBatch.objects.filter(pk=batch_id).update(status='failed', completed_at=timezone.now())
-        raise
-    finally:
-        close_old_connections()
-
-
 class ImportConfirmView(APIView):
     permission_classes = [IsAdminUser]
 
@@ -468,13 +433,97 @@ class ImportConfirmView(APIView):
         if not (batch.subject_id and batch.chapter_id and batch.topic_id):
             return Response({'detail': 'Please select Subject, Chapter and Topic before importing.'}, status=400)
 
+        # Bulk-import taxonomy audit Phase 3: server-side re-assertion of
+        # what the frontend's Confirm button already gates on — never trust
+        # the client alone. dedup_status must be 'completed' for the
+        # batch's CURRENT dedup_generation specifically; a pending/
+        # processing run, or a completed run for an already-superseded
+        # generation (the Subject changed again after it finished but
+        # before the admin clicked Confirm), both mean the row duplicate
+        # flags on screen are not yet verified against the current Subject.
+        if batch.subject_id and batch.dedup_status != 'completed':
+            return Response({'detail': 'Duplicate check is still in progress for the selected Subject — please wait for it to complete.'}, status=400)
+
         blocked = batch.rows.filter(status='duplicate', dedup_action='').exists()
         if blocked:
             return Response({'detail': 'Some duplicate rows still need a Skip/Replace/Keep Both decision before importing.'}, status=400)
 
-        thread = threading.Thread(target=_run_import, args=(batch.id,), daemon=True)
-        thread.start()
+        # Scalability audit (Phase 2.2): a background thread doesn't
+        # survive the request completing — a Cloud Run instance can be
+        # frozen/recycled the moment the response is sent, silently
+        # killing the thread partway through a large batch, with no retry.
+        # enqueue_import_task() runs this via a durable Cloud Tasks HTTP
+        # callback instead (or synchronously inline in local dev — see
+        # IMPORT_PROCESSING_ASYNC); run_import() itself is resumable, so a
+        # Cloud Tasks retry after a transient failure picks up exactly
+        # where a previous attempt left off instead of reprocessing rows.
+        enqueue_import_task(batch.id)
         return Response({'detail': 'Import started.', 'batch_id': batch.id})
+
+
+class ImportBatchDedupProcessingHandlerView(APIView):
+    """
+    POST /api/import-batches/dedup-process/ — internal endpoint invoked by
+    Cloud Tasks (or directly, synchronously, when DEDUP_PROCESSING_ASYNC=
+    False — see import_dedup_tasks.enqueue_dedup_task). Auth is a shared
+    secret header, matching this project's existing internal-endpoint
+    convention. Returns a non-2xx status if run_dedup_task() raises, so
+    Cloud Tasks' built-in retry kicks in on a transient failure — safe
+    because run_dedup_task() only ever claims/marks-complete via a short,
+    generation-checked atomic update, never mid-computation (see its
+    docstring for the full idempotency/staleness design).
+    """
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        from .import_dedup_tasks import run_dedup_task
+
+        provided = request.headers.get('X-Dedup-Processing-Secret')
+        if provided != settings.DEDUP_PROCESSING_SECRET:
+            return Response({'detail': 'Invalid secret.'}, status=status.HTTP_401_UNAUTHORIZED)
+
+        try:
+            body = json.loads(request.body)
+            batch_id = body['batch_id']
+            generation = body['generation']
+        except (json.JSONDecodeError, KeyError):
+            return Response({'detail': 'batch_id and generation required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            run_dedup_task(batch_id, generation)
+        except Exception as exc:  # noqa: BLE001 - deliberately surfaced as a 500 so Cloud Tasks retries
+            return Response({'detail': f'Dedup run failed: {exc}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        return Response({'ok': True})
+
+
+class ImportProcessingHandlerView(APIView):
+    """
+    POST /api/import-batches/process/ — internal endpoint invoked by Cloud
+    Tasks (or directly, synchronously, when IMPORT_PROCESSING_ASYNC=False).
+    Auth is a shared secret header, matching this project's existing
+    X-Media-Processing-Secret / X-Cron-Secret convention for other
+    internal/cron endpoints. Returns a non-2xx status if run_import()
+    raises, so Cloud Tasks' built-in retry kicks in on a transient failure
+    — safe because run_import() is resumable (see its docstring).
+    """
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        provided = request.headers.get('X-Import-Processing-Secret')
+        if provided != settings.IMPORT_PROCESSING_SECRET:
+            return Response({'detail': 'Invalid secret.'}, status=status.HTTP_401_UNAUTHORIZED)
+
+        try:
+            body = json.loads(request.body)
+            batch_id = body['batch_id']
+        except (json.JSONDecodeError, KeyError):
+            return Response({'detail': 'batch_id required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            run_import(batch_id)
+        except Exception as exc:  # noqa: BLE001 - deliberately surfaced as a 500 so Cloud Tasks retries
+            return Response({'detail': f'Import run failed: {exc}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        return Response({'ok': True})
 
 
 class RowImportError(Exception):
@@ -504,7 +553,21 @@ def _create_questions_for_test(batch):
     for row in rows:
         if row.status == 'duplicate' and row.dedup_action == 'skip':
             row.status = 'skipped'
-            row.save(update_fields=['status'])
+            # CRITICAL, per the scalability audit's duplicate-handling
+            # rule: Skip must not create a new duplicate Question Bank
+            # record, but the existing matching question must still be
+            # attached to the newly created exam — dropping the row
+            # entirely (the old behavior here) silently produced a test
+            # with fewer questions than rows instead. row.status stays
+            # 'skipped' (not 'imported') specifically so ImportRollbackView
+            # — which only ever deletes status='imported' rows — can never
+            # delete this pre-existing question; this batch didn't create
+            # it and must never be able to remove it.
+            existing = Question.objects.filter(pk=row.duplicate_of_id).first() if row.duplicate_of_id else None
+            if existing:
+                row.created_question = existing
+                question_ids.append(existing.id)
+            row.save(update_fields=['status', 'created_question'])
             skipped_count += 1
             continue
 
@@ -624,6 +687,92 @@ class ImportBatchCreateTestView(APIView):
             return Response({'detail': f'Could not create the test: {exc}'}, status=400)
 
         return Response({**_batch_summary(batch), 'test_id': test.id})
+
+
+class ImportBatchCreateQuestionsView(APIView):
+    """POST /import-batches/<id>/create-questions/ — Phase B foundation for
+    Exam Management's "Bulk Import Questions" action: creates every eligible
+    row's Question, exactly like Import & Create Test's first half, but
+    stops there. No Test is created or modified, and TestQuestion is never
+    touched — the Admin frontend is expected to merge the returned
+    `question_ids` into its own in-memory question list (the same shape
+    QuestionPicker's onInsert already produces) and let the existing
+    PATCH /tests/{id}/ (TestAdminSerializer.update()) remain the only thing
+    that ever writes TestQuestion rows, completely unchanged.
+
+    Deliberately reuses _create_questions_for_test — the exact same
+    function ImportBatchCreateTestView already calls — rather than a new
+    question-creation path: same one-transaction, all-or-nothing guarantee
+    (a row failure rolls back everything already written in this attempt,
+    same as Import & Create Test), same duplicate-handling semantics
+    (skip/replace/keep_both), same taxonomy/dedup-decision preconditions.
+    A batch already consumed by either this endpoint or Import & Create
+    Test (status no longer 'ready'/'failed') cannot be run again — the same
+    status invariant already protects both.
+
+    Gated on the granular `question_entry` feature (matching the Admin
+    frontend's own RequireStaff check for the whole Import screen) rather
+    than the plain IsAdminUser every other view in this file uses, since
+    this endpoint is reached from inside Exam Management rather than the
+    Import page itself and per Phase B's explicit permission requirement."""
+    permission_classes = [HasFeature('question_entry')]
+
+    def post(self, request, batch_id):
+        try:
+            batch = ImportBatch.objects.get(pk=batch_id)
+        except ImportBatch.DoesNotExist:
+            return Response({'detail': 'Batch not found.'}, status=404)
+
+        # Same status invariant as ImportBatchCreateTestView (see its own
+        # docstring/comment for the full reasoning): a 'ready' batch has
+        # never been run — nothing written yet — safe to proceed. A
+        # 'failed' batch can only be safely retried here if it failed
+        # *inside this same synchronous, transactional flow* — nothing
+        # partially committed either way. Any other status (already
+        # 'completed' by this endpoint or by Import & Create Test,
+        # 'rolled_back', still 'importing'/'validating' on the separate
+        # async Import-to-Question-Bank path) is refused outright — this
+        # is what stops the same batch from being imported twice.
+        if batch.status not in ('ready', 'failed'):
+            return Response({'detail': f'Batch is currently "{batch.status}" — cannot import questions.'}, status=400)
+        if not (batch.subject_id and batch.chapter_id and batch.topic_id):
+            return Response({'detail': 'Please select Subject, Chapter and Topic before importing.'}, status=400)
+        blocked = batch.rows.filter(status='duplicate', dedup_action='').exists()
+        if blocked:
+            return Response({
+                'detail': 'Some duplicate rows still need a Skip/Replace/Keep Both decision before importing.',
+            }, status=400)
+
+        try:
+            with transaction.atomic():
+                question_ids, skipped_count, duplicate_count = _create_questions_for_test(batch)
+
+                batch.status = 'completed'
+                batch.created_count = len(question_ids)
+                batch.skipped_count = skipped_count
+                batch.duplicate_count = duplicate_count
+                batch.completed_at = timezone.now()
+                batch.save(update_fields=[
+                    'status', 'created_count', 'skipped_count', 'duplicate_count', 'completed_at',
+                ])
+        except RowImportError as exc:
+            row = batch.rows.filter(row_number=exc.row_number).first()
+            if row:
+                row.status = 'error'
+                row.errors = (row.errors or []) + [exc.reason]
+                row.save(update_fields=['status', 'errors'])
+            batch.status = 'failed'
+            batch.save(update_fields=['status'])
+            return Response({
+                'detail': f'Import failed at row {exc.row_number}: {exc.reason}. No questions were created.',
+                'failed_row_number': exc.row_number,
+            }, status=400)
+        except Exception as exc:  # noqa: BLE001 - never leave the batch stuck in "ready" on an unexpected failure
+            batch.status = 'failed'
+            batch.save(update_fields=['status'])
+            return Response({'detail': f'Could not import questions: {exc}'}, status=400)
+
+        return Response({**_batch_summary(batch), 'question_ids': question_ids})
 
 
 class ImportStatusView(APIView):

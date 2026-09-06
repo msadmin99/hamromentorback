@@ -20,8 +20,17 @@ steps:
       # through the connector too.
       - --vpc-connector=hamromentor-vpc-conn
       - --vpc-egress=private-ranges-only
-      - --set-env-vars=DB_NAME=hamromentor,DB_USER=hamromentor_app,DB_HOST=/cloudsql/hamromentor-app:us-central1:hamromentor-db-uc1,DJANGO_DEBUG=False,GCP_PROJECT_ID=hamromentor-app,GCP_REGION=us-central1,MEDIA_GCS_PRIVATE_BUCKET=hamromentor-media-private,MEDIA_GCS_PUBLIC_BUCKET=hamromentor-media-public,CLOUD_TASKS_QUEUE=image-processing,BACKEND_INTERNAL_URL=https://api.drgutka.com,IMAGE_PROCESSING_ASYNC=True,REDIS_HOST=10.101.211.19,REDIS_PORT=6379
-      - --set-secrets=DB_PASSWORD=db-password:latest,DJANGO_SECRET_KEY=django-secret-key:latest,MEDIA_PROCESSING_SECRET=media-processing-secret:latest,CRON_SECRET=cron-secret:latest
+      # STATS_PROCESSING_ASYNC=True / STATS_PROCESSING_ENABLED=True are
+      # explicit here (not left to their code defaults) because the
+      # deadlock-fix audit specifically requires production to never run
+      # cross-student stats inline during live exam submission — see
+      # tests_app/stats_tasks.py's module docstring. STATS_PROCESSING_
+      # ENABLED=False is the intended rollback lever if the async worker
+      # has a problem: it disables stats processing entirely rather than
+      # falling back to the deadlock-prone synchronous per-question
+      # locking.
+      - --set-env-vars=DB_NAME=hamromentor,DB_USER=hamromentor_app,DB_HOST=/cloudsql/hamromentor-app:us-central1:hamromentor-db-uc1,DJANGO_DEBUG=False,GCP_PROJECT_ID=hamromentor-app,GCP_REGION=us-central1,MEDIA_GCS_PRIVATE_BUCKET=hamromentor-media-private,MEDIA_GCS_PUBLIC_BUCKET=hamromentor-media-public,CLOUD_TASKS_QUEUE=image-processing,BACKEND_INTERNAL_URL=https://api.drgutka.com,IMAGE_PROCESSING_ASYNC=True,REDIS_HOST=10.101.211.19,REDIS_PORT=6379,CLOUD_TASKS_IMPORT_QUEUE=bulk-import,IMPORT_PROCESSING_ASYNC=True,CLOUD_TASKS_STATS_QUEUE=question-stats,STATS_PROCESSING_ASYNC=True,STATS_PROCESSING_ENABLED=True
+      - --set-secrets=DB_PASSWORD=db-password:latest,DJANGO_SECRET_KEY=django-secret-key:latest,MEDIA_PROCESSING_SECRET=media-processing-secret:latest,CRON_SECRET=cron-secret:latest,IMPORT_PROCESSING_SECRET=import-processing-secret:latest,STATS_PROCESSING_SECRET=question-stats-secret:latest
       - --memory=1Gi
       - --cpu=1
       - --max-instances=15
