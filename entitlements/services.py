@@ -53,6 +53,7 @@ CAN_CONTINUE = 'CanContinue'
 CAN_SUBMIT = 'CanSubmit'
 CAN_REVIEW = 'CanReview'
 CAN_VIEW_SOLUTIONS = 'CanViewSolutions'
+CAN_VIEW_DETAILED_REVIEW = 'CanViewDetailedReview'
 CAN_VIEW_RANK = 'CanViewRank'
 CAN_VIEW_ANALYTICS = 'CanViewAnalytics'
 
@@ -74,6 +75,7 @@ REASON_SCHOLARSHIP_EXPIRED = 'scholarship_expired'
 REASON_ASSIGNMENT_REQUIRED = 'assignment_required'
 REASON_EXAM_NOT_OPEN = 'exam_not_open'
 REASON_EXAM_CLOSED = 'exam_closed'
+REASON_EXAM_MISSED = 'exam_missed'  # Release Candidate — Grand Test: entitled, window passed unattempted
 REASON_ATTEMPT_LIMIT_REACHED = 'attempt_limit_reached'
 REASON_RESUME_NOT_ALLOWED = 'resume_not_allowed'
 REASON_REGISTRATION_REQUIRED = 'registration_required'
@@ -81,6 +83,7 @@ REASON_PAYMENT_REQUIRED = 'payment_required'
 REASON_PASSWORD_REQUIRED = 'password_required'
 REASON_RESOURCE_UNAVAILABLE = 'resource_unavailable'
 REASON_SOLUTIONS_NOT_RELEASED = 'solutions_not_released'  # Phase 7
+REASON_REVIEW_EXPIRED = 'review_expired'  # GT3-4
 
 
 @dataclass(frozen=True)
@@ -464,17 +467,29 @@ def can_view_solutions(user, attempt):
       genuinely over. For a session-scoped attempt, that's the session's
       effective_status reaching 'completed' (tests_app.lifecycle.
       compute_effective_session_status — the exact field help_text:
-      "Automatically, once the exam window ends"). For a session-less
-      (anytime) attempt, there is no window to end — released immediately
-      once the attempt is reviewable, matching this codebase's existing,
-      validated behavior for every Test that predates this phase.
+      "Automatically, once the exam window ends"). For a Grand Test
+      scheduled via the simpler Test.scheduled_start/scheduled_end pair
+      instead (no ExamSession — GT3-2/GT3-4), the identical rule now
+      applies there too (GT3-4 fix, see below) — a session-less, non-
+      Grand-Test attempt still releases immediately once reviewable,
+      matching this codebase's existing, validated behavior for every
+      Test that predates this phase.
     - solutions_visibility='manual': released only once an admin has
       explicitly done so — Test.solutions_released_at (session-less
       attempts) or the attempt's own session's solutions_released_at
       (session-scoped attempts; deliberately independent per session, so
       releasing a Daily Test's Session #1 can never leak into a still-open
       Session #2 — see ExamSession.solutions_released_at's own comment).
-    """
+
+    GT3-4 fix: previously, a Grand Test with NO real ExamSession (the
+    Test.scheduled_start/scheduled_end fallback path GT3-2 made load-
+    bearing for MISSED/attempt-deadline enforcement) fell straight through
+    to "released immediately once reviewable" — meaning a student who
+    submitted at 10:20 on an 08:00-11:00 exam would have seen the correct
+    answer/solution instantly, directly violating Grand Test 3.0's own
+    'Absolute Solution-Release Rule'. Closed below by reusing
+    grand_test_review_window() — the identical schedule source
+    _start_attempt()/grand_test_participation_status() already enforce."""
     decision = can_review_attempt(user, attempt)
     if not decision.allowed:
         return _tag(decision, CAN_VIEW_SOLUTIONS)
@@ -489,7 +504,20 @@ def can_view_solutions(user, attempt):
     # 'auto' (or any other/legacy value — fail toward the existing,
     # validated behavior rather than a new denial for data this phase
     # didn't anticipate).
-    if attempt.session_id:
+    from django.utils import timezone
+
+    if test.exam_type == 'grand':
+        from tests_app.lifecycle import grand_test_review_window
+
+        available_at, _expires_at = grand_test_review_window(
+            test, session=attempt.session if attempt.session_id else None,
+        )
+        if available_at and timezone.now() < available_at:
+            return _tag(
+                _deny('Solutions are released automatically once the exam window ends.', REASON_SOLUTIONS_NOT_RELEASED),
+                CAN_VIEW_SOLUTIONS,
+            )
+    elif attempt.session_id:
         from tests_app.lifecycle import compute_effective_session_status
         if compute_effective_session_status(attempt.session) != 'completed':
             return _tag(
@@ -497,6 +525,42 @@ def can_view_solutions(user, attempt):
                 CAN_VIEW_SOLUTIONS,
             )
     return _tag(AccessDecision(allowed=True, source_type=SOURCE_NONE, reason='Solutions available.'), CAN_VIEW_SOLUTIONS)
+
+
+def can_view_detailed_review(user, attempt):
+    """CanViewDetailedReview — GT3-4: the per-question review list
+    (question/your-answer/marks/solution breakdown) can expire
+    independently of the attempt's own OVERVIEW (score, rank, percentile,
+    accuracy), which remains available permanently — Grand Test 3.0's own
+    explicit rule: 'Result history may remain permanently available.
+    Detailed review can expire.' Always starts from CanReview (submitted +
+    owner); for a Grand Test with a configured review_duration_days,
+    additionally denied once review_expires_at has passed. Every other
+    exam type (review_duration_days is never set outside Grand Test in
+    this phase) is completely unaffected — this always allows once
+    CanReview allows, byte-for-byte the pre-GT3-4 behavior."""
+    decision = can_review_attempt(user, attempt)
+    if not decision.allowed:
+        return _tag(decision, CAN_VIEW_DETAILED_REVIEW)
+
+    test = attempt.test
+    if test.exam_type == 'grand':
+        from django.utils import timezone
+
+        from tests_app.lifecycle import grand_test_review_window
+
+        _available_at, expires_at = grand_test_review_window(
+            test, session=attempt.session if attempt.session_id else None,
+        )
+        if expires_at and timezone.now() >= expires_at:
+            return _tag(
+                _deny('Detailed review for this Grand Test has expired.', REASON_REVIEW_EXPIRED),
+                CAN_VIEW_DETAILED_REVIEW,
+            )
+    return _tag(
+        AccessDecision(allowed=True, source_type=SOURCE_NONE, reason='Detailed review available.'),
+        CAN_VIEW_DETAILED_REVIEW,
+    )
 
 
 def can_view_rank(user, attempt):

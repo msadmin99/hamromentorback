@@ -13,6 +13,10 @@ from .serializers import SmartPracticeSessionSerializer
 from .services import bookmarked_candidates, due_review_candidates, new_question_pool
 from .source_performance import source_missed_questions, source_topic_mastery
 
+# GT3-6 — SourceScopeError/_ERROR_STATUS/_error_response above are reused
+# as-is for the Grand Test bridge's errors (GrandTestRecommendationError
+# IS-A SourceScopeError — see smart_practice/grand_test_bridge.py).
+
 MODE_LABELS = dict(SmartPracticeSession.MODE_CHOICES)
 
 _ERROR_STATUS = {
@@ -23,6 +27,11 @@ _ERROR_STATUS = {
     'no_submitted_attempt': status.HTTP_400_BAD_REQUEST,
     'feature_disabled': status.HTTP_403_FORBIDDEN,
     'session_not_in_progress': status.HTTP_400_BAD_REQUEST,
+    # GT3-6 — grand_test_bridge.GrandTestRecommendationError codes.
+    'not_a_grand_test': status.HTTP_400_BAD_REQUEST,
+    'not_entitled': status.HTTP_402_PAYMENT_REQUIRED,
+    'missed_no_performance_data': status.HTTP_403_FORBIDDEN,
+    'not_yet_appeared': status.HTTP_403_FORBIDDEN,
 }
 
 
@@ -263,3 +272,38 @@ class SessionCompleteView(APIView):
         except SourceScopeError as exc:
             return _error_response(exc)
         return Response(SmartPracticeSessionSerializer(session, context={'request': request}).data)
+
+
+class GrandTestPracticeSessionCreateView(APIView):
+    """Grand Test 3.0 / GT3-6 — POST /smart-practice/grand-test-sessions/.
+
+    The ONLY route through which a Grand Test result's 'Practice Now' CTA
+    reaches smart_practice — separate from SessionCreateView above (which
+    still only ever accepts a source_test_id and internally re-derives
+    exam_type, rejecting 'grand' exactly as before: unchanged). Delegates
+    entirely to smart_practice.grand_test_bridge.
+    create_grand_test_practice_session, which hardcodes mode=
+    'source_weak_areas' — the client cannot choose a mode here, unlike
+    the ordinary SessionCreateView, so a Grand Test can never be turned
+    into unlimited raw-content practice through a client-supplied mode."""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        from tests_app.models import Test
+
+        from .grand_test_bridge import GrandTestRecommendationError, create_grand_test_practice_session
+
+        test_id = request.data.get('test_id')
+        if not test_id:
+            return Response({'detail': 'test_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        test = get_object_or_404(Test, pk=test_id, exam_type='grand')
+
+        try:
+            session = create_grand_test_practice_session(request.user, test)
+        except GrandTestRecommendationError as exc:
+            return _error_response(exc)
+
+        return Response(
+            SmartPracticeSessionSerializer(session, context={'request': request}).data,
+            status=status.HTTP_201_CREATED,
+        )

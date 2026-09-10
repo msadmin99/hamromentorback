@@ -7,6 +7,7 @@ from .models import (
     ComboPlan,
     Coupon,
     GrandTestAccess,
+    GrandTestPackage,
     PaymentAuditLog,
     PaymentMethod,
     Purchase,
@@ -124,6 +125,46 @@ class ComboPlanSerializer(serializers.ModelSerializer):
         return value
 
 
+class GrandTestPackageSerializer(serializers.ModelSerializer):
+    """GT3-5 — student-facing (list/detail) and Admin-editable in one
+    serializer, mirroring ComboPlanSerializer's exact shape (test_details/
+    individual_value/you_save alongside the flat, admin-set `price` —
+    unlike ComboPlan's `final_price`, there is no separate 'final' value
+    here since `price` already IS the final flat bulk price, before any
+    coupon a specific purchase might apply)."""
+    test_details = serializers.SerializerMethodField()
+    individual_value = serializers.SerializerMethodField()
+    you_save = serializers.SerializerMethodField()
+
+    class Meta:
+        model = GrandTestPackage
+        fields = [
+            'id', 'name', 'tests', 'test_details', 'price', 'individual_value', 'you_save',
+            'is_active', 'order', 'created_at',
+        ]
+
+    def get_test_details(self, obj):
+        return [
+            {
+                'id': t.id, 'title': t.title, 'price': t.price,
+                'scheduled_start': t.scheduled_start, 'scheduled_end': t.scheduled_end,
+            }
+            for t in obj.tests.all()
+        ]
+
+    def get_individual_value(self, obj):
+        return obj.individual_value
+
+    def get_you_save(self, obj):
+        return obj.you_save
+
+    def validate_tests(self, value):
+        non_grand = [t for t in value if t.exam_type != 'grand']
+        if non_grand:
+            raise serializers.ValidationError('A Grand Test Package can only include Grand Tests.')
+        return value
+
+
 class SubscriptionSerializer(serializers.ModelSerializer):
     course_name = serializers.CharField(source='course.name', read_only=True)
     plan_name = serializers.CharField(source='plan.name', read_only=True)
@@ -172,7 +213,17 @@ class GrandTestAccessSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = GrandTestAccess
-        fields = ['id', 'test', 'test_title', 'password', 'granted_at', 'email_sent_at']
+        # GT3-3: `password` deliberately dropped from this list. It's no
+        # longer required to start (tests_app.views._start_attempt), so
+        # there is no remaining legitimate reason for GET /my-subscriptions/
+        # to keep returning it in plaintext — even though this was always
+        # ownership-scoped to the requesting student's own row, never
+        # another user's (not an IDOR), "never expose plaintext password
+        # unnecessarily" applies once the field stops being necessary at
+        # all. The column itself is untouched — still generated, still
+        # emailed (see billing.payment_service._send_grand_test_email,
+        # deliberately not disabled this phase — see the GT3-3 report).
+        fields = ['id', 'test', 'test_title', 'granted_at', 'email_sent_at']
 
 
 class PurchaseSerializer(serializers.ModelSerializer):
@@ -252,6 +303,7 @@ class CreatePurchaseSerializer(serializers.Serializer):
     grand_test_id = serializers.IntegerField(required=False, allow_null=True)
     teacher_course_id = serializers.IntegerField(required=False, allow_null=True)
     combo_plan_id = serializers.IntegerField(required=False, allow_null=True)
+    grand_test_package_id = serializers.IntegerField(required=False, allow_null=True)  # GT3-5
     plan_ids = serializers.ListField(child=serializers.IntegerField(), required=False)
     coupon_code = serializers.CharField(required=False, allow_blank=True)
 

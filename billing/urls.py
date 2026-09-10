@@ -8,6 +8,7 @@ from .views import (
     ComboQuoteView,
     CouponViewSet,
     ExpireStalePaymentsView,
+    GrandTestPackageViewSet,
     GrantAccessView,
     MyCouponsView,
     MySubscriptionsView,
@@ -22,6 +23,7 @@ from .views import (
 router = DefaultRouter()
 router.register('subscription-plans', SubscriptionPlanViewSet, basename='subscription-plan')
 router.register('combo-plans', ComboPlanViewSet, basename='combo-plan')
+router.register('grand-test-packages', GrandTestPackageViewSet, basename='grand-test-package')
 router.register('payment-methods', PaymentMethodViewSet, basename='payment-method')
 router.register('coupons', CouponViewSet, basename='coupon')
 router.register('purchases', PurchaseViewSet, basename='purchase')

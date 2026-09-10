@@ -31,7 +31,7 @@ from academics.models import Option, Question, Subject
 from billing.models import Subscription
 from courses.models import Course, Enrollment
 from tests_app.lifecycle import attempt_is_preview_only, attempt_preview_question_ids, freeze_attempt_questions
-from tests_app.models import AttemptQuestion, AttemptQuestionSnapshot, Test, TestAttempt, TestQuestion
+from tests_app.models import Answer, AttemptQuestion, AttemptQuestionSnapshot, Test, TestAttempt, TestQuestion
 
 User = get_user_model()
 
@@ -620,3 +620,172 @@ class AccessRegressionTests(APITestCase):
         for status_value, access in results.items():
             self.assertEqual(access, baseline, f'has_daily_test_access differs at verification_status={status_value!r}')
         self.assertTrue(baseline)
+
+
+class GT3HistoricalIntegrityTests(APITestCase):
+    """Grand Test 3.0 / GT3-1 — freezing Question.marks/negative_marks onto
+    AttemptQuestion at attempt-creation time, and fixing the accuracy
+    denominator to count only ATTEMPTED (answered) questions.
+
+    Both fixes live in the same function (tests_app.lifecycle._score_and_rank)
+    that already computes score/rank/percentile — see that function's own
+    updated docstring for the exact bug each closes. Proven here the same
+    way every other fix in this file is proven: through the real, public
+    HTTP endpoints an actual student/admin would use, not by poking
+    internal state directly."""
+
+    def setUp(self):
+        self.student = User.objects.create_user(username='gt3_stu', email='gt3_stu@example.com', password='pw')
+        self.subject = Subject.objects.create(name='GT3-1 Subject')
+        self.client.force_authenticate(user=self.student)
+
+    def _mkquestion(self, marks, negative_marks):
+        q = Question.objects.create(
+            subject=self.subject, text=f'Q marks={marks} neg={negative_marks}',
+            marks=marks, negative_marks=negative_marks,
+        )
+        Option.objects.create(question=q, text='Correct', is_correct=True, order=0)
+        Option.objects.create(question=q, text='Wrong', is_correct=False, order=1)
+        return q
+
+    def test_marks_snapshot_survives_a_later_edit_to_the_master_question(self):
+        """Acceptance Test 1 — capture marks=2 at attempt creation, edit the
+        master Question afterward, confirm the attempt still scores against
+        the value that was frozen when it started, not the new one."""
+        question = self._mkquestion(marks=2, negative_marks=0.5)
+        test = _mkexam(exam_type='grand', is_pro=False, allow=self.student, max_attempts=1, negative_marking=True)
+        TestQuestion.objects.create(test=test, question=question, order=0)
+
+        attempt_id = self.client.post(f'/api/tests/{test.id}/start/').data['id']
+        attempt_question = AttemptQuestion.objects.get(attempt_id=attempt_id, question=question)
+        self.assertEqual(attempt_question.marks_snapshot, 2)
+        self.assertEqual(attempt_question.negative_marks_snapshot, 0.5)
+
+        # Admin edits the master question's marks AFTER the attempt already started.
+        question.marks = 10
+        question.negative_marks = 5
+        question.save(update_fields=['marks', 'negative_marks'])
+
+        correct_option = Option.objects.get(question=question, is_correct=True)
+        self.client.post(f'/api/attempts/{attempt_id}/answer/', {'question_id': question.id, 'option_id': correct_option.id})
+        resp = self.client.post(f'/api/attempts/{attempt_id}/submit/')
+        self.assertEqual(resp.status_code, 200, resp.data)
+        # Scored against the FROZEN marks=2, never the edited marks=10.
+        self.assertEqual(float(resp.data['score']), 2.0)
+
+    def test_negative_marks_snapshot_survives_a_later_edit_to_the_master_question(self):
+        """Acceptance Test 2 — same as above, for an incorrect answer."""
+        question = self._mkquestion(marks=2, negative_marks=0.5)
+        test = _mkexam(exam_type='grand', is_pro=False, allow=self.student, max_attempts=1, negative_marking=True)
+        TestQuestion.objects.create(test=test, question=question, order=0)
+
+        attempt_id = self.client.post(f'/api/tests/{test.id}/start/').data['id']
+
+        question.negative_marks = 5  # admin edits AFTER the attempt started
+        question.save(update_fields=['negative_marks'])
+
+        wrong_option = Option.objects.get(question=question, is_correct=False)
+        self.client.post(f'/api/attempts/{attempt_id}/answer/', {'question_id': question.id, 'option_id': wrong_option.id})
+        resp = self.client.post(f'/api/attempts/{attempt_id}/submit/')
+        self.assertEqual(resp.status_code, 200, resp.data)
+        # -0.5 (frozen), never -5 (the edited value).
+        self.assertEqual(float(resp.data['score']), -0.5)
+
+    def test_legacy_attempt_question_row_with_null_snapshot_falls_back_to_live_marks(self):
+        """A frozen AttemptQuestion row that predates GT3-1 (marks_snapshot
+        still null, e.g. an attempt started before this migration) must
+        keep scoring exactly as it always did: live Question.marks."""
+        question = self._mkquestion(marks=3, negative_marks=1)
+        test = _mkexam(exam_type='daily', is_pro=False, allow=self.student, max_attempts=1)
+        TestQuestion.objects.create(test=test, question=question, order=0)
+
+        attempt = TestAttempt.objects.create(user=self.student, test=test, attempt_number=1)
+        AttemptQuestion.objects.create(attempt=attempt, question=question, order=0)  # no snapshot values set
+
+        correct_option = Option.objects.get(question=question, is_correct=True)
+        self.client.post(f'/api/attempts/{attempt.id}/answer/', {'question_id': question.id, 'option_id': correct_option.id})
+        resp = self.client.post(f'/api/attempts/{attempt.id}/submit/')
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertEqual(float(resp.data['score']), 3.0)  # live Question.marks, the pre-GT3-1 fallback
+
+    def test_accuracy_denominator_excludes_unanswered_questions(self):
+        """Acceptance Test 3 — 20 questions, 15 attempted (10 correct, 5
+        incorrect), 5 never touched at all. Accuracy must be 10/15*100,
+        never 10/20*100."""
+        questions = [self._mkquestion(marks=1, negative_marks=0) for _ in range(20)]
+        test = _mkexam(exam_type='grand', is_pro=False, allow=self.student, max_attempts=1, negative_marking=False)
+        for i, q in enumerate(questions):
+            TestQuestion.objects.create(test=test, question=q, order=i)
+
+        attempt_id = self.client.post(f'/api/tests/{test.id}/start/').data['id']
+        for q in questions[:10]:
+            option = Option.objects.get(question=q, is_correct=True)
+            self.client.post(f'/api/attempts/{attempt_id}/answer/', {'question_id': q.id, 'option_id': option.id})
+        for q in questions[10:15]:
+            option = Option.objects.get(question=q, is_correct=False)
+            self.client.post(f'/api/attempts/{attempt_id}/answer/', {'question_id': q.id, 'option_id': option.id})
+        # questions[15:20] are left completely untouched — no Answer row at all.
+
+        resp = self.client.post(f'/api/attempts/{attempt_id}/submit/')
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertAlmostEqual(float(resp.data['accuracy']), round(10 / 15 * 100, 2))
+        self.assertNotAlmostEqual(float(resp.data['accuracy']), round(10 / 20 * 100, 2))
+
+    def test_marked_for_review_without_answering_counts_as_unanswered_not_attempted(self):
+        """Acceptance Test 4 — a question marked for review but never
+        actually answered (MarkForReviewView creates/touches an Answer row
+        with no selected_option) must not inflate the attempted denominator."""
+        questions = [self._mkquestion(marks=1, negative_marks=0) for _ in range(4)]
+        test = _mkexam(exam_type='grand', is_pro=False, allow=self.student, max_attempts=1, negative_marking=False)
+        for i, q in enumerate(questions):
+            TestQuestion.objects.create(test=test, question=q, order=i)
+
+        attempt_id = self.client.post(f'/api/tests/{test.id}/start/').data['id']
+        # Answer 2 correctly.
+        for q in questions[:2]:
+            option = Option.objects.get(question=q, is_correct=True)
+            self.client.post(f'/api/attempts/{attempt_id}/answer/', {'question_id': q.id, 'option_id': option.id})
+        # Mark question[2] for review WITHOUT ever answering it.
+        mark_resp = self.client.post(
+            f'/api/attempts/{attempt_id}/mark-review/', {'question_id': questions[2].id, 'marked': True},
+        )
+        self.assertEqual(mark_resp.status_code, 200, mark_resp.data)
+        self.assertTrue(Answer.objects.filter(attempt_id=attempt_id, question=questions[2]).exists())
+        self.assertIsNone(
+            Answer.objects.get(attempt_id=attempt_id, question=questions[2]).selected_option_id,
+        )
+        # questions[3] is left completely untouched.
+
+        resp = self.client.post(f'/api/attempts/{attempt_id}/submit/')
+        self.assertEqual(resp.status_code, 200, resp.data)
+        # attempted = 2 (correct), never 3 or 4 — the mark-for-review-only
+        # row and the fully-untouched row must both be excluded.
+        self.assertEqual(float(resp.data['accuracy']), 100.0)
+
+    def test_historical_result_survives_a_later_edit_to_master_question_marks(self):
+        """Acceptance Test 5 — submit an attempt, then edit the master
+        Question's marks; the already-finalized attempt's score AND its
+        permanent review snapshot must both remain based on the frozen
+        attempt-time value, never the edited one."""
+        question = self._mkquestion(marks=4, negative_marks=1)
+        test = _mkexam(exam_type='grand', is_pro=False, allow=self.student, max_attempts=1, negative_marking=True)
+        TestQuestion.objects.create(test=test, question=question, order=0)
+
+        attempt_id = self.client.post(f'/api/tests/{test.id}/start/').data['id']
+        correct_option = Option.objects.get(question=question, is_correct=True)
+        self.client.post(f'/api/attempts/{attempt_id}/answer/', {'question_id': question.id, 'option_id': correct_option.id})
+        submit_resp = self.client.post(f'/api/attempts/{attempt_id}/submit/')
+        self.assertEqual(float(submit_resp.data['score']), 4.0)
+
+        # Master question is edited AFTER finalization.
+        question.marks = 99
+        question.negative_marks = 42
+        question.save(update_fields=['marks', 'negative_marks'])
+
+        result_resp = self.client.get(f'/api/attempts/{attempt_id}/result/')
+        self.assertEqual(result_resp.status_code, 200, result_resp.data)
+        self.assertEqual(float(result_resp.data['score']), 4.0)  # unaffected by the later edit
+
+        snapshot = AttemptQuestionSnapshot.objects.get(attempt_id=attempt_id, question=question)
+        self.assertEqual(snapshot.marks, 4)  # frozen at finalize time, not the edited 99
+        self.assertEqual(snapshot.negative_marks, 1)  # frozen at finalize time, not the edited 42

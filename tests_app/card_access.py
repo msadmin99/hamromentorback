@@ -39,6 +39,7 @@ from billing.access import has_daily_test_access, has_mock_test_access, has_pyq_
 from entitlements.services import (
     REASON_ATTEMPT_LIMIT_REACHED,
     REASON_EXAM_CLOSED,
+    REASON_EXAM_MISSED,
     REASON_EXAM_NOT_OPEN,
     REASON_FREE_LIMIT_REACHED,
     REASON_PURCHASE_REQUIRED,
@@ -57,6 +58,13 @@ STATE_REVIEW = 'review'          # already completed — go read the result
 STATE_START = 'start'            # entitled and open right now
 STATE_UPCOMING = 'upcoming'      # scheduled, window hasn't opened
 STATE_CLOSED = 'closed'          # window has passed, never attempted
+STATE_MISSED = 'missed'          # Release Candidate audit — Grand Test only:
+                                  # schedule closed, no attempt ever made (see
+                                  # grand_test_participation_status). Distinct
+                                  # from STATE_CLOSED (the generic, non-Grand
+                                  # session-closed case) so the frontend can
+                                  # render Grand Test 3.0's own approved
+                                  # "Missed" copy/state, never "Closed".
 STATE_ATTEMPTS_EXHAUSTED = 'attempts_exhausted'
 STATE_LOCKED = 'locked'          # needs an upgrade/purchase
 
@@ -235,6 +243,36 @@ def resolve_card_access(test, snapshot, attempts, session=None):
             if blocked['state'] == STATE_CLOSED and submitted:
                 return finish(_blank(STATE_REVIEW))
             return finish(blocked)
+
+    # Release Candidate audit fix: this function's only production call
+    # site (TestListSerializer.get_access) never passes a `session` — so
+    # for a Grand Test, the block above is unreachable dead code, and a
+    # Grand Test scheduled via the simpler Test.scheduled_start/end
+    # fallback (GT3-2 — "the more basic, standalone mechanism, not a
+    # display-only leftover") was invisible to this card contract
+    # entirely: an upcoming or already-missed Grand Test still showed
+    # 'Start Test' as clickable here (clicking it would then correctly
+    # fail server-side at _start_attempt, but the card itself lied about
+    # what was available). Reuses grand_test_participation_status — the
+    # exact same canonical function _start_attempt enforces against and
+    # GT3-6/7's own analytics read — rather than re-deriving the
+    # start/end comparison a third time. Placed at the same priority as
+    # the generic _session_block above (before entitlement), matching
+    # every other scheduled exam type's existing precedent: schedule
+    # state is shown regardless of whether the student has bought in yet.
+    if test.exam_type == 'grand' and snapshot.authenticated:
+        from .lifecycle import grand_test_participation_status
+
+        participation = grand_test_participation_status(test, snapshot.user)
+        if participation == 'upcoming':
+            return finish(_blank(STATE_UPCOMING, reason_code=REASON_EXAM_NOT_OPEN))
+        if participation == 'missed':
+            return finish(_blank(STATE_MISSED, reason_code=REASON_EXAM_MISSED))
+        # 'live' / 'not_scheduled' / 'completed' / 'in_progress' all fall
+        # through unchanged — the last two can't actually occur here
+        # (already handled above via `attempts`), and 'live'/
+        # 'not_scheduled' both mean "nothing to block on schedule
+        # grounds," exactly like _session_block's own `None` return.
 
     if submitted and attempts_left <= 0:
         return finish(_blank(STATE_REVIEW))

@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import Answer, ExamTypePolicy, Test, TestAttempt, TestQuestion
+from .models import Answer, ExamTypePolicy, GrandTestMotivationBand, Test, TestAttempt, TestQuestion
 
 
 class TestQuestionInline(admin.TabularInline):
@@ -41,3 +41,16 @@ class ExamTypePolicyAdmin(admin.ModelAdmin):
         'default_is_draft', 'default_duration_minutes', 'default_max_attempts',
         'default_negative_marking', 'default_is_pro',
     )
+
+
+@admin.register(GrandTestMotivationBand)
+class GrandTestMotivationBandAdmin(admin.ModelAdmin):
+    """Grand Test 3.0 / GT3-6 — a plain, admin-editable score-band table
+    (same pattern as ExamTypePolicyAdmin above), not a rules-engine UI per
+    the spec's own 'minimum necessary configuration' instruction. Edit a
+    row's title/message/hint or add/remove bands here; tests_app.
+    grand_test_analytics.motivation_for_score() reads this table live."""
+
+    list_display = ('title', 'min_percent', 'max_percent', 'order')
+    list_editable = ('min_percent', 'max_percent', 'order')
+    ordering = ('-min_percent',)

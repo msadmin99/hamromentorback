@@ -83,6 +83,17 @@ class Test(models.Model):
     shuffle_options = models.BooleanField(default=True)
     max_attempts = models.PositiveIntegerField(default=1)
     solutions_visibility = models.CharField(max_length=10, choices=SOLUTIONS_VISIBILITY_CHOICES, default='auto')
+    review_duration_days = models.PositiveIntegerField(
+        null=True, blank=True,
+        help_text='Grand Test 3.0 / GT3-4: how many days after the exam window closes the DETAILED per-question '
+                   'review (question/answer/solution list) stays available. Null (the default) = permanent — the '
+                   'exact, unchanged behavior every existing Test already has, since this field starts null for '
+                   'every row. The attempt/result OVERVIEW (score, rank, percentile, accuracy) never expires '
+                   'regardless of this setting — only the detailed question-by-question breakdown does. Lives here '
+                   '(not on ExamSession) to match solutions_visibility/solutions_released_at, which already live at '
+                   'this same Test level — a genuinely per-session override was not something any current Grand '
+                   'Test usage pattern required.',
+    )
 
     is_pro = models.BooleanField(default=False)
     is_new = models.BooleanField(default=False)
@@ -447,7 +458,26 @@ class AttemptQuestion(models.Model):
     freezing content this early would duplicate the Phase 8 snapshot
     mechanism for no benefit before the attempt is even finalized. Only
     WHICH questions and WHAT ORDER are frozen here — that was the one
-    thing actually unstable."""
+    thing actually unstable.
+
+    Grand Test 3.0 / GT3-1 addendum: `marks_snapshot`/`negative_marks_snapshot`
+    freeze Question.marks/negative_marks at this SAME moment (attempt
+    creation), closing a real, distinct gap the Phase 8/9 work above never
+    covered: _score_and_rank() (tests_app/lifecycle.py) used to read
+    Question.marks/negative_marks LIVE at finalize time, not at attempt-
+    start time. For a short quiz this rarely matters, but for a Grand
+    Test — a single scheduled window many students sit simultaneously,
+    some finishing in 20 minutes, others using the full 3 hours — an
+    admin editing a question's marks mid-window would score an earlier
+    finisher and a later finisher under two different point values for
+    the identical question, even though neither attempt's own history
+    was ever retroactively altered after ITS OWN finalization. Both
+    fields are nullable so this migration never has to backfill existing
+    rows: _score_and_rank() falls back to live Question.marks/
+    negative_marks whenever the snapshot is null (a pre-GT3-1 attempt, or
+    the pre-Phase-9 legacy case of zero AttemptQuestion rows at all) —
+    the exact same graceful-fallback shape already established by
+    attempt_is_preview_only()/_create_question_snapshots() above."""
     attempt = models.ForeignKey(TestAttempt, on_delete=models.CASCADE, related_name='attempt_questions')
     question = models.ForeignKey(Question, on_delete=models.SET_NULL, null=True, blank=True, related_name='+')
     order = models.PositiveIntegerField(default=0)
@@ -455,6 +485,15 @@ class AttemptQuestion(models.Model):
         default=False,
         help_text='Whether this row exists because the attempt was frozen in preview-only mode at start time. '
                    'Informational/audit only — no access decision reads this field directly.',
+    )
+    marks_snapshot = models.DecimalField(
+        max_digits=5, decimal_places=2, null=True, blank=True,
+        help_text='Question.marks at attempt-creation time. Null for a pre-GT3-1 attempt — '
+                   '_score_and_rank() then falls back to live Question.marks, exactly as it always has.',
+    )
+    negative_marks_snapshot = models.DecimalField(
+        max_digits=5, decimal_places=2, null=True, blank=True,
+        help_text='Question.negative_marks at attempt-creation time — see marks_snapshot.',
     )
 
     class Meta:
@@ -556,6 +595,40 @@ class AttemptQuestionSnapshot(models.Model):
 
     def __str__(self):
         return f'Snapshot: {self.text[:40]} (attempt #{self.attempt_id})'
+
+
+class GrandTestMotivationBand(models.Model):
+    """Grand Test 3.0 / GT3-6 — admin-configurable score-band motivational
+    copy (§16/§54 of the GT3-6 spec: 'Implement configurable score-band
+    messages... allow Admin to configure score-band motivational
+    messages, score thresholds'). Deliberately a flat, CRUD-able table
+    (mirroring ExamTypePolicy's per-row-not-singleton pattern) rather than
+    a rules-engine UI — exactly the 'do NOT build a complex rule-
+    management UI' scope this phase asks for.
+
+    `recommended_practice_hint` is short, generic GUIDANCE TEXT only
+    ("Advanced practice / difficult questions / timed Mock Test") — never
+    a specific exam name or link. The actual, concrete, real-exam
+    recommendation (verified to exist and be accessible) comes from
+    smart_practice.grand_test_bridge, a completely separate concern —
+    this band never claims to know what specific practice is available
+    for a given student, only what KIND of practice generally suits this
+    score range."""
+    min_percent = models.DecimalField(max_digits=5, decimal_places=2)
+    max_percent = models.DecimalField(max_digits=5, decimal_places=2)
+    title = models.CharField(max_length=100, help_text='e.g. "Excellent Progress"')
+    message = models.TextField()
+    recommended_practice_hint = models.CharField(
+        max_length=200, blank=True,
+        help_text='Short, generic guidance, e.g. "Weak-topic practice + timed Mock Test" — never a specific exam name.',
+    )
+    order = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ['-min_percent']
+
+    def __str__(self):
+        return f'{self.title} ({self.min_percent}-{self.max_percent}%)'
 
 
 class SavedExamView(models.Model):

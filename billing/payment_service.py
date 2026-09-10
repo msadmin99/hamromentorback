@@ -163,6 +163,50 @@ def _send_grand_test_email(access):
         access.save(update_fields=['email_sent_at'])
 
 
+def _send_grand_test_package_email(purchase, accesses):
+    """GT3-5 — one consolidated confirmation for a whole package purchase,
+    reusing the exact same send_mail pattern _send_grand_test_email above
+    already uses (no new email infrastructure, per the GT3-5 spec's own
+    'do not make a broad email-system rewrite' instruction). Deliberately
+    does NOT mention a password at all — unlike the older per-test email
+    above (left untouched, a GT3-3-disclosed, deferred cleanup item), this
+    is new code written correctly against GT3-3's actual current behavior
+    from the start: an entitled student never needs one.
+
+    Only ever called with the NEWLY-activated accesses for this purchase
+    (see _activate_product's own §22 guard) — a test the student already
+    owned is never re-announced here."""
+    user = accesses[0].user
+    lines = [
+        f'Hi {user.first_name or user.email},',
+        '',
+        'Your payment has been confirmed. Your Grand Test package is now active:',
+        '',
+    ]
+    for access in sorted(accesses, key=lambda a: a.test.scheduled_start or timezone.now()):
+        test = access.test
+        line = f'- {test.title}'
+        if test.scheduled_start and test.scheduled_end:
+            line += f' — {test.scheduled_start.strftime("%d %b %Y, %I:%M %p")} to {test.scheduled_end.strftime("%I:%M %p")}'
+        lines.append(line)
+    lines += [
+        '',
+        'No password is needed — each exam unlocks automatically once you sign in during its scheduled time.',
+        'Each exam can only be attempted during its own scheduled window and cannot be retaken once it closes.',
+        '',
+        'Good luck!',
+        'Dr. Gutka Support',
+    ]
+    send_mail(
+        f'Your Grand Test package is active — {purchase.grand_test_package.name if purchase.grand_test_package_id else "Grand Test Package"}',
+        '\n'.join(lines), settings.DEFAULT_FROM_EMAIL, [user.email], fail_silently=True,
+    )
+    now = timezone.now()
+    for access in accesses:
+        access.email_sent_at = now
+    GrandTestAccess.objects.bulk_update(accesses, ['email_sent_at'])
+
+
 def _teacher_course_duration(course):
     if course.access_duration_type == 'lifetime':
         return None
@@ -215,6 +259,48 @@ def _activate_product(purchase):
                 send_notification(purchase.user, 'renewal_confirmation', subscription)
             subscriptions.append(subscription)
         return subscriptions
+
+    if purchase.kind == 'grand_test_package':
+        # GT3-5: one commercial purchase, N independent GrandTestAccess
+        # rows — never a single "5 attempts" grant. Runs inside the SAME
+        # transaction.atomic()/select_for_update() block activate() already
+        # wraps every purchase in, so a failure partway through creating
+        # the entitlements rolls back the whole activation — no half-
+        # activated package is ever left behind (GT3-5 spec §12/§35;
+        # nothing new needed here, the existing activate() lock already
+        # provides this for every purchase kind).
+        accesses = []
+        newly_activated = []
+        for item in purchase.grand_test_package_items.select_related('test'):
+            # No `purchase` in defaults — GrandTestAccess.purchase is a
+            # OneToOneField and this same `purchase` row will be reused
+            # across every item in this loop, which that field's own
+            # uniqueness constraint cannot hold (see its own docstring).
+            # PurchaseEntitlementGrant, written below, is the real link.
+            access, created = GrandTestAccess.objects.get_or_create(user=purchase.user, test=item.test)
+            # GT3-5 §22: unlike the single grand_test branch above (which
+            # unconditionally re-stamps/re-emails even for an already-
+            # active entitlement — a harmless no-op there since it's one
+            # purchase, one test), a 5-item package makes that same
+            # unconditional refresh a real problem: buying a package that
+            # happens to include a Grand Test the student already owns
+            # individually would otherwise re-email them and write a
+            # redundant grant row for that one item. Only a genuinely NEW
+            # or previously-REVOKED access is (re)activated here; an
+            # already-valid one is left completely untouched — but the
+            # PurchaseGrandTestPackageItem row for it (created at order
+            # time, see PurchaseViewSet.create()) still exists, so order
+            # history is never lost even for the untouched item.
+            if created or access.revoked_at is not None:
+                access.granted_at = timezone.now()
+                access.revoked_at = None
+                access.save()
+                _record_grant(purchase, grand_test_access=access, was_created=created)
+                newly_activated.append(access)
+            accesses.append(access)
+        if newly_activated:
+            _send_grand_test_package_email(purchase, newly_activated)
+        return accesses
 
     if purchase.kind == 'teacher_course':
         from marketplace.models import CourseEnrollment

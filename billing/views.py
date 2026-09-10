@@ -13,6 +13,7 @@ from rest_framework.response import Response
 from rest_framework.throttling import UserRateThrottle
 from rest_framework.views import APIView
 
+from hamromentor.errors import error_response
 from hamromentor.permissions import IsAdminRoleOrAbove, IsAdminRoleOrAboveOrReadOnly
 from tests_app.models import Test
 
@@ -23,10 +24,12 @@ from .models import (
     ComboPlan,
     Coupon,
     GrandTestAccess,
+    GrandTestPackage,
     NotificationLog,
     PaymentMethod,
     Purchase,
     PurchaseComboItem,
+    PurchaseGrandTestPackageItem,
     Scholarship,
     Subscription,
     SubscriptionPlan,
@@ -40,6 +43,7 @@ from .serializers import (
     ComboPlanSerializer,
     CouponSerializer,
     CreatePurchaseSerializer,
+    GrandTestPackageSerializer,
     PaymentAuditLogSerializer,
     PaymentMethodSerializer,
     PurchaseSerializer,
@@ -61,22 +65,32 @@ class SubmitPaymentThrottle(UserRateThrottle):
         return '10/hour'
 
 
-def _resolve_amount(kind, plan, grand_test, teacher_course=None):
+def _resolve_amount(kind, plan, grand_test, teacher_course=None, grand_test_package=None):
     if kind == 'subscription':
         return plan.price, plan.product_type
     if kind == 'teacher_course':
         amount = Decimal('0') if teacher_course.is_free else teacher_course.price
         return amount, 'teacher_course'
+    if kind == 'grand_test_package':
+        # GT3-5: a flat, admin-set bulk price — never computed by summing
+        # the included tests' own prices (that sum is GrandTestPackage.
+        # individual_value, a display-only property for the "Save Rs. X"
+        # marketplace badge, never what a student actually pays).
+        # product_type='grand_test' deliberately reuses the existing
+        # Coupon.APPLIES_TO_CHOICES category rather than adding a new one
+        # — an existing "Grand Test" coupon automatically also applies to
+        # a package, with zero new coupon-admin configuration required.
+        return grand_test_package.price, 'grand_test'
     return (grand_test.price or Decimal('0')), 'grand_test'
 
 
-def _coupon_usable(coupon, user, product_type, plan, grand_test, amount):
+def _coupon_usable(coupon, user, product_type, plan, grand_test, amount, grand_test_package=None):
     """Shared eligibility checks for both a manually-typed code and an auto-apply candidate."""
     if not coupon.is_valid_now():
         return False
     if not coupon.applies_to_product(product_type):
         return False
-    if not coupon.applies_to_course(plan, grand_test):
+    if not coupon.applies_to_course(plan, grand_test, grand_test_package=grand_test_package):
         return False
     if not coupon.is_eligible_for(user):
         return False
@@ -86,12 +100,12 @@ def _coupon_usable(coupon, user, product_type, plan, grand_test, amount):
     return uses_by_user < coupon.max_uses_per_user
 
 
-def find_auto_apply_coupon(user, product_type, plan, grand_test, amount):
+def find_auto_apply_coupon(user, product_type, plan, grand_test, amount, grand_test_package=None):
     """Best-value currently-valid, eligible, auto-apply coupon for this purchase, if any —
     used when the student hasn't typed a code, so a site-wide promotion still applies."""
     best, best_discount = None, Decimal('0')
     for coupon in Coupon.objects.filter(auto_apply=True, is_active=True):
-        if not _coupon_usable(coupon, user, product_type, plan, grand_test, amount):
+        if not _coupon_usable(coupon, user, product_type, plan, grand_test, amount, grand_test_package=grand_test_package):
             continue
         discount = coupon.compute_discount(amount)
         if discount > best_discount:
@@ -99,13 +113,19 @@ def find_auto_apply_coupon(user, product_type, plan, grand_test, amount):
     return best
 
 
-def compute_price(kind, plan, grand_test, coupon_code, user, teacher_course=None):
+def compute_price(kind, plan, grand_test, coupon_code, user, teacher_course=None, grand_test_package=None):
     """Server-authoritative price computation — never trust a client-sent discount.
 
     Tries, in order: a manually-typed coupon code; the best matching auto-apply
     coupon; a one-time referral "friend" discount on a referred student's first
-    purchase. At most one of these ever applies — no stacking."""
-    amount, product_type = _resolve_amount(kind, plan, grand_test, teacher_course=teacher_course)
+    purchase. At most one of these ever applies — no stacking.
+
+    `grand_test_package` (GT3-5) is additive — every existing caller omits
+    it and is completely unaffected; only PurchaseViewSet's new
+    kind='grand_test_package' branch passes it."""
+    amount, product_type = _resolve_amount(
+        kind, plan, grand_test, teacher_course=teacher_course, grand_test_package=grand_test_package,
+    )
     coupon = None
     discount = Decimal('0')
     error = None
@@ -118,7 +138,7 @@ def compute_price(kind, plan, grand_test, coupon_code, user, teacher_course=None
             error = 'This coupon is not currently active.'
         elif not coupon.applies_to_product(product_type):
             error = 'This coupon does not apply to this product.'
-        elif not coupon.applies_to_course(plan, grand_test):
+        elif not coupon.applies_to_course(plan, grand_test, grand_test_package=grand_test_package):
             error = 'This coupon does not apply to your course.'
         elif not coupon.is_eligible_for(user):
             error = 'You are not eligible for this coupon.'
@@ -133,7 +153,7 @@ def compute_price(kind, plan, grand_test, coupon_code, user, teacher_course=None
             else:
                 discount = coupon.compute_discount(amount)
     else:
-        coupon = find_auto_apply_coupon(user, product_type, plan, grand_test, amount)
+        coupon = find_auto_apply_coupon(user, product_type, plan, grand_test, amount, grand_test_package=grand_test_package)
         if coupon:
             discount = coupon.compute_discount(amount)
         elif (
@@ -300,6 +320,34 @@ class ComboPlanViewSet(viewsets.ModelViewSet):
         if not (user.is_authenticated and user.is_staff):
             qs = qs.filter(is_active=True)
         return qs
+
+
+class GrandTestPackageViewSet(viewsets.ModelViewSet):
+    """GT3-5 — mirrors ComboPlanViewSet's exact permission/visibility
+    pattern: admin-writable, student-readable, non-staff callers only ever
+    see active packages."""
+    queryset = GrandTestPackage.objects.prefetch_related('tests').all()
+    serializer_class = GrandTestPackageSerializer
+    permission_classes = [IsAdminRoleOrAboveOrReadOnly]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = self.request.user
+        if not (user.is_authenticated and user.is_staff):
+            qs = qs.filter(is_active=True)
+        return qs
+
+    @action(detail=True, methods=['get'], permission_classes=[IsAdminRoleOrAbove])
+    def series_report(self, request, pk=None):
+        """GT3-7 §19-20 — the Grand Test series admin report for this
+        package's own tests (the existing 'GT-I through GT-VI' grouping
+        GT3-5 already built) — reuses tests_app.grand_test_admin.
+        grand_test_report() per test, never a second aggregation
+        implementation."""
+        from tests_app.grand_test_admin import grand_test_series_report
+
+        package = self.get_object()
+        return Response(grand_test_series_report(package.tests.all()))
 
 
 class PaymentMethodViewSet(viewsets.ModelViewSet):
@@ -494,6 +542,8 @@ class PurchaseViewSet(viewsets.ModelViewSet):
 
         if data['kind'] == 'combo':
             return self._create_combo(request, data)
+        if data['kind'] == 'grand_test_package':
+            return self._create_grand_test_package(request, data)
 
         plan = get_object_or_404(SubscriptionPlan, pk=data['plan_id']) if data.get('plan_id') else None
         grand_test = get_object_or_404(Test, pk=data['grand_test_id']) if data.get('grand_test_id') else None
@@ -569,6 +619,46 @@ class PurchaseViewSet(viewsets.ModelViewSet):
         ])
 
         if final_price <= 0:
+            payment_service.activate(purchase.id, request=request, allow_unpaid=True)
+            purchase.refresh_from_db()
+
+        return Response(PurchaseSerializer(purchase).data, status=status.HTTP_201_CREATED)
+
+    def _create_grand_test_package(self, request, data):
+        """GT3-5 — kind='grand_test_package'. Unlike _create_combo (which
+        never accepts a coupon_code), this DOES go through compute_price()
+        — the GT3-5 spec explicitly requires coupon compatibility for
+        packages, unlike combo's own, separate, no-coupon design decision.
+
+        PurchaseGrandTestPackageItem rows are created HERE, at order-
+        creation time — before payment is verified — mirroring
+        PurchaseComboItem's own timing exactly: an order line records what
+        was ordered regardless of whether payment later succeeds; the
+        actual GrandTestAccess fan-out only happens once
+        payment_service.activate() actually runs (see that function's own
+        kind='grand_test_package' branch)."""
+        package = get_object_or_404(GrandTestPackage, pk=data.get('grand_test_package_id'), is_active=True)
+        tests = list(package.tests.all())
+        if not tests:
+            return error_response(400, 'package_empty', 'This package currently has no Grand Tests in it.')
+
+        amount, discount, final, coupon, error = compute_price(
+            'grand_test_package', None, None, data.get('coupon_code', ''), request.user,
+            grand_test_package=package,
+        )
+        if error:
+            return error_response(400, 'pricing_error', error)
+
+        purchase = Purchase.objects.create(
+            user=request.user, kind='grand_test_package', grand_test_package=package,
+            coupon=coupon, original_amount=amount, discount_amount=discount, final_amount=final,
+            expires_at=(timezone.now() + timezone.timedelta(minutes=Purchase.EXPIRY_MINUTES)) if final > 0 else None,
+        )
+        PurchaseGrandTestPackageItem.objects.bulk_create([
+            PurchaseGrandTestPackageItem(purchase=purchase, test=t) for t in tests
+        ])
+
+        if final <= 0:
             payment_service.activate(purchase.id, request=request, allow_unpaid=True)
             purchase.refresh_from_db()
 

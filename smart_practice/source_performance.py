@@ -22,6 +22,47 @@ def source_missed_questions(ctx):
     )
 
 
+def source_subject_mastery(ctx, weak_max_pct):
+    """Grand Test 3.0 / GT3-6 — the subject-level counterpart of
+    source_topic_mastery below, same file, same pattern, same pure-
+    aggregation-no-new-models philosophy. Added here (not a new module)
+    specifically so the Grand Test recommendation bridge (smart_practice/
+    grand_test_bridge.py) has a real subject breakdown to identify a
+    'priority improvement area' from, without inventing a second
+    aggregation approach — every other source-scoped signal already lives
+    in this one file."""
+    answers = (
+        Answer.objects.filter(attempt=ctx.attempt, selected_option__isnull=False)
+        .select_related('question')
+    )
+
+    per_subject = defaultdict(lambda: {'attempted': 0, 'correct': 0})
+    subject_names = {}
+    for answer in answers:
+        q = answer.question
+        if not q.subject_id:
+            continue
+        bucket = per_subject[q.subject_id]
+        bucket['attempted'] += 1
+        if answer.is_correct:
+            bucket['correct'] += 1
+        if q.subject_id not in subject_names and q.subject:
+            subject_names[q.subject_id] = q.subject.name
+
+    result = []
+    for subject_id, agg in per_subject.items():
+        accuracy = round(agg['correct'] / agg['attempted'] * 100, 2) if agg['attempted'] else 0.0
+        result.append({
+            'subject_id': subject_id,
+            'subject_name': subject_names.get(subject_id, ''),
+            'attempted': agg['attempted'],
+            'correct': agg['correct'],
+            'accuracy': accuracy,
+            'is_weak': accuracy <= weak_max_pct,
+        })
+    return sorted(result, key=lambda r: r['accuracy'])
+
+
 def source_topic_mastery(ctx, weak_max_pct):
     """Per-topic accuracy within the source attempt only — accuracy is
     computed only over answers with a real selected_option (mirrors

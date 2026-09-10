@@ -204,6 +204,73 @@ class SessionAwareCardStateTests(Phase10Base):
         self.assertEqual(block['latest_attempt_id'], attempt.id)
 
 
+class GrandTestScheduleCardStateTests(Phase10Base):
+    """Release Candidate audit fix — a Grand Test scheduled through the
+    simpler Test.scheduled_start/scheduled_end fallback (no real
+    ExamSession) was previously invisible to resolve_card_access: the
+    card showed 'Start Test' on an upcoming or already-missed exam. The
+    fix reuses grand_test_participation_status (the same canonical
+    function _start_attempt enforces against), so card and server never
+    disagree."""
+
+    def _grand(self, start, end, entitled=True):
+        test = self._test(exam_type='grand', is_pro=True, scheduled_start=start, scheduled_end=end)
+        if entitled:
+            purchase = Purchase.objects.create(
+                user=self.student, kind='grand_test', grand_test=test,
+                original_amount=50, final_amount=50, status='approved',
+            )
+            GrandTestAccess.objects.create(user=self.student, test=test, purchase=purchase)
+        return test
+
+    def test_upcoming_grand_test_is_not_startable(self):
+        now = timezone.now()
+        test = self._grand(now + timezone.timedelta(hours=2), now + timezone.timedelta(hours=5))
+        block = _resolve(self.student, test)
+        self.assertEqual(block['state'], 'upcoming')
+        self.assertEqual(block['reason_code'], 'exam_not_open')
+        self.assertFalse(block['can_start'])
+
+    def test_missed_grand_test_reports_missed_not_start(self):
+        now = timezone.now()
+        test = self._grand(now - timezone.timedelta(hours=5), now - timezone.timedelta(hours=1))
+        block = _resolve(self.student, test)
+        self.assertEqual(block['state'], 'missed')
+        self.assertEqual(block['reason_code'], 'exam_missed')
+        self.assertFalse(block['can_start'])
+
+    def test_live_grand_test_is_startable(self):
+        now = timezone.now()
+        test = self._grand(now - timezone.timedelta(hours=1), now + timezone.timedelta(hours=2))
+        block = _resolve(self.student, test)
+        self.assertEqual(block['state'], 'start')
+        self.assertTrue(block['can_start'])
+
+    def test_missed_grand_test_with_a_completed_attempt_stays_reviewable(self):
+        now = timezone.now()
+        test = self._grand(now - timezone.timedelta(hours=5), now - timezone.timedelta(hours=1))
+        TestAttempt.objects.create(user=self.student, test=test, status='submitted', score=3, end_time=now)
+        block = _resolve(self.student, test)
+        # An existing attempt outranks a "missed" schedule verdict — the
+        # student did participate; grand_test_participation_status returns
+        # 'completed', not 'missed', so this falls through to review.
+        self.assertEqual(block['state'], 'review')
+
+    def test_unscheduled_grand_test_is_unaffected(self):
+        test = self._grand(None, None)
+        block = _resolve(self.student, test)
+        self.assertEqual(block['state'], 'start')
+
+    def test_upcoming_grand_test_without_entitlement_still_shows_schedule_first(self):
+        """Matches every other scheduled exam type's precedent
+        (_session_block runs before the entitlement branch): schedule
+        state is shown regardless of whether the student has bought in."""
+        now = timezone.now()
+        test = self._grand(now + timezone.timedelta(hours=2), now + timezone.timedelta(hours=5), entitled=False)
+        block = _resolve(self.student, test)
+        self.assertEqual(block['state'], 'upcoming')
+
+
 class CardAccessMatchesCanStartTestTests(Phase10Base):
     """The guard rail: the batched card resolver and Phase 4's canonical
     `can_start_test()` must agree on startability for every entitlement

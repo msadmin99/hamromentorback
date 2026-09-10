@@ -51,7 +51,7 @@ from django.utils import timezone
 from academics.models import QuestionBankConfig
 from academics.services import record_question_result
 
-from .models import AttemptQuestion, TestAttempt
+from .models import AttemptQuestion, Test, TestAttempt
 from .stats_tasks import enqueue_question_stats_task
 
 logger = logging.getLogger(__name__)
@@ -83,12 +83,26 @@ def effective_attempt_end(attempt):
     with no session: every Test has a duration_minutes (already the
     number the frontend countdown timer has always displayed), so every
     attempt has at least a personal deadline; a session, when one exists,
-    can only ever shorten it, never extend it."""
+    can only ever shorten it, never extend it.
+
+    GT3-2: a Grand Test scheduled via the simpler Test.scheduled_end field
+    (no real ExamSession — see grand_test_participation_status's own
+    docstring) gets the identical ceiling a session-scheduled Grand Test
+    already had, closing the 'late start extends the closing time' gap
+    for that path (a late-starting student's personal duration_minutes
+    could previously run well past the exam's own advertised end time,
+    since scheduled_start/end were display-only before this). Deliberately
+    scoped to exam_type='grand' only — a Daily/Mock/PYQ test's
+    scheduled_start/end (used only for TestListSerializer.get_status's
+    display badge) is completely unaffected; this does not newly enforce
+    anything for those exam types."""
     from datetime import timedelta
 
     personal_end = attempt.start_time + timedelta(minutes=attempt.test.duration_minutes)
     if attempt.session_id and attempt.session.end_datetime:
         return min(personal_end, attempt.session.end_datetime)
+    if attempt.test.exam_type == 'grand' and attempt.test.scheduled_end:
+        return min(personal_end, attempt.test.scheduled_end)
     return personal_end
 
 
@@ -101,6 +115,134 @@ def is_attempt_expired(attempt, now=None):
         return False
     now = now or timezone.now()
     return now >= effective_attempt_end(attempt)
+
+
+def resolve_test_schedule_session(test):
+    """Grand Test 3.0 / GT3-2 — the one, canonical way to find 'the'
+    ExamSession that governs a Test's scheduled window, reused by both
+    _start_attempt() (enforcement) and grand_test_participation_status()
+    (read-only reporting) so the two can never independently disagree
+    about which session is authoritative.
+
+    A Test can in principle have more than one ExamSession (a reschedule
+    creates a new one rather than mutating the old — see ExamSession's
+    own docstring); this picks the most recently *starting* non-cancelled
+    one. For Grand Test 3.0's actual usage pattern (one Test = one
+    scheduled Grand Test = one session) there is only ever one candidate,
+    so this ambiguity is a documented edge case, not the common path —
+    see this feature's own limitations note.
+
+    Returns None for a Test with no real schedule at all (the ordinary,
+    unscheduled Daily/Mock/PYQ/legacy-Grand-Test case) — such a Test has
+    no 'ended' concept and can therefore never be MISSED."""
+    return test.sessions.exclude(status='cancelled').order_by('-start_datetime').first()
+
+
+def grand_test_participation_status(test, user, session=None):
+    """Grand Test 3.0 / GT3-2 — the derived (never stored) answer to
+    'where does this student stand on this scheduled Grand Test right
+    now.' One of:
+
+        not_scheduled  — this Test has no real schedule at all, neither
+                         an ExamSession nor Test.scheduled_start/end (an
+                         ordinary, unscheduled Test — MISSED cannot apply;
+                         nothing here changes for it)
+        upcoming       — the schedule hasn't opened yet
+        live           — schedule is open, student has no attempt yet
+        in_progress    — student has an attempt, still 'in_progress'
+        completed      — student has an attempt, 'submitted'
+                         (auto_submitted or manual — both are equally
+                         'completed' from a participation standpoint;
+                         attempt.auto_submitted still distinguishes them)
+        missed         — schedule has closed, student never started one
+
+    TWO schedule sources, checked in this order, matching exactly what
+    _start_attempt() enforces (see that function — the two must never
+    diverge):
+      1. A real ExamSession (resolve_test_schedule_session) — the richer,
+         status-lifecycle-aware mechanism (draft/scheduled/live/completed/
+         cancelled), used when a Test has actually been run through
+         Reschedule / Exam Sessions.
+      2. Test.scheduled_start/scheduled_end directly — the simpler pair
+         of fields an admin can set on the exam builder without ever
+         touching Exam Sessions at all. Confirmed (exam_versioning.py's
+         own reschedule-seed logic) to be the more basic, standalone
+         mechanism, not merely a display-only legacy leftover — GT3-2
+         makes it load-bearing for the first time, alongside the richer
+         session path, rather than replacing it.
+
+    Deliberately entitlement-agnostic: whether the user actually HOLDS a
+    valid billing.GrandTestAccess for this Test is a separate, existing
+    question (billing.access.get_grand_test_access) — a caller combines
+    both ('not entitled' is reported independently, never folded into
+    this function's vocabulary, so the two concerns stay testable in
+    isolation exactly as GT3.0's own architecture principle requires).
+
+    No TestAttempt row is ever created, read-modified, or implied by
+    calling this — a 'missed' result is derived purely from the absence
+    of one, never represented by one."""
+    if session is None:
+        session = resolve_test_schedule_session(test)
+
+    if session is not None:
+        attempt = TestAttempt.objects.filter(test=test, session=session, user=user).only('status').first()
+        if attempt is not None:
+            return 'in_progress' if attempt.status == 'in_progress' else 'completed'
+        effective = compute_effective_session_status(session)
+        if effective in ('scheduled', 'registration_open'):
+            return 'upcoming'
+        if effective == 'live':
+            return 'live'
+        if effective == 'completed':
+            return 'missed'
+        return 'not_scheduled'  # draft (cancelled already excluded by resolve_test_schedule_session)
+
+    # No real ExamSession exists — fall back to the Test's own
+    # scheduled_start/scheduled_end (see docstring above).
+    start, end = test.scheduled_start, test.scheduled_end
+    if start is None or end is None:
+        return 'not_scheduled'
+
+    attempt = TestAttempt.objects.filter(test=test, session__isnull=True, user=user).only('status').first()
+    if attempt is not None:
+        return 'in_progress' if attempt.status == 'in_progress' else 'completed'
+
+    now = timezone.now()
+    if now < start:
+        return 'upcoming'
+    if now <= end:
+        return 'live'
+    return 'missed'
+
+
+def grand_test_review_window(test, session=None):
+    """Grand Test 3.0 / GT3-4 — (solutions_available_at, review_expires_at)
+    for one Grand Test, the single shared derivation every review/solution
+    authorization check reuses so none of them can independently disagree
+    about when a review window opens or closes (the exact discipline
+    grand_test_participation_status/effective_attempt_end already
+    established for MISSED and the attempt deadline).
+
+    solutions_available_at is exactly the moment this Test's own governing
+    schedule closes — a real ExamSession's end_datetime if one exists,
+    else Test.scheduled_end (the same two-source resolution
+    grand_test_participation_status uses). review_expires_at is that same
+    moment plus Test.review_duration_days, or None for a permanent review
+    (the field's own null default — see its help_text).
+
+    Returns (None, None) for a Test with no real schedule at all — nothing
+    has 'closed' yet, so there is no window to compute."""
+    if session is None:
+        session = resolve_test_schedule_session(test)
+
+    available_at = session.end_datetime if session is not None else test.scheduled_end
+    if available_at is None:
+        return None, None
+    if test.review_duration_days is None:
+        return available_at, None
+    from datetime import timedelta
+
+    return available_at, available_at + timedelta(days=test.review_duration_days)
 
 
 def freeze_attempt_questions(attempt):
@@ -136,7 +278,10 @@ def freeze_attempt_questions(attempt):
         qs = qs[:test.free_preview_questions]
 
     AttemptQuestion.objects.bulk_create([
-        AttemptQuestion(attempt=attempt, question=q, order=i, is_preview=preview)
+        AttemptQuestion(
+            attempt=attempt, question=q, order=i, is_preview=preview,
+            marks_snapshot=q.marks, negative_marks_snapshot=q.negative_marks,
+        )
         for i, q in enumerate(qs)
     ])
 
@@ -194,20 +339,52 @@ def _score_and_rank(attempt):
     extracted, unchanged in behavior, so a manual submit and a
     server-triggered auto-submit are byte-for-byte the same code path.
     Caller holds the row lock and the outer transaction; this only
-    mutates `attempt` in memory and returns the stat deltas to enqueue."""
+    mutates `attempt` in memory and returns the stat deltas to enqueue.
+
+    GT3-1 (Grand Test 3.0, Historical & Scoring Integrity):
+
+    1. Marks/negative-marks are read from this attempt's own frozen
+       AttemptQuestion.marks_snapshot/negative_marks_snapshot first,
+       falling back to the live Question.marks/negative_marks only when
+       the snapshot is null (a pre-GT3-1 attempt, or the pre-Phase-9
+       legacy case of zero AttemptQuestion rows) — see AttemptQuestion's
+       own docstring for why this matters specifically for a Grand Test.
+    2. `accuracy` is now correct/(correct+incorrect) — i.e. over
+       ATTEMPTED questions only. The previous `attempt.answers.count()`
+       denominator over-counted: an Answer row is created not just by
+       actually selecting an option but also by MarkForReviewView
+       (marking a question for review with no option ever chosen still
+       creates/touches an Answer row with selected_option=None) — so a
+       student who marked several questions for review without
+       answering them previously had their accuracy silently understated
+       against a denominator that included those never-answered rows.
+       Score itself was never affected (this loop already only credited
+       marks when selected_option_id was actually set) — only the
+       separately-displayed accuracy percentage was wrong."""
     score = 0.0
     correct = 0
+    incorrect = 0
     stat_deltas = []
-    answered = attempt.answers.count()
     config = QuestionBankConfig.load()
+    marks_by_qid = {
+        aq.question_id: aq for aq in attempt.attempt_questions.all() if aq.question_id is not None
+    }
     for answer in attempt.answers.select_related('question', 'selected_option'):
         q = answer.question
         if answer.selected_option_id:
+            frozen = marks_by_qid.get(q.id)
+            marks = frozen.marks_snapshot if frozen and frozen.marks_snapshot is not None else q.marks
+            negative_marks = (
+                frozen.negative_marks_snapshot if frozen and frozen.negative_marks_snapshot is not None
+                else q.negative_marks
+            )
             if answer.is_correct:
-                score += float(q.marks)
+                score += float(marks)
                 correct += 1
-            elif attempt.test.negative_marking:
-                score -= float(q.negative_marks)
+            else:
+                incorrect += 1
+                if attempt.test.negative_marking:
+                    score -= float(negative_marks)
             _, delta = record_question_result(
                 attempt.user, q, answer.is_correct, source='test',
                 selected_option=answer.selected_option, time_taken_seconds=answer.time_taken_seconds,
@@ -216,10 +393,31 @@ def _score_and_rank(attempt):
             if delta:
                 stat_deltas.append(delta)
 
+    attempted = correct + incorrect
     attempt.score = round(score, 2)
-    attempt.accuracy = round((correct / answered) * 100, 2) if answered else 0
+    attempt.accuracy = round((correct / attempted) * 100, 2) if attempted else 0
     attempt.end_time = timezone.now()
     attempt.status = 'submitted'
+
+    # GT3-7 §46 — ranking concurrency: reading ranking_pool and computing
+    # this attempt's rank used to happen with no lock beyond the caller's
+    # own TestAttempt row lock (finalize_attempt's select_for_update on
+    # THIS attempt only) — so two different students finishing at
+    # genuinely the same instant (a real scenario near a Grand Test's
+    # 11:00 deadline, GT3-7 §41 Scenario C) could each read the ranking
+    # pool before the other's row had committed as 'submitted', and each
+    # compute a rank/percentile that doesn't account for the other —
+    # e.g. two attempts with different scores could both compute
+    # ahead=0 and both land on rank=1, even though one genuinely
+    # outscored the other. Locking this Test row (already exists, one
+    # per exam, so this only ever serializes OTHER students finishing
+    # the SAME exam — never a global lock across unrelated exams)
+    # for this short aggregate-then-write section makes rank assignment
+    # for one exam strictly sequential, closing that race. Deadlock-safe:
+    # the only caller (finalize_attempt) already holds this attempt's own
+    # row lock first and never acquires a Test lock anywhere else in a
+    # different order.
+    Test.objects.select_for_update().get(pk=attempt.test_id)
 
     ranking_pool = TestAttempt.objects.filter(test=attempt.test, session=attempt.session, status='submitted')
     agg = ranking_pool.aggregate(total=Count('id'), ahead=Count('id', filter=Q(score__gt=attempt.score)))
@@ -259,6 +457,20 @@ def _create_question_snapshots(attempt):
     feature existed) fall back to the exact pre-Phase-9 behavior: the live
     TestQuestion set, ordered by TestQuestion.order — unchanged.
 
+    GT3-1 fix: marks/negative_marks recorded on this permanent snapshot
+    now come from the SAME frozen AttemptQuestion.marks_snapshot/
+    negative_marks_snapshot _score_and_rank() actually scored against
+    (falling back to live Question.marks/negative_marks only when the
+    snapshot is null) — previously this read live Question.marks
+    independently, at finalize time. For a quick quiz the two reads
+    happen close enough together that this never showed a visible
+    difference, but for a Grand Test — one scheduled window many
+    students finalize across, minutes to hours apart — an admin editing
+    a question's marks mid-window used to mean the review page's
+    displayed marks and the score actually computed for a LATER-finishing
+    student's identical attempt could disagree, even though each
+    individual attempt's own snapshot was internally self-consistent.
+
     Caller holds the row lock and the outer transaction. Runs exactly once
     per attempt by construction — finalize_attempt()'s own status re-check
     means this function is only ever reached the one time an attempt
@@ -280,12 +492,18 @@ def _create_question_snapshots(attempt):
     )
     if frozen:
         questions_in_order = [aq.question for aq in frozen if aq.question_id and aq.question is not None]
+        # GT3-1: same frozen-marks lookup _score_and_rank() uses, so this
+        # permanent review snapshot always agrees with the score that was
+        # actually computed for THIS attempt — never the live value some
+        # other, later-finalizing attempt of the same Grand Test might see.
+        marks_by_qid = {aq.question_id: aq for aq in frozen if aq.question_id is not None}
     else:
         questions_in_order = [
             tq.question for tq in
             TestQuestion.objects.filter(test=attempt.test)
             .select_related(*select_fields).prefetch_related('question__options').order_by('order')
         ]
+        marks_by_qid = {}
 
     answers_by_question = {a.question_id: a for a in attempt.answers.all()}
 
@@ -300,6 +518,12 @@ def _create_question_snapshots(attempt):
             }
             for opt in q.options.all()
         ]
+        frozen_marks = marks_by_qid.get(q.id)
+        marks = frozen_marks.marks_snapshot if frozen_marks and frozen_marks.marks_snapshot is not None else q.marks
+        negative_marks = (
+            frozen_marks.negative_marks_snapshot
+            if frozen_marks and frozen_marks.negative_marks_snapshot is not None else q.negative_marks
+        )
         snapshots.append(AttemptQuestionSnapshot(
             attempt=attempt, question=q, order=i,
             text=q.text, latex=q.latex, image_data=resolve_image_data(q.image_asset, q.image),
@@ -310,7 +534,7 @@ def _create_question_snapshots(attempt):
             reference_edition=q.reference_edition, reference_chapter=q.reference_chapter,
             reference_page=q.reference_page, reference_url=q.reference_url,
             subject_name=q.subject.name if q.subject_id else '',
-            marks=q.marks, negative_marks=q.negative_marks,
+            marks=marks, negative_marks=negative_marks,
             options_snapshot=options_snapshot,
             selected_option_original_id=answer.selected_option_id if answer else None,
         ))
@@ -363,3 +587,40 @@ def ensure_finalized_if_expired(attempt):
     if is_attempt_expired(attempt):
         return finalize_attempt(attempt, auto_submitted=True)
     return attempt
+
+
+def sweep_expired_attempts(*, dry_run=False):
+    """Release Candidate — the ONE shared body for the best-effort
+    expired-attempt sweep. Called by BOTH the `finalize_expired_attempts`
+    management command AND the `/api/cron/finalize-expired-attempts/` HTTP
+    endpoint (tests_app.views.FinalizeExpiredAttemptsView), so a Cloud
+    Scheduler HTTP trigger and a manual/CLI run are byte-for-byte the same
+    logic — never a second finalization implementation.
+
+    Still not required for correctness (every request-time path already
+    finalizes an expired attempt it touches — see this module's docstring)
+    and still fully idempotent: finalize_attempt() is a no-op on anything
+    not still 'in_progress', and each attempt is finalized under its own
+    row lock, so overlapping sweeps or a sweep racing a student's own
+    submit can never double-score. Returns a small counts dict for the
+    caller to log/return.
+
+    The cheap DB-side prefilter (status='in_progress') narrows the
+    candidate set before the exact per-row MIN(personal deadline, session
+    end) check, which needs Python."""
+    now = timezone.now()
+    candidates = (
+        TestAttempt.objects.filter(status='in_progress')
+        .select_related('test', 'session')
+        .order_by('id')
+    )
+    checked = 0
+    finalized_ids = []
+    for attempt in candidates.iterator():
+        checked += 1
+        if not is_attempt_expired(attempt, now=now):
+            continue
+        if not dry_run:
+            finalize_attempt(attempt, auto_submitted=True)
+        finalized_ids.append(attempt.id)
+    return {'checked': checked, 'finalized': len(finalized_ids), 'finalized_ids': finalized_ids, 'dry_run': dry_run}

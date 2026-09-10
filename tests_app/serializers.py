@@ -3,7 +3,7 @@ from django.utils import timezone
 from rest_framework import serializers
 
 from academics.models import Option, Question
-from academics.serializers import OptionSerializer, QuestionResultSerializer
+from academics.serializers import OptionAdminSerializer, OptionSerializer, QuestionResultSerializer
 
 from .lifecycle import effective_attempt_end
 from .models import AttemptQuestionSnapshot, Answer, ExamSession, ExamTemplate, SavedExamView, Test, TestAttempt, TestQuestion
@@ -235,12 +235,52 @@ class TestDetailSerializer(TestListSerializer):
     # `is_pro && !has_access && free_preview_questions > 0 && type !== grand`,
     # a fourth place answering a question the backend already answers.
     preview_only = serializers.SerializerMethodField()
+    # GT3-2: the derived (never stored) MISSED/UPCOMING/LIVE/etc. state —
+    # only ever meaningful for a Grand Test; null for every other exam
+    # type, so a Frontend consuming this never has to special-case
+    # "field present but meaningless." See
+    # tests_app.lifecycle.grand_test_participation_status's own docstring
+    # for exactly what each value means and where it comes from (a real
+    # ExamSession if one exists, else Test.scheduled_start/end).
+    grand_test_status = serializers.SerializerMethodField()
+    grand_test_schedule = serializers.SerializerMethodField()
 
     class Meta(TestListSerializer.Meta):
         fields = TestListSerializer.Meta.fields + [
             'shuffle_questions', 'shuffle_options', 'negative_marking', 'max_attempts',
             'free_preview_questions', 'has_access', 'requires_password', 'preview_only',
+            'grand_test_status', 'grand_test_schedule',
         ]
+
+    def get_grand_test_status(self, obj):
+        if obj.exam_type != 'grand':
+            return None
+        request = self.context.get('request')
+        user = request.user if request else None
+        if not user or not user.is_authenticated:
+            return None
+        from .lifecycle import grand_test_participation_status
+
+        return grand_test_participation_status(obj, user)
+
+    def get_grand_test_schedule(self, obj):
+        """The actually-authoritative start/end for this Grand Test's
+        schedule — a real ExamSession's own dates when one exists (which
+        may differ from Test.scheduled_start/end: that pair is only ever
+        BACKFILLED once, at first reschedule, and a session can be edited
+        independently afterward), else Test.scheduled_start/end directly.
+        Null (both keys) for an unscheduled Grand Test or any other exam
+        type — nothing here changes existing behavior for Daily/Mock/PYQ."""
+        if obj.exam_type != 'grand':
+            return None
+        from .lifecycle import resolve_test_schedule_session
+
+        session = resolve_test_schedule_session(obj)
+        if session is not None:
+            return {'start': session.start_datetime, 'end': session.end_datetime}
+        if obj.scheduled_start and obj.scheduled_end:
+            return {'start': obj.scheduled_start, 'end': obj.scheduled_end}
+        return None
 
     def get_preview_only(self, obj):
         from billing.access import is_preview_only
@@ -269,7 +309,25 @@ class TestDetailSerializer(TestListSerializer):
         return True
 
     def get_requires_password(self, obj):
-        return bool(obj.access_password) or (obj.exam_type == 'grand' and obj.is_pro)
+        """GT3-3: an already-entitled Grand Test student no longer needs a
+        password at all (see tests_app.views._start_attempt's matching
+        change) — the Frontend reads this field directly to decide
+        whether to show a password box before Start (Frontend/src/app/
+        tests/[id]/page.js), so this is the one place that decision
+        actually needs to change; the answer/start endpoints themselves
+        already stopped requiring it. A not-yet-entitled student on a
+        pro Grand Test is untouched — still True, since the free-starter
+        path's own Test.access_password gate (a separate mechanism, not
+        touched by GT3-3) may still apply to them."""
+        if obj.exam_type == 'grand' and obj.is_pro:
+            from billing.access import get_grand_test_access
+
+            request = self.context.get('request')
+            user = request.user if request else None
+            if get_grand_test_access(user, obj):
+                return False
+            return True
+        return bool(obj.access_password)
 
 
 class TestAdminSerializer(serializers.ModelSerializer):
@@ -283,6 +341,15 @@ class TestAdminSerializer(serializers.ModelSerializer):
     exam_code = serializers.CharField(source='exam_template.exam_code', read_only=True, default=None)
     # Phase 7 — read-only, written only by TestViewSet.release_solutions.
     solutions_released_by_name = serializers.SerializerMethodField()
+    # GT3-7 §7-8 — advisory only, never a write-blocking validation (per
+    # this phase's own instruction: historical attempt snapshots — see
+    # AttemptQuestion.marks_snapshot/AttemptQuestionSnapshot — are what
+    # ALREADY structurally protects a finalized attempt's score/review
+    # from a later edit here, regardless of this field). Lets the Admin
+    # UI show the exact warning GT3-7 §8 specifies before an admin changes
+    # a dangerous field on an exam that already has real attempts.
+    attempt_count = serializers.SerializerMethodField()
+    dangerous_edit_warning = serializers.SerializerMethodField()
 
     class Meta:
         model = Test
@@ -293,12 +360,26 @@ class TestAdminSerializer(serializers.ModelSerializer):
             'is_pro', 'is_new', 'price', 'access_password', 'free_preview_questions', 'academic_year', 'university',
             'scheduled_start', 'scheduled_end', 'is_draft', 'question_ids', 'questions', 'question_count', 'total_marks',
             'created_by_name', 'exam_template', 'exam_code', 'version_number',
-            'solutions_released_at', 'solutions_released_by_name',
+            'solutions_released_at', 'solutions_released_by_name', 'review_duration_days',
+            'attempt_count', 'dangerous_edit_warning',
         ]
         read_only_fields = ['exam_template', 'version_number', 'solutions_released_at']
 
     def get_solutions_released_by_name(self, obj):
         return _staff_name(obj.solutions_released_by)
+
+    def get_attempt_count(self, obj):
+        return obj.attempts.count()
+
+    def get_dangerous_edit_warning(self, obj):
+        if not obj.pk or not obj.attempts.exists():
+            return None
+        return (
+            f'This exam already has {obj.attempts.count()} student attempt(s). Changing questions, marks, '
+            'negative marks, or the schedule may affect examination integrity for students who already '
+            'attempted it — their own scored results stay based on what the exam looked like when they took '
+            'it (see the exam’s historical review), but new attempts will use whatever you save now.'
+        )
 
     def get_total_marks(self, obj):
         return float(obj.total_marks)
@@ -333,6 +414,19 @@ class TestAdminSerializer(serializers.ModelSerializer):
         for field in POLICY_CONTROLLED_FIELDS:
             if field not in validated_data:
                 validated_data[field] = defaults[field]
+        # GT3-4: a brand-new Grand Test defaults to a 30-day detailed-review
+        # window when the admin doesn't set one explicitly — the approved
+        # product default. Deliberately NOT added to POLICY_CONTROLLED_FIELDS/
+        # ExamTypePolicy (that per-category-configurable machinery is a
+        # bigger surface than "the minimum Admin setting necessary" this
+        # phase asks for); the field is still fully admin-editable per-Test
+        # via this same serializer. Applies only at creation, only for a
+        # NEW Grand Test — never retroactively touches an existing row
+        # (review_duration_days stays null/permanent for every Test that
+        # existed before this phase, exactly like every other field this
+        # create() method defaults only when the caller omits it).
+        if exam_type == 'grand' and 'review_duration_days' not in validated_data:
+            validated_data['review_duration_days'] = 30
         test = Test.objects.create(**validated_data)
         if courses:
             test.courses.set(courses)
@@ -755,6 +849,50 @@ class AttemptQuestionSnapshotResultSerializer(serializers.Serializer):
         return data
 
 
+class MissedReviewQuestionSerializer(serializers.ModelSerializer):
+    """Grand Test 3.0 / GT3-4 — the Missed-Exam Review question shape.
+
+    Deliberately a SEPARATE serializer from QuestionResultSerializer, not
+    that one called with an empty attempt_map — the GT3-4 spec's own §8
+    rule is that a missed review must NOT contain a student answer, score,
+    rank, percentile, or attempt time AT ALL, not merely show them as
+    null/false. This serializer structurally cannot leak any of those:
+    there is no selected_option_id/is_correct field defined on it in the
+    first place, so there is nothing for a future edit to accidentally
+    re-enable by, say, changing a context default. It exists specifically
+    because the two shapes (appeared vs. missed) are genuinely different,
+    not merely differently-populated — matching the GT3-4 spec's own
+    'ExamQuestionSerializer vs ReviewQuestionSerializer' guidance.
+
+    Uses OptionAdminSerializer (not the public, pre-submission
+    OptionSerializer) deliberately — a missed review's whole purpose is
+    showing the correct answer/explanation, which OptionSerializer
+    explicitly strips."""
+    options = OptionAdminSerializer(many=True, read_only=True)
+    subject_name = serializers.CharField(source='subject.name', read_only=True, default='')
+    chapter_name = serializers.CharField(source='chapter.name', read_only=True, default='')
+    topic_name = serializers.CharField(source='topic.name', read_only=True, default='')
+    image_data = serializers.SerializerMethodField()
+    explanation_image_data = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Question
+        fields = [
+            'id', 'public_id', 'text', 'image', 'image_data', 'latex',
+            'explanation', 'explanation_image', 'explanation_image_data', 'explanation_latex',
+            'explanation_video_url', 'references', 'key_takeaway', 'options',
+            'subject_name', 'chapter_name', 'topic_name',
+        ]
+
+    def get_image_data(self, obj):
+        from media_library.serializers import resolve_image_data
+        return resolve_image_data(obj.image_asset, obj.image)
+
+    def get_explanation_image_data(self, obj):
+        from media_library.serializers import resolve_image_data
+        return resolve_image_data(obj.explanation_image_asset, obj.explanation_image)
+
+
 class TestResultSerializer(serializers.ModelSerializer):
     questions = serializers.SerializerMethodField()
     test_title = serializers.CharField(source='test.title', read_only=True)
@@ -767,6 +905,25 @@ class TestResultSerializer(serializers.ModelSerializer):
     # (this is a convenience summary of the same decision).
     can_view_solutions = serializers.SerializerMethodField()
     can_view_rank = serializers.SerializerMethodField()
+    # GT3-4 — additive. review_status/solutions_available_at/
+    # review_expires_at are explicit state metadata for the Frontend
+    # (never inferred from which fields happen to be missing — see the
+    # GT3-4 spec's own "prefer explicit state metadata" instruction);
+    # score/rank/percentile/accuracy above are NEVER gated by these —
+    # the result OVERVIEW remains permanently available regardless of
+    # review_status, only the detailed `questions` breakdown responds to
+    # 'expired'. All three are null for anything that isn't a scheduled
+    # Grand Test — no behavior/shape change for Daily/Mock/PYQ.
+    review_status = serializers.SerializerMethodField()
+    solutions_available_at = serializers.SerializerMethodField()
+    review_expires_at = serializers.SerializerMethodField()
+    # GT3-6 — additive, null for every non-Grand-Test result (no shape
+    # change for Daily/Mock/PYQ). `motivation` is the score-band copy
+    # from GrandTestMotivationBand; `grand_test_recommendations` is the
+    # top-3 WHAT/WHY/HOW/FUTURE-BENEFIT list built via the smart_practice
+    # bridge — see tests_app.grand_test_analytics for both.
+    motivation = serializers.SerializerMethodField()
+    grand_test_recommendations = serializers.SerializerMethodField()
 
     class Meta:
         model = TestAttempt
@@ -774,6 +931,8 @@ class TestResultSerializer(serializers.ModelSerializer):
             'id', 'test', 'test_title', 'score', 'total_marks', 'rank',
             'percentile', 'accuracy', 'status', 'auto_submitted', 'start_time', 'end_time', 'questions',
             'session', 'session_name', 'can_view_solutions', 'can_view_rank',
+            'review_status', 'solutions_available_at', 'review_expires_at',
+            'motivation', 'grand_test_recommendations',
         ]
 
     def get_total_marks(self, obj):
@@ -790,6 +949,18 @@ class TestResultSerializer(serializers.ModelSerializer):
             self._show_solutions_cache = _can_view_solutions(request.user if request else None, obj).allowed
         return self._show_solutions_cache
 
+    def _show_detailed_review(self, obj):
+        """GT3-4 — memoized alongside _show_solutions for the same reason:
+        get_questions() and get_review_status() both need this exact
+        decision, computed once."""
+        if not hasattr(self, '_show_detailed_review_cache'):
+            from entitlements.services import can_view_detailed_review as _can_view_detailed_review
+            request = self.context.get('request')
+            self._show_detailed_review_cache = _can_view_detailed_review(
+                request.user if request else None, obj,
+            ).allowed
+        return self._show_detailed_review_cache
+
     def get_can_view_solutions(self, obj):
         return self._show_solutions(obj)
 
@@ -798,12 +969,83 @@ class TestResultSerializer(serializers.ModelSerializer):
         request = self.context.get('request')
         return _can_view_rank(request.user if request else None, obj).allowed
 
+    def _review_window(self, obj):
+        if obj.test.exam_type != 'grand':
+            return None, None
+        from .lifecycle import grand_test_review_window
+
+        return grand_test_review_window(obj.test, session=obj.session if obj.session_id else None)
+
+    def get_review_status(self, obj):
+        # Null for anything that isn't a Grand Test — no review-lifecycle
+        # concept exists for Daily/Mock/PYQ (their solutions release
+        # immediately/manually exactly as before GT3-4; there is no
+        # 'locked pending scheduled close' or 'expired' state to report).
+        if obj.test.exam_type != 'grand':
+            return None
+        # Locked can only ever precede expired (review_expires_at is
+        # always derived AFTER solutions_available_at — see
+        # grand_test_review_window) — so these two checks are mutually
+        # exclusive by construction, never overlapping.
+        if not self._show_solutions(obj):
+            return 'locked'
+        if not self._show_detailed_review(obj):
+            return 'expired'
+        return 'available'
+
+    def get_solutions_available_at(self, obj):
+        available_at, _ = self._review_window(obj)
+        return available_at
+
+    def get_review_expires_at(self, obj):
+        _, expires_at = self._review_window(obj)
+        return expires_at
+
+    def get_motivation(self, obj):
+        # GT3-6 — appeared-Grand-Test-only. Not gated by review_status:
+        # the score-band message is part of the permanent result
+        # OVERVIEW (same permanence rule as score/rank/percentile/
+        # accuracy), never expires alongside the detailed review.
+        if obj.test.exam_type != 'grand' or obj.status != 'submitted':
+            return None
+        if not obj.test.total_marks:
+            return None
+        from .grand_test_analytics import motivation_for_score
+
+        score_pct = float(obj.score) / float(obj.test.total_marks) * 100
+        return motivation_for_score(score_pct)
+
+    def get_grand_test_recommendations(self, obj):
+        # GT3-6 — same scope as get_motivation above. Computed fresh per
+        # request (a single attempt's question count is small — see
+        # smart_practice/source_performance.py's own stated reasoning for
+        # not persisting these aggregates).
+        if obj.test.exam_type != 'grand' or obj.status != 'submitted':
+            return []
+        request = self.context.get('request')
+        user = request.user if request else None
+        if not user:
+            return []
+        from .grand_test_analytics import appeared_student_recommendations
+
+        return appeared_student_recommendations(user, obj)
+
     def get_questions(self, obj):
         # Phase 7: whether solution content (is_correct/explanation/
         # correct-option/aggregate stats) is included in each question
         # below — see entitlements.services.can_view_solutions and
         # QuestionResultSerializer's own docstring.
         show_solutions = self._show_solutions(obj)
+
+        # GT3-4: the detailed per-question list itself can expire
+        # independently of the overview above it — returns an empty list
+        # (not an error; the attempt/score/rank fields on this same
+        # response stay fully populated) once review_expires_at has
+        # passed. Every non-Grand-Test call site is unaffected
+        # (_show_detailed_review always True for them, §_show_detailed_
+        # review's own docstring).
+        if not self._show_detailed_review(obj):
+            return []
 
         filter_type = self.context.get('filter', 'all')
         if not show_solutions:

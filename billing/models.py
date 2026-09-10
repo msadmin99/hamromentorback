@@ -1,6 +1,7 @@
 import random
 import string
 from datetime import timedelta
+from decimal import Decimal
 
 from django.conf import settings
 from django.db import models
@@ -103,6 +104,58 @@ class ComboPlan(models.Model):
 
     def __str__(self):
         return f'{self.course.name} — {self.name}'
+
+
+class GrandTestPackage(models.Model):
+    """Grand Test 3.0 / GT3-5 — an admin-curated bundle of specific,
+    individual Grand Test rows sold as ONE flat-priced commercial product
+    (the approved "5 Grand Tests for Rs. 100" default).
+
+    Deliberately NOT ComboPlan, which was already established (GT3.0 Gap
+    Analysis, re-confirmed by direct inspection this phase) as structurally
+    unsuitable: ComboPlan bundles SubscriptionPlan rows and always computes
+    its price live from a discount_percent off the summed plan prices —
+    this product bundles specific tests.Test rows (exam_type='grand') at a
+    price the admin sets directly, never computed. Price is a plain field
+    here, not a property, for exactly that reason — it must not silently
+    change if an included Test's own `price` field is edited later (that
+    field is display-only for a package's own bundled tests; the actual
+    entitlement this package grants has no per-test cost once bought).
+
+    `tests` is the CURRENT/editable composition — an admin can change it at
+    any time (§23 of the GT3-5 spec explicitly allows this). What a
+    specific purchase actually included is frozen separately, onto
+    PurchaseGrandTestPackageItem rows created at purchase time — so editing
+    this M2M later never alters what an already-purchasing student is
+    entitled to."""
+    name = models.CharField(max_length=150, help_text='e.g. "Grand Test 5-Pack"')
+    tests = models.ManyToManyField(
+        'tests_app.Test', related_name='grand_test_packages',
+        help_text="The exact Grand Tests currently included (exam_type='grand'). Editable — see this model's own "
+                   'docstring for why an edit here never retroactively changes an already-purchased entitlement.',
+    )
+    price = models.DecimalField(max_digits=9, decimal_places=2, help_text='Flat bulk price, e.g. Rs. 100 for a 5-pack.')
+    is_active = models.BooleanField(default=True)
+    order = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['order', '-created_at']
+
+    def __str__(self):
+        return self.name
+
+    @property
+    def individual_value(self):
+        """Sum of the currently-included tests' own `price` — purely
+        informational (drives the "Save Rs. X" marketplace display), never
+        used to compute what a student actually pays (that's always the
+        flat `price` field above, minus any coupon)."""
+        return sum((t.price or Decimal('0')) for t in self.tests.all())
+
+    @property
+    def you_save(self):
+        return max(self.individual_value - self.price, Decimal('0'))
 
 
 class Subscription(models.Model):
@@ -219,11 +272,16 @@ class Coupon(models.Model):
     def applies_to_product(self, product_type):
         return self.applies_to == 'all' or self.applies_to == product_type
 
-    def applies_to_course(self, plan, grand_test):
+    def applies_to_course(self, plan, grand_test, grand_test_package=None):
         """Blank courses = applies everywhere. Otherwise must include the
         subscription plan's course, or (for Grand Test) overlap with the
         test's mapped courses — an unscoped Grand Test (Test.courses blank =
-        visible to everyone) matches any coupon."""
+        visible to everyone) matches any coupon.
+
+        GT3-5: `grand_test_package` unions the mapped courses across every
+        currently-included test (the same "unscoped matches any coupon"
+        leniency, generalized to a bundle instead of one test) — additive,
+        every existing caller omits it."""
         coupon_course_ids = set(self.courses.values_list('id', flat=True))
         if not coupon_course_ids:
             return True
@@ -231,6 +289,11 @@ class Coupon(models.Model):
             return plan.course_id in coupon_course_ids
         if grand_test is not None:
             test_course_ids = set(grand_test.courses.values_list('id', flat=True))
+            return not test_course_ids or bool(test_course_ids & coupon_course_ids)
+        if grand_test_package is not None:
+            test_course_ids = set()
+            for test in grand_test_package.tests.all():
+                test_course_ids |= set(test.courses.values_list('id', flat=True))
             return not test_course_ids or bool(test_course_ids & coupon_course_ids)
         return True
 
@@ -310,6 +373,7 @@ class Purchase(models.Model):
         ('grand_test', 'Grand Test'),
         ('teacher_course', 'Teacher Course'),
         ('combo', 'Combo Plan'),
+        ('grand_test_package', 'Grand Test Package'),  # GT3-5
     ]
     STATUS_CHOICES = [
         ('unpaid', 'Unpaid'),  # = "Awaiting Payment": order created, no proof submitted yet
@@ -335,7 +399,7 @@ class Purchase(models.Model):
     OPEN_STATUSES = ('unpaid', 'pending', 'resubmission_requested', 'approved')
 
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='purchases')
-    kind = models.CharField(max_length=15, choices=KIND_CHOICES)
+    kind = models.CharField(max_length=20, choices=KIND_CHOICES)  # GT3-5: widened from 15 for 'grand_test_package'
     plan = models.ForeignKey(SubscriptionPlan, on_delete=models.SET_NULL, null=True, blank=True, related_name='purchases')
     grand_test = models.ForeignKey(
         'tests_app.Test', on_delete=models.SET_NULL, null=True, blank=True, related_name='purchases',
@@ -347,6 +411,13 @@ class Purchase(models.Model):
         ComboPlan, on_delete=models.SET_NULL, null=True, blank=True, related_name='purchases',
         help_text='Set for a predefined-bundle purchase, null for a custom "build your own" combo — '
                    'either way the actual items are PurchaseComboItem rows, not this field.',
+    )
+    grand_test_package = models.ForeignKey(
+        GrandTestPackage, on_delete=models.SET_NULL, null=True, blank=True, related_name='purchases',
+        help_text='GT3-5: which predefined package this purchase bought (for billing-history display, e.g. '
+                   '"Grand Test 5-Pack — Rs. 100") — mirrors combo_plan above exactly. The actual entitled Grand '
+                   'Tests are PurchaseGrandTestPackageItem rows, not this field, for the same reason combo_plan '
+                   'is not where PurchaseComboItem content lives.',
     )
     coupon = models.ForeignKey(Coupon, on_delete=models.SET_NULL, null=True, blank=True, related_name='purchases')
     currency = models.CharField(max_length=3, default='NRS', help_text='NRS only — this platform does not support other currencies.')
@@ -435,6 +506,24 @@ class PurchaseComboItem(models.Model):
 
     def __str__(self):
         return f'{self.purchase_id}: {self.plan.name} (Rs.{self.price})'
+
+
+class PurchaseGrandTestPackageItem(models.Model):
+    """GT3-5 — one Grand Test within a package Purchase
+    (kind='grand_test_package'). Created at purchase-CREATION time (mirrors
+    PurchaseComboItem's own timing exactly — an order line recording what
+    was bought, independent of whether payment later succeeds), frozen
+    from GrandTestPackage.tests at that moment — the whole point being
+    that GrandTestPackage.tests can change later (GT3-5 spec §23) without
+    ever altering what an already-placed order actually included."""
+    purchase = models.ForeignKey(Purchase, on_delete=models.CASCADE, related_name='grand_test_package_items')
+    test = models.ForeignKey('tests_app.Test', on_delete=models.CASCADE, related_name='package_purchase_items')
+
+    class Meta:
+        unique_together = ('purchase', 'test')
+
+    def __str__(self):
+        return f'{self.purchase_id}: {self.test.title}'
 
 
 class PurchaseEntitlementGrant(models.Model):
@@ -570,7 +659,23 @@ class NotificationLog(models.Model):
 
 class GrandTestAccess(models.Model):
     """One student's unique password + access grant for a paid Grand Test."""
-    purchase = models.OneToOneField(Purchase, on_delete=models.CASCADE, related_name='grand_test_access')
+    # GT3-5: widened to null=True. A OneToOneField structurally cannot hold
+    # more than one GrandTestAccess row per Purchase — fine for a single
+    # kind='grand_test' purchase (the original, still-unchanged use), but
+    # a kind='grand_test_package' purchase produces SEVERAL GrandTestAccess
+    # rows from the SAME Purchase, which this field's own unique
+    # constraint would reject outright. Package-created/reactivated access
+    # leaves this null and relies entirely on PurchaseEntitlementGrant
+    # (already designed, by its own docstring, as "the explicit,
+    # reversible link between one Purchase and each access record it
+    # actually granted... one purchase can produce several rows") as the
+    # authoritative source-of-truth link instead — see billing.
+    # payment_service._activate_product's kind='grand_test_package'
+    # branch. The single-purchase path is completely unchanged: it still
+    # always sets this field, exactly as before.
+    purchase = models.OneToOneField(
+        Purchase, on_delete=models.CASCADE, related_name='grand_test_access', null=True, blank=True,
+    )
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='grand_test_accesses')
     test = models.ForeignKey('tests_app.Test', on_delete=models.CASCADE, related_name='student_accesses')
     password = models.CharField(max_length=20, unique=True, blank=True)

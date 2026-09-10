@@ -1,8 +1,6 @@
 from django.core.management.base import BaseCommand
-from django.utils import timezone
 
-from tests_app.lifecycle import finalize_attempt, is_attempt_expired
-from tests_app.models import TestAttempt
+from tests_app.lifecycle import sweep_expired_attempts
 
 
 class Command(BaseCommand):
@@ -42,33 +40,14 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
         dry_run = options['dry_run']
-        now = timezone.now()
-
-        # A cheap, DB-side prefilter: no in_progress attempt can possibly be
-        # expired before its own personal duration has elapsed, so this
-        # narrows the candidate set before the exact per-row MIN(personal,
-        # session) check (which needs Python, since it compares two
-        # different possible ceilings) — avoids scanning attempts that
-        # started minutes ago on a codebase that could have thousands of
-        # concurrently in_progress attempts.
-        candidates = (
-            TestAttempt.objects.filter(status='in_progress')
-            .select_related('test', 'session')
-            .order_by('id')
-        )
-
-        finalized = 0
-        checked = 0
-        for attempt in candidates.iterator():
-            checked += 1
-            if not is_attempt_expired(attempt, now=now):
-                continue
-            finalized += 1
-            if dry_run:
-                self.stdout.write(f'Would finalize attempt #{attempt.id} (user={attempt.user_id}, test={attempt.test_id})')
-                continue
-            finalize_attempt(attempt, auto_submitted=True)
-            self.stdout.write(f'Finalized attempt #{attempt.id} (user={attempt.user_id}, test={attempt.test_id})')
-
+        # Release Candidate — the sweep body now lives in
+        # tests_app.lifecycle.sweep_expired_attempts, shared with the
+        # /api/cron/finalize-expired-attempts/ HTTP endpoint so a Cloud
+        # Scheduler trigger and this CLI run are the exact same code path.
+        result = sweep_expired_attempts(dry_run=dry_run)
         verb = 'Would finalize' if dry_run else 'Finalized'
-        self.stdout.write(self.style.SUCCESS(f'{verb} {finalized} expired attempt(s) out of {checked} in_progress attempt(s) checked.'))
+        for attempt_id in result['finalized_ids']:
+            self.stdout.write(f'{verb} attempt #{attempt_id}')
+        self.stdout.write(self.style.SUCCESS(
+            f"{verb} {result['finalized']} expired attempt(s) out of {result['checked']} in_progress attempt(s) checked."
+        ))
