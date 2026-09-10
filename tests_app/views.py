@@ -23,10 +23,16 @@ from billing.access import (
 )
 from entitlements.provisioning import ensure_and_consume_free_starter, has_free_starter_available
 from entitlements.services import can_review_attempt
+from hamromentor.errors import error_response
 from hamromentor.permissions import HasFeature, IsStaffOrReadOnly
 
 from . import performance
 from .access import can_access_test, visible_test_queryset
+from .grand_test_admin import (
+    grand_test_monitor as _grand_test_monitor_data,
+    grand_test_participants as _grand_test_participants_data,
+    grand_test_report as _grand_test_report_data,
+)
 from .exam_versioning import RescheduleError, clone_test_as_new_version, create_reschedule_session
 from .lifecycle import (
     attempt_is_preview_only,
@@ -35,9 +41,12 @@ from .lifecycle import (
     ensure_finalized_if_expired,
     finalize_attempt,
     freeze_attempt_questions,
+    grand_test_participation_status,
+    grand_test_review_window,
     is_attempt_expired,
+    resolve_test_schedule_session,
 )
-from .models import Answer, ExamSession, ExamTemplate, SavedExamView, Test, TestAttempt
+from .models import Answer, ExamSession, ExamTemplate, SavedExamView, Test, TestAttempt, TestQuestion
 from .policy import get_all_exam_type_defaults
 from .preview import resolve_preview_user
 from .stats_tasks import process_question_stats
@@ -46,6 +55,7 @@ logger = logging.getLogger(__name__)
 from .serializers import (
     ExamSessionSerializer,
     ExamTemplateSerializer,
+    MissedReviewQuestionSerializer,
     RescheduleSerializer,
     SavedExamViewSerializer,
     SessionAttemptSerializer,
@@ -130,10 +140,27 @@ def _free_starter_eligibility(user, has_prior_attempt, resource_type):
 
 
 def _start_attempt(request, test, session=None):
-    """Shared by TestViewSet.start (legacy route, session=None — behavior is
-    byte-for-byte what it was before Exam Sessions existed) and
-    ExamSessionViewSet.start (new route — additionally enforces the
-    session's time window/status/access)."""
+    """Shared by TestViewSet.start (legacy route — behavior is byte-for-byte
+    what it was before Exam Sessions existed, FOR A TEST THAT HAS NEVER
+    BEEN SCHEDULED) and ExamSessionViewSet.start (explicitly enforces the
+    session's time window/status/access).
+
+    GT3-2 fix: if the caller didn't pass a session but this Test has one
+    anyway (scheduled via TestViewSet.reschedule / exam_versioning), it is
+    auto-resolved here rather than silently skipped — closing a real
+    bypass where a student could call the legacy /tests/{id}/start/ route
+    directly to start (or, more importantly for Grand Test 3.0, to appear
+    to have 'attempted') an exam whose real, scheduled window had already
+    closed, entirely ignoring that window's own start/end/status checks
+    below (which only ever ran `if session:`). This is what makes MISSED
+    (tests_app.lifecycle.grand_test_participation_status) impossible to
+    dodge merely by choosing a different URL — the server, not the route
+    the client happened to call, decides. A genuinely unscheduled Test
+    (test.sessions is empty) is completely unaffected — resolve_test_
+    schedule_session() returns None for it, exactly as before."""
+    if session is None:
+        session = resolve_test_schedule_session(test)
+
     serializer = StartTestSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
     submitted_password = serializer.validated_data.get('access_password')
@@ -157,16 +184,59 @@ def _start_attempt(request, test, session=None):
     if session:
         session.refresh_status()
         if session.status == 'cancelled':
-            return Response({'detail': 'This session has been cancelled.'}, status=status.HTTP_403_FORBIDDEN)
+            return error_response(status.HTTP_403_FORBIDDEN, 'session_cancelled', 'This session has been cancelled.')
         if session.status == 'draft':
-            return Response({'detail': 'This session is not yet open.'}, status=status.HTTP_403_FORBIDDEN)
+            return error_response(status.HTTP_403_FORBIDDEN, 'session_not_open', 'This session is not yet open.')
         now = timezone.now()
         if now < session.start_datetime:
-            return Response({'detail': 'This session has not started yet.'}, status=status.HTTP_403_FORBIDDEN)
+            return error_response(
+                status.HTTP_403_FORBIDDEN, 'session_not_started', 'This session has not started yet.',
+            )
         if now > session.end_datetime:
-            return Response({'detail': 'This session has ended.'}, status=status.HTTP_403_FORBIDDEN)
+            # GT3-2: a Grand Test student who never started at all gets the
+            # specific, approved MISSED message/code rather than the
+            # generic 'session_ended' — distinct wording, distinct `code`,
+            # so the Frontend can render the dedicated missed-state screen
+            # (§12/§32 of the GT3-2 spec) instead of a plain error toast.
+            # Every other exam type, and a Grand Test where an attempt
+            # already exists (an unusual client action — see this
+            # function's own resume-handling below, unreachable from here
+            # since this check runs first), keep the existing generic
+            # message unchanged.
+            if test.exam_type == 'grand' and not test.attempts.filter(user=request.user, session=session).exists():
+                return error_response(
+                    status.HTTP_403_FORBIDDEN, 'grand_test_missed',
+                    'Sorry, you missed this Grand Test during the scheduled examination time. '
+                    'The examination cannot be attempted after the official closing time.',
+                )
+            return error_response(status.HTTP_403_FORBIDDEN, 'session_ended', 'This session has ended.')
         if session.access_type == 'private' and submitted_password != session.password:
-            return Response({'detail': 'Incorrect session password.'}, status=status.HTTP_403_FORBIDDEN)
+            return error_response(
+                status.HTTP_403_FORBIDDEN, 'invalid_session_password', 'Incorrect session password.',
+            )
+    elif test.exam_type == 'grand' and test.scheduled_start and test.scheduled_end:
+        # GT3-2: no real ExamSession exists for this Grand Test, but it
+        # does have the simpler Test.scheduled_start/scheduled_end pair
+        # (set directly on the exam builder, without using Reschedule/Exam
+        # Sessions) — this is the more basic, likely more commonly used
+        # scheduling mechanism, and until now it was purely a display
+        # field (TestListSerializer.get_status's 'upcoming'/'ended'/'live'
+        # badge) with NO actual enforcement here. That gap is exactly what
+        # let a determined student start a "closed" Grand Test at any
+        # time, defeating the entire "one official scheduled window"
+        # premise. See grand_test_participation_status() — this mirrors
+        # it exactly so enforcement and reporting can never disagree.
+        now = timezone.now()
+        if now < test.scheduled_start:
+            return error_response(
+                status.HTTP_403_FORBIDDEN, 'grand_test_not_started', 'This Grand Test has not started yet.',
+            )
+        if now > test.scheduled_end and not test.attempts.filter(user=request.user, session__isnull=True).exists():
+            return error_response(
+                status.HTTP_403_FORBIDDEN, 'grand_test_missed',
+                'Sorry, you missed this Grand Test during the scheduled examination time. '
+                'The examination cannot be attempted after the official closing time.',
+            )
 
     # Phase 3 Free Starter: which resource_type (if any) this attempt is
     # being granted through free-starter fallback — checked (never
@@ -187,34 +257,44 @@ def _start_attempt(request, test, session=None):
         if not access:
             eligible, should_consume = _free_starter_eligibility(request.user, has_prior_attempt, 'grand_test')
             if not eligible:
-                return Response(
-                    {
-                        'detail': 'This Grand Test requires purchase.', 'code': 'purchase_required',
-                        'access_denied': _free_starter_denied_payload(),
-                    },
-                    status=status.HTTP_402_PAYMENT_REQUIRED,
+                return error_response(
+                    status.HTTP_402_PAYMENT_REQUIRED, 'purchase_required', 'This Grand Test requires purchase.',
+                    access_denied=_free_starter_denied_payload(),
                 )
             # Free-starter-eligible entry still respects the exam's own
             # optional password (an additional layer, never a substitute
             # for entitlement — GrandTestAccess.password doesn't apply here
-            # since no GrandTestAccess grant exists on this path).
+            # since no GrandTestAccess grant exists on this path). GT3-3
+            # deliberately leaves this branch untouched — it gates a
+            # DIFFERENT population (a student with no paid entitlement at
+            # all) through a DIFFERENT, admin-set, Test-level password,
+            # not the per-student GrandTestAccess.password this phase
+            # removes below.
             if test.access_password and submitted_password != test.access_password:
-                return Response({'detail': 'Incorrect test password.'}, status=status.HTTP_403_FORBIDDEN)
+                return error_response(status.HTTP_403_FORBIDDEN, 'invalid_test_password', 'Incorrect test password.')
             if should_consume:
                 free_starter_resource = 'grand_test'
-        elif submitted_password != access.password:
-            return Response({'detail': 'Incorrect exam password.'}, status=status.HTTP_403_FORBIDDEN)
+        # GT3-3: an entitled student (a real, non-revoked GrandTestAccess
+        # row exists) no longer needs to submit access.password at all —
+        # authorization for this population is now exactly
+        # `authenticated user + valid GrandTestAccess + valid schedule`
+        # (the schedule half already enforced above/below, unchanged from
+        # GT3-2). The password CHECK is removed; the password FIELD,
+        # generator, and confirmation email are all deliberately left in
+        # place (no destructive migration, easy rollback) — see this
+        # phase's own completion report for why. A student who submits a
+        # password anyway (stale frontend build, or one who still has the
+        # emailed value) is simply ignored here, not rejected — the
+        # field is no longer consulted for this population, in either
+        # direction.
     elif test.access_password and submitted_password != test.access_password:
-        return Response({'detail': 'Incorrect test password.'}, status=status.HTTP_403_FORBIDDEN)
+        return error_response(status.HTTP_403_FORBIDDEN, 'invalid_test_password', 'Incorrect test password.')
     elif test.exam_type in ('mock', 'qbank') and test.is_pro and not has_mock_test_access(request.user, test):
         eligible, should_consume = _free_starter_eligibility(request.user, has_prior_attempt, 'mock_test')
         if not eligible:
-            return Response(
-                {
-                    'detail': 'This Mock Test requires an active subscription.', 'code': 'purchase_required',
-                    'access_denied': _free_starter_denied_payload(),
-                },
-                status=status.HTTP_402_PAYMENT_REQUIRED,
+            return error_response(
+                status.HTTP_402_PAYMENT_REQUIRED, 'purchase_required',
+                'This Mock Test requires an active subscription.', access_denied=_free_starter_denied_payload(),
             )
         if should_consume:
             free_starter_resource = 'mock_test'
@@ -224,53 +304,88 @@ def _start_attempt(request, test, session=None):
     ):
         eligible, should_consume = _free_starter_eligibility(request.user, has_prior_attempt, 'daily_test')
         if not eligible:
-            return Response(
-                {
-                    'detail': 'This Daily Test requires an active subscription.', 'code': 'purchase_required',
-                    'access_denied': _free_starter_denied_payload(),
-                },
-                status=status.HTTP_402_PAYMENT_REQUIRED,
+            return error_response(
+                status.HTTP_402_PAYMENT_REQUIRED, 'purchase_required',
+                'This Daily Test requires an active subscription.', access_denied=_free_starter_denied_payload(),
             )
         if should_consume:
             free_starter_resource = 'daily_test'
     elif test.exam_type == 'pyq' and test.is_pro and not has_pyq_access(request.user, test):
         eligible, should_consume = _free_starter_eligibility(request.user, has_prior_attempt, 'pyq')
         if not eligible:
-            return Response(
-                {
-                    'detail': 'This Past Year Questions test requires an active membership.', 'code': 'purchase_required',
-                    'access_denied': _free_starter_denied_payload(),
-                },
-                status=status.HTTP_402_PAYMENT_REQUIRED,
+            return error_response(
+                status.HTTP_402_PAYMENT_REQUIRED, 'purchase_required',
+                'This Past Year Questions test requires an active membership.',
+                access_denied=_free_starter_denied_payload(),
             )
         if should_consume:
             free_starter_resource = 'pyq'
 
-    attempt_qs = test.attempts.filter(user=request.user, session=session)
-    existing = attempt_qs.filter(status='in_progress').first()
-    if existing:
-        # Phase 6: a "resume" that lands after the effective deadline has
-        # passed finalizes the stale attempt instead of handing back a
-        # dead attempt for the frontend to render as if still answerable
-        # — then falls through to the ordinary attempt-count/new-attempt
-        # logic below, exactly as if this had never been in progress.
-        existing = ensure_finalized_if_expired(existing)
-        if existing.status == 'in_progress':
-            return Response(TestAttemptSerializer(existing, context={'request': request}).data)
+    # GT3-7 §42 — start concurrency: everything from here through the
+    # actual TestAttempt.objects.create() below used to be a plain
+    # read-then-write with no lock and no DB constraint, so two
+    # simultaneous start requests from the SAME user (a double-tap, two
+    # open tabs, a retried request) could both observe "no in_progress
+    # attempt yet" and both create one — two 'official' attempts for one
+    # exam, defeating "one official attempt" (a real, reproduced race,
+    # not theoretical). A DB-level partial/conditional unique constraint
+    # (UniqueConstraint(condition=...)) would be the more standard fix,
+    # but this project's production database is MySQL, which Django's ORM
+    # does not support conditional unique constraints against
+    # (supports_partial_indexes=False) — so the guard instead locks this
+    # one user's own row for the duration of the check-then-create,
+    # serializing only this user's own concurrent requests against each
+    # other (select_for_update on a row that already exists, unlike the
+    # not-yet-created TestAttempt). Every other student's start request
+    # locks a completely different row and proceeds independently, so
+    # this adds no contention for the real target scenario (many
+    # different students starting at the same instant — GT3-7 §41
+    # Scenario A).
+    try:
+        with transaction.atomic():
+            request.user.__class__.objects.select_for_update().get(pk=request.user.pk)
 
-    attempt_count = attempt_qs.count()
-    max_attempts = session.max_attempts if session else test.max_attempts
-    if attempt_count >= max_attempts:
-        return Response({'detail': 'Maximum attempts reached for this test.'}, status=status.HTTP_403_FORBIDDEN)
+            attempt_qs = test.attempts.filter(user=request.user, session=session)
+            existing = attempt_qs.filter(status='in_progress').first()
+            if existing:
+                # Phase 6: a "resume" that lands after the effective deadline has
+                # passed finalizes the stale attempt instead of handing back a
+                # dead attempt for the frontend to render as if still answerable
+                # — then falls through to the ordinary attempt-count/new-attempt
+                # logic below, exactly as if this had never been in progress.
+                existing = ensure_finalized_if_expired(existing)
+                if existing.status == 'in_progress':
+                    return Response(TestAttemptSerializer(existing, context={'request': request}).data)
 
-    attempt = TestAttempt.objects.create(
-        user=request.user, test=test, session=session, attempt_number=attempt_count + 1,
-    )
-    # Phase 9: freeze this attempt's question set/order exactly once, right
-    # here — the single point every subsequent GET/answer/submit reads
-    # from instead of recomputing. See freeze_attempt_questions' own
-    # docstring for the incident this fixes.
-    freeze_attempt_questions(attempt)
+            attempt_count = attempt_qs.count()
+            max_attempts = session.max_attempts if session else test.max_attempts
+            if attempt_count >= max_attempts:
+                return error_response(
+                    status.HTTP_403_FORBIDDEN, 'max_attempts_reached', 'Maximum attempts reached for this test.',
+                )
+
+            attempt = TestAttempt.objects.create(
+                user=request.user, test=test, session=session, attempt_number=attempt_count + 1,
+            )
+            # Phase 9: freeze this attempt's question set/order exactly once, right
+            # here — the single point every subsequent GET/answer/submit reads
+            # from instead of recomputing. See freeze_attempt_questions' own
+            # docstring for the incident this fixes.
+            freeze_attempt_questions(attempt)
+    except OperationalError:
+        # Same defensive pattern as TestViewSet.reschedule's own
+        # select_for_update() lock-contention handling — on a backend
+        # without true blocking row locks (SQLite, used locally/in tests),
+        # a near-simultaneous duplicate request can surface as "database is
+        # locked" instead of waiting; tell the loser to retry rather than
+        # show a raw 500. On production MySQL, the second request instead
+        # blocks and proceeds normally once the first commits (InnoDB row
+        # locking), so this branch is expected to be effectively unreachable
+        # there.
+        return Response(
+            {'detail': 'Please try again — a duplicate start request was in progress.'},
+            status=status.HTTP_409_CONFLICT,
+        )
 
     if free_starter_resource:
         ensure_and_consume_free_starter(request.user, free_starter_resource)
@@ -760,6 +875,39 @@ class TestViewSet(viewsets.ModelViewSet):
             )
         return Response(TestAdminSerializer(test, context={'request': request}).data)
 
+    @action(detail=True, methods=['get'], permission_classes=[IsAdminUser])
+    def grand_test_monitor(self, request, pk=None):
+        """GT3-7 §9-13 — the Live Grand Test Monitor's aggregate header
+        counts (entitled/started/active/submitted/auto-submitted/
+        not-started). Extends the existing admin monitoring surface
+        (ExamSessionViewSet.attempts already covers per-attempt Participants/
+        Results) rather than duplicating it — see tests_app/
+        grand_test_admin.py's own module docstring."""
+        test = self.get_object()
+        if test.exam_type != 'grand':
+            return Response({'detail': 'This view is only meaningful for a Grand Test.'}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(_grand_test_monitor_data(test))
+
+    @action(detail=True, methods=['get'], permission_classes=[IsAdminUser])
+    def grand_test_participants(self, request, pk=None):
+        """GT3-7 §13-14 — student participation table, including entitled
+        students with no attempt at all (not_started/missed) — the gap
+        ExamSessionViewSet.attempts structurally cannot fill, since it only
+        lists rows that already have an attempt."""
+        test = self.get_object()
+        if test.exam_type != 'grand':
+            return Response({'detail': 'This view is only meaningful for a Grand Test.'}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(_grand_test_participants_data(test))
+
+    @action(detail=True, methods=['get'], permission_classes=[IsAdminUser])
+    def grand_test_report(self, request, pk=None):
+        """GT3-7 §15-18 — post-exam participation/results/question
+        analytics, computed only from submitted attempts."""
+        test = self.get_object()
+        if test.exam_type != 'grand':
+            return Response({'detail': 'This view is only meaningful for a Grand Test.'}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(_grand_test_report_data(test))
+
 
 def _teacher_scope(qs, user, field='created_by'):
     if user.is_authenticated and getattr(user, 'admin_role', None) == 'teacher' and not user.can_manage_all_content:
@@ -1166,12 +1314,144 @@ class TestResultView(APIView):
         )
 
 
+class GrandTestMissedReviewView(APIView):
+    """Grand Test 3.0 / GT3-4 — GET /tests/{id}/missed-review/.
+
+    The one genuinely new endpoint this phase adds; every other GT3-4
+    change extends an existing endpoint/serializer (TestResultView/
+    TestResultSerializer, entitlements.services). Deliberately separate
+    from TestResultView: that endpoint is keyed by attempt_id and
+    requires can_review_attempt (an attempt that exists); a missed
+    student has neither an attempt nor an attempt_id BY DESIGN — see
+    grand_test_participation_status's own docstring for why MISSED is
+    derived rather than ever backed by a fabricated TestAttempt. This
+    endpoint is keyed by the Test's own id, and its authorization is a
+    genuinely different shape (GT3-4 spec §14): entitlement + schedule-
+    ended + no-attempt-ever-existed + review-not-expired — never 'owns
+    an attempt', because there is none to own."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        test = get_object_or_404(Test, pk=pk, exam_type='grand')
+
+        access = get_grand_test_access(request.user, test)
+        if not access:
+            return error_response(
+                status.HTTP_402_PAYMENT_REQUIRED, 'purchase_required', 'This Grand Test requires purchase.',
+            )
+
+        participation = grand_test_participation_status(test, request.user)
+        if participation in ('completed', 'in_progress'):
+            return error_response(
+                status.HTTP_403_FORBIDDEN, 'not_missed',
+                'You appeared for this Grand Test — use the regular result page instead.',
+            )
+        if participation != 'missed':
+            # not_scheduled / upcoming / live — nothing has closed yet, so
+            # there is nothing (appeared or missed) to review.
+            return error_response(status.HTTP_403_FORBIDDEN, 'review_locked', 'This Grand Test has not ended yet.')
+
+        available_at, expires_at = grand_test_review_window(test)
+        now = timezone.now()
+        # GT3-6 — general, evidence-safe recommendation only: a missed
+        # student has content-review data, never performance data, so
+        # this never touches score/rank/accuracy or the current test's
+        # weak-area breakdown (see grand_test_analytics.
+        # missed_student_recommendation's own docstring). Included
+        # regardless of expiry — it is not derived from the per-question
+        # content that expires.
+        from .grand_test_analytics import missed_student_recommendation
+
+        motivation = missed_student_recommendation(request.user, test)
+        base_payload = {
+            'review_type': 'missed_review',
+            'test': test.id,
+            'test_title': test.title,
+            'solutions_available_at': available_at,
+            'review_expires_at': expires_at,
+            'motivation': motivation,
+        }
+        if expires_at and now >= expires_at:
+            # GT3-4 §12: the missed record/status itself never disappears —
+            # only the detailed question/solution content does.
+            return Response({**base_payload, 'review_status': 'expired', 'questions': []})
+
+        questions = [
+            tq.question for tq in
+            TestQuestion.objects.filter(test=test).select_related(
+                'question__subject', 'question__chapter', 'question__topic',
+                'question__image_asset', 'question__explanation_image_asset',
+            ).prefetch_related('question__options').order_by('order')
+            if tq.question_id
+        ]
+        return Response({
+            **base_payload,
+            'review_status': 'available',
+            'questions': MissedReviewQuestionSerializer(questions, many=True, context={'request': request}).data,
+        })
+
+
+class GrandTestSeriesView(APIView):
+    """Grand Test 3.0 / GT3-6 — GET /tests/grand-series/.
+
+    The series-level dashboard: score trend, attendance/consistency, and
+    personal best across every Grand Test this student holds a live
+    entitlement for. See tests_app.grand_test_analytics.
+    grand_test_series_summary's own docstring for the exact rules (a
+    missed test is never scored as zero; trend/average are computed over
+    appeared tests only)."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from .grand_test_analytics import grand_test_series_summary
+
+        return Response(grand_test_series_summary(request.user))
+
+
 class MyAttemptsView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
         attempts = TestAttempt.objects.filter(user=request.user).select_related('test').order_by('-start_time')
         return Response(TestAttemptSummarySerializer(attempts, many=True, context={'request': request}).data)
+
+
+class FinalizeExpiredAttemptsView(APIView):
+    """POST /api/cron/finalize-expired-attempts/ — the Release Candidate
+    scheduler hook for the best-effort expired-attempt sweep.
+
+    Runs the SAME body as the `finalize_expired_attempts` management
+    command (tests_app.lifecycle.sweep_expired_attempts — never a second
+    finalization algorithm). Idempotent and row-lock-safe, so Cloud
+    Scheduler firing it every few minutes, overlapping with a slow run,
+    or racing a student's own submit can never double-score.
+
+    Same shared-secret pattern as billing.views.ExpireStalePaymentsView /
+    courses.views.PruneExpiredPackagesView: `X-Cron-Secret` header (or
+    `?secret=`), checked against settings.CRON_SECRET, which fails closed
+    when unconfigured. `?dry_run=1` reports without writing."""
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        from django.conf import settings
+
+        from .lifecycle import sweep_expired_attempts
+
+        if not settings.CRON_SECRET:
+            return Response({'detail': 'Cron secret not configured.'}, status=status.HTTP_401_UNAUTHORIZED)
+        provided = request.headers.get('X-Cron-Secret') or request.query_params.get('secret')
+        if provided != settings.CRON_SECRET:
+            return Response({'detail': 'Invalid or missing cron secret.'}, status=status.HTTP_401_UNAUTHORIZED)
+
+        dry_run = request.query_params.get('dry_run') in ('1', 'true', 'True')
+        try:
+            result = sweep_expired_attempts(dry_run=dry_run)
+        except Exception as exc:  # noqa: BLE001 - surfaced as 500 so the scheduler retries
+            logger.exception('finalize-expired-attempts sweep failed')
+            return Response({'detail': f'Sweep failed: {exc}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        # Don't echo the full id list in the HTTP response (could be large);
+        # the command path still logs each one.
+        return Response({'checked': result['checked'], 'finalized': result['finalized'], 'dry_run': result['dry_run']})
 
 
 def _parse_course(request):
