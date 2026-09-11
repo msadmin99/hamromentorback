@@ -691,17 +691,18 @@ def _build_docx_runs(paragraphs):
 
 
 class DocxParserBoldCorrectAnswerTests(TestCase):
-    """Regression coverage for a real reported bug: faculty commonly bold
-    the entire correct option in the source Word document as their own
-    visual convention while writing the file — the parser has never read
-    that bold as the answer signal (it only reads the explicit
-    "Answer: <letter>" line), but it faithfully carried the bold into the
-    option's stored HTML anyway, so students saw the correct option
-    rendered in bold. The fix strips bold ONLY from the option the
-    Answer: line independently confirms correct, and ONLY when that
-    option's entire text came out bold — never using bold itself to
-    decide correctness, and never touching a partially-bold option
-    (genuine word-level emphasis)."""
+    """Regression coverage for the final, non-negotiable product rule:
+    OPTION formatting from a .docx import must never carry bold, whether
+    it exists because the author used bold as their own correct-answer
+    marking convention (whole option), genuine word-level emphasis
+    (partial), or lands on a distractor rather than the actual answer —
+    none of that formatting is ever legitimate student-facing content on
+    an option, so it is unconditionally stripped. Correctness itself is
+    completely independent of formatting: it comes exclusively from the
+    explicit "Answer: <letter>" line, exactly as before this change, and
+    is represented purely structurally (`is_correct`) — never inferred
+    from, or coupled to, bold. Question text and explanations are
+    entirely out of scope and keep their bold exactly as authored."""
 
     def test_bold_correct_option_C_loses_the_bold_but_stays_correct(self):
         # The "C) " label is its own plain run and only the answer text
@@ -729,7 +730,8 @@ class DocxParserBoldCorrectAnswerTests(TestCase):
         ])
         self.assertNotIn('<strong>', texts[2])
         self.assertEqual([o['is_correct'] for o in options], [False, False, True, False])
-        # No internal bookkeeping keys leak into the returned shape.
+        # The returned option shape carries only the documented fields —
+        # no internal bookkeeping keys of any kind.
         self.assertEqual(set(options[2].keys()), {'text_html', 'is_correct', 'image_path'})
 
     def test_bold_correct_option_A(self):
@@ -796,11 +798,11 @@ class DocxParserBoldCorrectAnswerTests(TestCase):
         self.assertEqual(questions[1]['options'][2]['text_html'], '<p>Right one</p>')
         self.assertEqual([o['is_correct'] for o in questions[1]['options']], [False, False, True, False])
 
-    def test_legitimate_partial_bold_word_is_preserved_even_on_the_correct_option(self):
-        # "MOST" is intentionally bold for emphasis, independent of the
-        # correct-answer marker — the option is NOT fully bold, so the
-        # importer cannot (and must not) tell that apart from real
-        # authored emphasis, and must leave it exactly as written.
+    def test_partial_bold_word_is_stripped_but_option_text_is_preserved(self):
+        # "MOST" is a single bold word inside otherwise-plain text — bold
+        # is still option-presentation formatting, so it is stripped like
+        # everything else. The important thing is the wording itself
+        # survives intact: no character is lost, just the <strong> tag.
         buf = _build_docx_runs([
             'Q1. Which structure is involved?',
             [('A) ', False), ('Which structure is the ', False), ('MOST', True), (' important?', False)],
@@ -811,13 +813,15 @@ class DocxParserBoldCorrectAnswerTests(TestCase):
         ])
         questions = parse_docx(buf)
         options = questions[0]['options']
-        self.assertEqual(options[0]['text_html'], '<p>Which structure is the <strong>MOST</strong> important?</p>')
+        self.assertEqual(options[0]['text_html'], '<p>Which structure is the MOST important?</p>')
+        self.assertNotIn('<strong>', options[0]['text_html'])
         self.assertTrue(options[0]['is_correct'])
 
-    def test_fully_bold_distractor_that_is_not_the_answer_is_left_untouched(self):
-        # A non-correct option that happens to be fully bold is NOT the
-        # marker convention (the Answer: line disagrees), so it is left
-        # exactly as authored rather than guessed at.
+    def test_bold_distractor_also_loses_its_bold_and_stays_incorrect(self):
+        # A non-correct option that happens to be bold is NOT read as an
+        # answer signal (the Answer: line alone decides is_correct), and
+        # its bold is stripped too — presentation formatting is discarded
+        # from every option, not only the correct one.
         buf = _build_docx_runs([
             'Q1. Stem?',
             [('A) ', False), ('Bolded but wrong', True)],
@@ -828,7 +832,8 @@ class DocxParserBoldCorrectAnswerTests(TestCase):
         ])
         questions = parse_docx(buf)
         options = questions[0]['options']
-        self.assertEqual(options[0]['text_html'], '<p><strong>Bolded but wrong</strong></p>')
+        self.assertEqual(options[0]['text_html'], '<p>Bolded but wrong</p>')
+        self.assertNotIn('<strong>', options[0]['text_html'])
         self.assertFalse(options[0]['is_correct'])
         self.assertTrue(options[1]['is_correct'])
 
@@ -847,9 +852,12 @@ class DocxParserBoldCorrectAnswerTests(TestCase):
         self.assertNotIn('<strong>', options[1]['text_html'])
         self.assertTrue(options[1]['is_correct'])
 
-    def test_mixed_text_and_latex_with_partial_bold_preserved(self):
+    def test_mixed_text_and_latex_bold_is_stripped_math_source_intact(self):
         # Options must appear in real A/B/C/D document order — the parser
         # assigns the letter by position, not by the label text typed.
+        # The bold LaTeX span loses its <strong> like any other option
+        # bold, but the LaTeX source itself (backslashes, braces) must
+        # come through completely unaltered.
         buf = _build_docx_runs([
             'Q1. Stem?',
             'A) First',
@@ -860,7 +868,8 @@ class DocxParserBoldCorrectAnswerTests(TestCase):
         ])
         questions = parse_docx(buf)
         options = questions[0]['options']
-        self.assertEqual(options[2]['text_html'], r'<p>The answer is <strong>\(F=ma\)</strong> exactly.</p>')
+        self.assertEqual(options[2]['text_html'], r'<p>The answer is \(F=ma\) exactly.</p>')
+        self.assertNotIn('<strong>', options[2]['text_html'])
 
     def test_bold_text_in_explanation_is_never_touched_by_this_fix(self):
         # The correct-answer marking convention only ever applies to
@@ -899,9 +908,11 @@ class DocxParserBoldCorrectAnswerTests(TestCase):
         options = questions[0]['options']
         self.assertEqual(options[2]['text_html'], '<p>First line bold</p><p>second line also bold</p>')
 
-    def test_multi_line_option_only_partially_bold_across_continuation_is_preserved(self):
-        # The first line is fully bold but the continuation line is not —
-        # the option as a whole is NOT fully bold, so nothing is stripped.
+    def test_multi_line_option_partial_bold_across_continuation_is_fully_stripped(self):
+        # The first line is bold, the continuation line is not — both end
+        # up bold-free, since bold is discarded from the option
+        # regardless of which line(s) carried it or how much of the
+        # option they cover. No text from either line is lost.
         buf = _build_docx_runs([
             'Q1. Stem?',
             'A) First',
@@ -915,8 +926,9 @@ class DocxParserBoldCorrectAnswerTests(TestCase):
         options = questions[0]['options']
         self.assertEqual(
             options[2]['text_html'],
-            '<p><strong>First line bold</strong></p><p>second line not bold</p>',
+            '<p>First line bold</p><p>second line not bold</p>',
         )
+        self.assertNotIn('<strong>', options[2]['text_html'])
 
     def test_plain_unbolded_correct_option_is_unaffected(self):
         buf = _build_docx([
@@ -928,6 +940,45 @@ class DocxParserBoldCorrectAnswerTests(TestCase):
         options = questions[0]['options']
         self.assertEqual(options[2]['text_html'], '<p>Third</p>')
         self.assertTrue(options[2]['is_correct'])
+
+    def test_question_text_containing_bold_is_never_touched(self):
+        # Bold stripping is scoped to OPTIONS only — a bold word in the
+        # question stem itself is completely out of scope and must render
+        # exactly as authored.
+        buf = _build_docx_runs([
+            [('Q1. ', False), ('Which', False), (' quantity is the ', False), ('MOST', True), (' fundamental?', False)],
+            'A) First',
+            'B) Second',
+            [('C) ', False), ('Third', True)],
+            'D) Fourth',
+            'Answer: C',
+        ])
+        questions = parse_docx(buf)
+        self.assertEqual(
+            questions[0]['text_html'],
+            '<p>Which quantity is the <strong>MOST</strong> fundamental?</p>',
+        )
+        # And the option-side stripping still applies independently.
+        self.assertEqual(questions[0]['options'][2]['text_html'], '<p>Third</p>')
+
+    def test_correctness_never_depends_on_stored_html(self):
+        # is_correct is read purely from the structural Answer: line —
+        # confirm it agrees with is_correct regardless of which option (if
+        # any) happened to be bold in the source, i.e. formatting and
+        # correctness are fully decoupled in both directions.
+        buf = _build_docx_runs([
+            'Q1. Stem?',
+            [('A) ', False), ('Bold but wrong', True)],
+            [('B) ', False), ('Also bold, also wrong', True)],
+            'C) Plain and correct',
+            [('D) ', False), ('Bold and wrong too', True)],
+            'Answer: C',
+        ])
+        questions = parse_docx(buf)
+        options = questions[0]['options']
+        self.assertEqual([o['is_correct'] for o in options], [False, False, True, False])
+        for opt in options:
+            self.assertNotIn('<strong>', opt['text_html'])
 
 
 def _pq(text, option_texts):

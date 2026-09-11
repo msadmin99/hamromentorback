@@ -13,6 +13,16 @@ selects them for the whole batch on the Preview & Validate screen. Marks and
 negative marks aren't part of the file either — those are set later in Exam
 Management.
 
+BOLD IN OPTIONS: some source documents bold the correct option as the
+author's own visual convention while typing — this parser never reads that
+bold as the answer signal (the explicit "Answer: <letter>" line below is
+the only source of truth for is_correct), and per product requirement,
+bold is never legitimate student-facing formatting on an option either way
+— full-word or partial, correct option or distractor. Option paragraphs are
+therefore always rendered with bold suppressed (see `keep_bold=False`
+below); question and explanation paragraphs are unaffected and keep bold
+exactly as authored.
+
 Expected structure (also shown in the downloadable .docx template):
 
     Q1. A ball is thrown vertically upward. What is its acceleration
@@ -53,30 +63,18 @@ def _run_html(run, text, keep_bold=True):
     return escaped
 
 
-def _paragraph_html(para, strip_prefix_len=0):
-    return _paragraph_html_variants(para, strip_prefix_len)[0]
+def _paragraph_html(para, strip_prefix_len=0, keep_bold=True):
+    """Renders one paragraph's runs to an HTML fragment.
 
-
-def _paragraph_html_variants(para, strip_prefix_len=0):
-    """Returns `(html, plain_html, all_bold)` for one paragraph.
-
-    `plain_html` is identical to `html` except every run's bold is
-    suppressed (sup/sub/italic are untouched) — used to recover an
-    option's real text when its bold turns out to be nothing but the
-    correct-answer marking convention (see `parse_docx`'s ANSWER_RE
-    branch), never for questions or explanations.
-
-    `all_bold` is True only when EVERY run that contributes actual
-    (non-whitespace) text to this paragraph has `run.bold` set — i.e. the
-    paragraph reads as a single fully-bold clause, not a bold word inside
-    otherwise plain text. A paragraph with no qualifying run (blank, or
-    entirely consumed by `strip_prefix_len`) is never considered
-    "all bold" — there's nothing there to have been marked."""
+    `keep_bold=False` (used for OPTION paragraphs only — see module
+    docstring) unconditionally drops any `<strong>` wrapping a bold run
+    would otherwise get, regardless of whether the bold covers the whole
+    option or just part of it, and regardless of whether the option turns
+    out to be the correct answer. Sup/sub/italic are never affected by
+    this flag. Question and explanation paragraphs always call this with
+    the default `keep_bold=True`, so bold there is completely unchanged."""
     parts = []
-    plain_parts = []
     consumed = 0
-    saw_text_run = False
-    all_bold = True
     for run in para.runs:
         text = run.text or ''
         if consumed < strip_prefix_len:
@@ -84,16 +82,9 @@ def _paragraph_html_variants(para, strip_prefix_len=0):
             text = text[cut:]
             consumed += cut
         if text:
-            parts.append(_run_html(run, text))
-            plain_parts.append(_run_html(run, text, keep_bold=False))
-            if text.strip():
-                saw_text_run = True
-                all_bold = all_bold and bool(run.bold)
+            parts.append(_run_html(run, text, keep_bold=keep_bold))
     inline = ''.join(parts).strip()
-    plain_inline = ''.join(plain_parts).strip()
-    html = f'<p>{inline}</p>' if inline else ''
-    plain_html = f'<p>{plain_inline}</p>' if plain_inline else ''
-    return html, plain_html, saw_text_run and all_bold
+    return f'<p>{inline}</p>' if inline else ''
 
 
 def _paragraph_image(para, document, batch_id, slot):
@@ -125,12 +116,6 @@ def parse_docx(file_obj, batch_id=None):
     def flush():
         nonlocal current
         if current is not None and current['text_html']:
-            # `_bold_plain_html`/`_all_bold` are internal bookkeeping only
-            # (see the ANSWER_RE branch below) — never part of the
-            # documented option shape in base.ParsedQuestion's docstring.
-            for opt in current['options']:
-                opt.pop('_bold_plain_html', None)
-                opt.pop('_all_bold', None)
             questions.append(current)
         current = None
 
@@ -165,34 +150,16 @@ def parse_docx(file_obj, batch_id=None):
         # never be read as a second set of real options for the question.
         if m and mode != 'explanation':
             mode = 'option'
-            html_val, plain_val, all_bold = _paragraph_html_variants(para, strip_prefix_len=m.end())
+            html_val = _paragraph_html(para, strip_prefix_len=m.end(), keep_bold=False)
             img = _paragraph_image(para, document, batch_id, f'q{len(questions) + 1}_option{len(current["options"]) + 1}')
-            current['options'].append({
-                'text_html': html_val, 'is_correct': False, 'image_path': img,
-                '_bold_plain_html': plain_val, '_all_bold': all_bold,
-            })
+            current['options'].append({'text_html': html_val, 'is_correct': False, 'image_path': img})
             continue
 
         m = ANSWER_RE.match(raw_text)
         if m and mode != 'explanation':
             letter = m.group(1).upper()
             for i, opt in enumerate(current['options']):
-                is_correct = chr(ord('A') + i) == letter
-                opt['is_correct'] = is_correct
-                # Some faculty bold the whole correct option in the source
-                # document as their own visual convention while typing —
-                # the parser never reads that bold as the answer signal
-                # (the explicit "Answer: <letter>" line above is the only
-                # source of truth for is_correct), but it must not leak
-                # into the option students see either. Only strip it once
-                # this option is independently confirmed correct by that
-                # line, and only when the ENTIRE option text came out
-                # bold — a partially-bold option (e.g. one word bolded for
-                # genuine emphasis) is left exactly as authored, since the
-                # importer has no way to tell that apart from the marker
-                # convention and must not guess.
-                if is_correct and opt.get('_all_bold') and opt.get('_bold_plain_html'):
-                    opt['text_html'] = opt['_bold_plain_html']
+                opt['is_correct'] = chr(ord('A') + i) == letter
             mode = None
             continue
 
@@ -206,21 +173,13 @@ def parse_docx(file_obj, batch_id=None):
             continue
 
         # plain continuation of whichever section is currently open
-        if mode == 'option' and current['options']:
-            html_val, plain_val, all_bold = _paragraph_html_variants(para)
-            if not html_val:
-                continue
-            opt = current['options'][-1]
-            opt['text_html'] += html_val
-            opt['_bold_plain_html'] = opt.get('_bold_plain_html', '') + plain_val
-            opt['_all_bold'] = opt.get('_all_bold', True) and all_bold
-            continue
-
-        html_val = _paragraph_html(para)
+        html_val = _paragraph_html(para, keep_bold=(mode != 'option'))
         if not html_val:
             continue
         if mode == 'question':
             current['text_html'] += html_val
+        elif mode == 'option' and current['options']:
+            current['options'][-1]['text_html'] += html_val
         elif mode == 'explanation':
             current['explanation_html'] += html_val
 
