@@ -260,7 +260,19 @@ def resolve_card_access(test, snapshot, attempts, session=None):
     # the generic _session_block above (before entitlement), matching
     # every other scheduled exam type's existing precedent: schedule
     # state is shown regardless of whether the student has bought in yet.
-    if test.exam_type == 'grand' and snapshot.authenticated:
+    #
+    # Daily Test schedule audit: extended to 'daily' here too — the exact
+    # same gap existed for Daily Test (a future- or already-closed-window
+    # Daily Test still showed 'Start Test' as clickable). Despite its
+    # name, grand_test_participation_status() is exam-type-agnostic
+    # internally — it only ever reads test.scheduled_start/end and
+    # test.sessions (which resolves to nothing for a Daily Test, since
+    # ExamSession is a Grand-Test-only concept in practice), so calling
+    # it for 'daily' correctly falls through to the plain
+    # scheduled_start/end comparison with no modification to the
+    # function itself. Grand Test's own behavior/tests are untouched —
+    # this only widens who else reaches the same, already-correct check.
+    if test.exam_type in ('grand', 'daily') and snapshot.authenticated:
         from .lifecycle import grand_test_participation_status
 
         participation = grand_test_participation_status(test, snapshot.user)

@@ -91,17 +91,22 @@ def effective_attempt_end(attempt):
     already had, closing the 'late start extends the closing time' gap
     for that path (a late-starting student's personal duration_minutes
     could previously run well past the exam's own advertised end time,
-    since scheduled_start/end were display-only before this). Deliberately
-    scoped to exam_type='grand' only — a Daily/Mock/PYQ test's
-    scheduled_start/end (used only for TestListSerializer.get_status's
-    display badge) is completely unaffected; this does not newly enforce
-    anything for those exam types."""
+    since scheduled_start/end were display-only before this).
+
+    Daily Test schedule audit: extended to exam_type='daily' too, for the
+    identical reason — a Daily Test's 24-hour scheduled_start/end window
+    must cap a late-starting attempt exactly like Grand Test's does,
+    per that feature's own requirement ("if the attempt would extend
+    beyond scheduled_end, cap the attempt at scheduled_end"). A Mock/PYQ
+    test's scheduled_start/end (used only for TestListSerializer.
+    get_status's display badge) remains completely unaffected — this
+    still does not newly enforce anything for those exam types."""
     from datetime import timedelta
 
     personal_end = attempt.start_time + timedelta(minutes=attempt.test.duration_minutes)
     if attempt.session_id and attempt.session.end_datetime:
         return min(personal_end, attempt.session.end_datetime)
-    if attempt.test.exam_type == 'grand' and attempt.test.scheduled_end:
+    if attempt.test.exam_type in ('grand', 'daily') and attempt.test.scheduled_end:
         return min(personal_end, attempt.test.scheduled_end)
     return personal_end
 

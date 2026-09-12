@@ -171,7 +171,7 @@ def _start_attempt(request, test, session=None):
     # already filters correctly, but this is what stops a leaked/guessed Test
     # ID from bypassing that filter entirely.
     if not can_access_test(request.user, test):
-        return Response({'detail': 'You do not have access to this exam.'}, status=status.HTTP_403_FORBIDDEN)
+        return error_response(status.HTTP_403_FORBIDDEN, 'not_authorized', 'You do not have access to this exam.')
 
     # Phase 3 Free Starter: whether this student has EVER attempted this
     # specific Test before (any status) — computed once, up front. Fed
@@ -214,7 +214,7 @@ def _start_attempt(request, test, session=None):
             return error_response(
                 status.HTTP_403_FORBIDDEN, 'invalid_session_password', 'Incorrect session password.',
             )
-    elif test.exam_type == 'grand' and test.scheduled_start and test.scheduled_end:
+    elif test.exam_type in ('grand', 'daily') and test.scheduled_start and test.scheduled_end:
         # GT3-2: no real ExamSession exists for this Grand Test, but it
         # does have the simpler Test.scheduled_start/scheduled_end pair
         # (set directly on the exam builder, without using Reschedule/Exam
@@ -226,16 +226,37 @@ def _start_attempt(request, test, session=None):
         # time, defeating the entire "one official scheduled window"
         # premise. See grand_test_participation_status() — this mirrors
         # it exactly so enforcement and reporting can never disagree.
+        #
+        # Daily Test schedule audit: the identical gap existed for Daily
+        # Test (its scheduled_start/end were equally display-only). Daily
+        # Test's own requirement is a hard 24h window boundary — "at/after
+        # scheduled_end, no new starting" — one instant stricter than
+        # Grand Test's existing `now > scheduled_end` (which still allows
+        # a start landing exactly ON the boundary). Branching the
+        # comparison operator here, rather than changing it outright,
+        # keeps Grand Test's own long-established behavior byte-for-byte
+        # unchanged (see tests_gt3_2_missed_exam.py) while giving Daily
+        # Test the stricter boundary its own spec calls for.
         now = timezone.now()
         if now < test.scheduled_start:
+            if test.exam_type == 'grand':
+                return error_response(
+                    status.HTTP_403_FORBIDDEN, 'grand_test_not_started', 'This Grand Test has not started yet.',
+                )
             return error_response(
-                status.HTTP_403_FORBIDDEN, 'grand_test_not_started', 'This Grand Test has not started yet.',
+                status.HTTP_403_FORBIDDEN, 'daily_test_not_started', 'This Daily Test has not opened yet.',
             )
-        if now > test.scheduled_end and not test.attempts.filter(user=request.user, session__isnull=True).exists():
+        window_closed = now >= test.scheduled_end if test.exam_type == 'daily' else now > test.scheduled_end
+        if window_closed and not test.attempts.filter(user=request.user, session__isnull=True).exists():
+            if test.exam_type == 'grand':
+                return error_response(
+                    status.HTTP_403_FORBIDDEN, 'grand_test_missed',
+                    'Sorry, you missed this Grand Test during the scheduled examination time. '
+                    'The examination cannot be attempted after the official closing time.',
+                )
             return error_response(
-                status.HTTP_403_FORBIDDEN, 'grand_test_missed',
-                'Sorry, you missed this Grand Test during the scheduled examination time. '
-                'The examination cannot be attempted after the official closing time.',
+                status.HTTP_403_FORBIDDEN, 'daily_test_missed',
+                "Sorry, this Daily Test's 24-hour window has closed. It can no longer be started.",
             )
 
     # Phase 3 Free Starter: which resource_type (if any) this attempt is
@@ -1131,9 +1152,9 @@ class SubmitAnswerView(APIView):
         # per the Phase 6 spec.
         if is_attempt_expired(attempt):
             finalize_attempt(attempt, auto_submitted=True)
-            return Response(
-                {'detail': 'This exam has ended and your attempt was automatically submitted.', 'code': 'exam_closed'},
-                status=status.HTTP_403_FORBIDDEN,
+            return error_response(
+                status.HTTP_403_FORBIDDEN, 'exam_closed',
+                'This exam has ended and your attempt was automatically submitted.',
             )
         serializer = SubmitAnswerSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -1150,9 +1171,8 @@ class SubmitAnswerView(APIView):
         if attempt_is_preview_only(attempt):
             allowed_ids = attempt_preview_question_ids(attempt)
             if data['question_id'] not in allowed_ids:
-                return Response(
-                    {'detail': 'Subscribe to unlock this question.', 'code': 'purchase_required'},
-                    status=status.HTTP_402_PAYMENT_REQUIRED,
+                return error_response(
+                    status.HTTP_402_PAYMENT_REQUIRED, 'purchase_required', 'Subscribe to unlock this question.',
                 )
 
         selected_option = None
@@ -1189,14 +1209,14 @@ class MarkForReviewView(APIView):
         # of interacting with an in-progress attempt.
         if is_attempt_expired(attempt):
             finalize_attempt(attempt, auto_submitted=True)
-            return Response(
-                {'detail': 'This exam has ended and your attempt was automatically submitted.', 'code': 'exam_closed'},
-                status=status.HTTP_403_FORBIDDEN,
+            return error_response(
+                status.HTTP_403_FORBIDDEN, 'exam_closed',
+                'This exam has ended and your attempt was automatically submitted.',
             )
         question_id = request.data.get('question_id')
         marked = request.data.get('marked') in (True, 'true', 'True', '1', 1)
         if not question_id:
-            return Response({'detail': 'question_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
+            return error_response(status.HTTP_400_BAD_REQUEST, 'question_id_required', 'question_id is required.')
         get_object_or_404(attempt.test.questions, pk=question_id)
         Answer.objects.update_or_create(
             attempt=attempt, question_id=question_id,
@@ -1235,9 +1255,8 @@ class SubmitTestView(APIView):
         # attempt_is_preview_only's own docstring for why this must not
         # re-derive from the student's current entitlement state).
         if attempt_is_preview_only(attempt):
-            return Response(
-                {'detail': 'Subscribe to submit this test.', 'code': 'purchase_required'},
-                status=status.HTTP_402_PAYMENT_REQUIRED,
+            return error_response(
+                status.HTTP_402_PAYMENT_REQUIRED, 'purchase_required', 'Subscribe to submit this test.',
             )
 
         attempt = finalize_attempt(attempt, auto_submitted=False)
@@ -1304,9 +1323,9 @@ class TestResultView(APIView):
         attempt = ensure_finalized_if_expired(attempt)
         decision = can_review_attempt(request.user, attempt)
         if not decision.allowed:
-            return Response(
-                {'detail': 'This attempt has not been submitted yet.', 'access_denied': decision.as_dict()},
-                status=status.HTTP_403_FORBIDDEN,
+            return error_response(
+                status.HTTP_403_FORBIDDEN, 'attempt_not_submitted', 'This attempt has not been submitted yet.',
+                access_denied=decision.as_dict(),
             )
         filter_type = request.query_params.get('filter', 'all')
         return Response(
