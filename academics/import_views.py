@@ -352,6 +352,23 @@ class ImportBatchTaxonomyView(APIView):
             batch.dedup_completed_at = None
             batch.save(update_fields=['dedup_generation', 'dedup_status', 'dedup_claimed_at', 'dedup_completed_at'])
             enqueue_dedup_task(batch.id, batch.dedup_generation)
+            # Bulk-import Preview & Validate audit (duplicate-visibility
+            # bug): when DEDUP_PROCESSING_ASYNC is off — the actual value
+            # on the deployed backend service, confirmed via `gcloud run
+            # services describe`; it's never set there, so this has always
+            # been the real production behavior despite the comment above
+            # (now corrected) — enqueue_dedup_task() runs run_dedup_task()
+            # SYNCHRONOUSLY, in-process, before returning here. That call
+            # writes dedup_status/dedup_completed_at straight to the DB row
+            # via a separate queryset .update(), never touching this local
+            # `batch` Python object — so without this refresh, the
+            # response below reports the 'pending' value set three lines
+            # above even though dedup has, by this point, already fully
+            # run and completed. The duplicate ROWS themselves were never
+            # wrong (batch.rows is a live queryset, always fresh) — only
+            # this scalar status field on the in-memory object was stale.
+            # A harmless no-op when dedup genuinely is still async/pending.
+            batch.refresh_from_db()
 
         return Response(_batch_summary(batch))
 
