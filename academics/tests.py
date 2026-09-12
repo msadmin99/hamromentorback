@@ -3007,6 +3007,77 @@ class AnswerActionStatsVisibilityTests(APITestCase):
         self.assertEqual(resp.data['reference_page'], '123')
 
 
+class AnswerActionSurfacesAttemptStateTests(APITestCase):
+    """QBank 2.0 Phase 2D: the answer() response now surfaces
+    mastery_status/attempts_count/revision_due_at/recent_events —
+    fields record_question_result() already computed and previously
+    discarded — plus the practice_session() annotation bug fix. No new
+    mastery/revision algorithm; this only asserts the existing
+    QuestionAttempt/QuestionEvent state is read back correctly."""
+
+    def setUp(self):
+        self.subject = Subject.objects.create(name='Attempt State Subject', is_free=True)
+        self.question = Question.objects.create(subject=self.subject, text='Attempt state question')
+        self.opt_correct = Option.objects.create(question=self.question, text='Right', is_correct=True, order=1)
+        self.opt_wrong = Option.objects.create(question=self.question, text='Wrong', is_correct=False, order=2)
+        self.student = User.objects.create_user(username='attemptstate', email='attemptstate@example.com', password='pw12345')
+        self.client.force_authenticate(user=self.student)
+
+    def test_no_option_submitted_leaves_new_attempt_fields_null(self):
+        resp = self.client.post(f'/api/questions/{self.question.id}/answer/', {}, format='json')
+        self.assertIsNone(resp.data['mastery_status'])
+        self.assertIsNone(resp.data['attempts_count'])
+        self.assertIsNone(resp.data['revision_due_at'])
+        self.assertIsNone(resp.data['recent_events'])
+
+    def test_first_wrong_answer_reports_learning_and_a_future_revision_date(self):
+        resp = self.client.post(f'/api/questions/{self.question.id}/answer/', {'option_id': self.opt_wrong.id}, format='json')
+        attempt = QuestionAttempt.objects.get(user=self.student, question=self.question)
+        self.assertEqual(resp.data['mastery_status'], attempt.mastery_status)
+        self.assertEqual(resp.data['attempts_count'], 1)
+        self.assertEqual(resp.data['correct_count'], 0)
+        self.assertEqual(resp.data['incorrect_count'], 1)
+        self.assertIsNotNone(resp.data['revision_due_at'])
+        self.assertEqual(resp.data['revision_due_at'], attempt.revision_due_at.isoformat())
+
+    def test_recent_events_reflect_answer_history_for_this_user_only(self):
+        other_student = User.objects.create_user(username='otherstudent', email='otherstudent@example.com', password='pw12345')
+        self.client.force_authenticate(user=other_student)
+        self.client.post(f'/api/questions/{self.question.id}/answer/', {'option_id': self.opt_wrong.id}, format='json')
+
+        self.client.force_authenticate(user=self.student)
+        self.client.post(f'/api/questions/{self.question.id}/answer/', {'option_id': self.opt_wrong.id}, format='json')
+        resp = self.client.post(f'/api/questions/{self.question.id}/answer/', {'option_id': self.opt_correct.id}, format='json')
+
+        # Only this user's own two events — the other student's answer to
+        # the same question must never leak into this list.
+        self.assertEqual(len(resp.data['recent_events']), 2)
+        self.assertEqual([e['is_correct'] for e in resp.data['recent_events']], [True, False])
+        self.assertEqual(resp.data['attempts_count'], 2)
+
+    def test_practice_session_reports_real_mastery_status_not_always_new(self):
+        # Reproduces the bug: without the fix, every practice-session
+        # question always reported mastery_status "new" and
+        # is_revision_due False, regardless of the student's real history.
+        self.client.post(f'/api/questions/{self.question.id}/answer/', {'option_id': self.opt_correct.id}, format='json')
+        attempt = QuestionAttempt.objects.get(user=self.student, question=self.question)
+        self.assertNotEqual(attempt.mastery_status, 'new')
+
+        # Backdate the real revision date into the past — without the
+        # annotation fix, is_revision_due always falls back to False
+        # regardless of this; with it, it correctly reflects an overdue
+        # question. This is what makes the assertion below discriminating
+        # rather than coincidentally passing either way.
+        from django.utils import timezone as tz
+        attempt.revision_due_at = tz.now() - tz.timedelta(days=1)
+        attempt.save(update_fields=['revision_due_at'])
+
+        resp = self.client.post('/api/questions/practice-session/', {'count': 10}, format='json')
+        by_id = {q['id']: q for q in resp.data}
+        self.assertEqual(by_id[self.question.id]['mastery_status'], attempt.mastery_status)
+        self.assertTrue(by_id[self.question.id]['is_revision_due'])
+
+
 class QuestionReportTests(APITestCase):
     def setUp(self):
         self.subject = Subject.objects.create(name='Report Subject', is_free=True)

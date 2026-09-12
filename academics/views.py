@@ -635,6 +635,7 @@ class QuestionViewSet(viewsets.ModelViewSet):
 
         selected_option = None
         is_correct = False
+        attempt = None
         if option_id:
             # Phase 3 Free Starter (docs/FREE_STARTER_USAGE_RULES.md §2):
             # only gate/consume on a student's genuinely FIRST-EVER attempt
@@ -677,7 +678,7 @@ class QuestionViewSet(viewsets.ModelViewSet):
             # bookmark to False on every plain answer (bool("False") is True, and
             # the serializer's bookmark default is always present in
             # validated_data even when the client never sent the key).
-            record_question_result(
+            attempt = record_question_result(
                 request.user, question, is_correct, source='qbank',
                 selected_option=selected_option, time_taken_seconds=time_taken_seconds, confidence=confidence,
             )
@@ -707,6 +708,20 @@ class QuestionViewSet(viewsets.ModelViewSet):
                 for opt in Option.objects.filter(question_id=question.id).order_by('order')
             ]
 
+        # QBank 2.0 Phase 2D: recent_events backs "Your Question History" —
+        # the append-only QuestionEvent log already records every past
+        # attempt at this question by this user; this is the first time
+        # it's read back rather than only written. Scoped to request.user
+        # only, so it can never expose another student's activity. Kept to
+        # the last 10 (oldest-noise trimmed) and only computed on an actual
+        # answer, matching every other field in this response.
+        recent_events = None
+        if option_id:
+            recent_events = [
+                {'is_correct': e.is_correct, 'date': e.created_at.isoformat()}
+                for e in QuestionEvent.objects.filter(user=request.user, question=question).order_by('-created_at')[:10]
+            ]
+
         return Response({
             'is_correct': is_correct,
             'correct_option_id': correct_option.id if correct_option else None,
@@ -727,6 +742,15 @@ class QuestionViewSet(viewsets.ModelViewSet):
                 round(question.correct_attempts / question.total_attempts * 100) if stats_available else None
             ),
             'total_responses': question.total_attempts if stats_available else None,
+            # QBank 2.0 Phase 2D — surfaces what record_question_result()
+            # (above) already computed and saved onto QuestionAttempt;
+            # previously discarded. No new mastery/revision algorithm.
+            'mastery_status': attempt.mastery_status if attempt else None,
+            'attempts_count': attempt.attempts_count if attempt else None,
+            'correct_count': attempt.correct_count if attempt else None,
+            'incorrect_count': attempt.incorrect_count if attempt else None,
+            'revision_due_at': attempt.revision_due_at.isoformat() if attempt and attempt.revision_due_at else None,
+            'recent_events': recent_events,
         })
 
     @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated])
@@ -1031,6 +1055,7 @@ class QuestionViewSet(viewsets.ModelViewSet):
         topic(s)/difficulty/status/count, returns a bounded question list for
         the existing QuestionSolver to consume. No second quiz engine."""
         from django.db.models import Q as Q_
+        from django.db.models import Subquery
 
         user = request.user
         data = request.data
@@ -1081,6 +1106,24 @@ class QuestionViewSet(viewsets.ModelViewSet):
             count = min(int(data.get('count') or 20), 100)
         except (TypeError, ValueError):
             count = 20
+
+        # QBank 2.0 Phase 2D bug fix: get_queryset() (the /questions/{id}/
+        # and /questions/?chapter= entry points) annotates every question
+        # with this user's own mastery_status/last_result/revision_due_at
+        # so QuestionSerializer can report the real values instead of its
+        # 'new'/False fallback — this action never did, so a Practice
+        # Session (Smart Practice, Quick Practice — the majority of real
+        # QuestionSolver traffic) silently reported every question as
+        # freshly 'new' and never due for revision, regardless of the
+        # student's actual history. Same exact annotation pattern, applied
+        # here for the first time; is_bookmarked_by_user is left alone
+        # below, already handled separately and correctly.
+        attempt_for_user = QuestionAttempt.objects.filter(user=user, question=OuterRef('pk'))
+        qs = qs.annotate(
+            mastery_status_for_user=Subquery(attempt_for_user.values('mastery_status')[:1]),
+            last_result_for_user=Subquery(attempt_for_user.values('last_result')[:1]),
+            revision_due_at_for_user=Subquery(attempt_for_user.values('revision_due_at')[:1]),
+        )
 
         # random_sample() replaces `.order_by('?')[:count]` — see
         # academics/random_sample.py for why ORDER BY RAND() doesn't scale.
