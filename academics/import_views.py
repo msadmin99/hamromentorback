@@ -198,6 +198,20 @@ def _batch_summary(batch):
     # produced implicitly.
     raw_counts = dict(batch.rows.values('status').annotate(n=Count('id')).values_list('status', 'n'))
     counts = {s: raw_counts.get(s, 0) for s, _ in ImportRow.STATUS_CHOICES}
+
+    # Bulk-action audit (Features 1/2/6): row_counts.error stays the raw
+    # classification count (unaffected by error_skipped — a skipped error
+    # row's `status` never changes, per its own field docstring), so
+    # these are additive, clearly-separate figures the frontend uses for
+    # the Import-button eligibility check and the new "Skipped" summary
+    # tile, without changing what row_counts.error/duplicate have always
+    # meant. skipped_projected_count intentionally sums two mutually
+    # exclusive sources (a row is never simultaneously status='error' and
+    # status='duplicate'), so this can never double-count a single row.
+    unskipped_error_count = batch.rows.filter(status='error', error_skipped=False).count()
+    skipped_error_count = counts['error'] - unskipped_error_count
+    duplicate_skip_count = batch.rows.filter(status='duplicate', dedup_action='skip').count()
+
     return {
         'id': batch.id, 'file_name': batch.file_name, 'file_format': batch.file_format,
         'status': batch.status, 'total_rows': batch.total_rows,
@@ -206,6 +220,10 @@ def _batch_summary(batch):
         'skipped_count': batch.skipped_count, 'duplicate_count': batch.duplicate_count,
         'progress_percent': batch.progress_percent,
         'row_counts': counts,
+        'unskipped_error_count': unskipped_error_count,
+        'skipped_error_count': skipped_error_count,
+        'duplicate_skip_count': duplicate_skip_count,
+        'skipped_projected_count': skipped_error_count + duplicate_skip_count,
         'subject_id': batch.subject_id, 'chapter_id': batch.chapter_id, 'topic_id': batch.topic_id,
         'course_ids': list(batch.courses.values_list('id', flat=True)),
         'started_at': batch.started_at, 'completed_at': batch.completed_at, 'created_at': batch.created_at,
@@ -356,6 +374,18 @@ class ImportBatchRowsView(APIView):
         status_filter = request.query_params.get('status')
         if status_filter:
             rows = rows.filter(status=status_filter)
+
+        # Bulk-action audit (Feature 1/2/5): "Select All Duplicates"/
+        # "Select All Errors" must select every matching row in the whole
+        # batch, not just the current page — page_size is capped at 100
+        # above, too low for a batch with hundreds of duplicates. This is
+        # a lightweight id-only query (no raw_data/errors payload), reusing
+        # this existing endpoint + its status filter rather than adding a
+        # separate one, and never paginated — a "select all" action isn't
+        # meaningfully time-sliceable the way browsing rows is.
+        if request.query_params.get('ids_only'):
+            return Response({'ids': list(rows.values_list('id', flat=True))})
+
         total = rows.count()
         start = (page - 1) * page_size
         page_rows = rows[start:start + page_size]
@@ -365,7 +395,7 @@ class ImportBatchRowsView(APIView):
                 {
                     'id': r.id, 'row_number': r.row_number, 'status': r.status,
                     'errors': r.errors, 'warnings': r.warnings, 'duplicate_of_id': r.duplicate_of_id,
-                    'dedup_action': r.dedup_action, 'data': r.raw_data,
+                    'dedup_action': r.dedup_action, 'error_skipped': r.error_skipped, 'data': r.raw_data,
                 }
                 for r in page_rows
             ],
@@ -387,12 +417,27 @@ class ImportRowDetailView(APIView):
             row.errors, row.warnings = errors, warnings
             if row.status != 'duplicate':
                 row.status = 'error' if errors else ('warning' if warnings else 'valid')
+                # Feature 4 (revalidation after edit): editing a row that
+                # was previously an error-but-skipped row and correcting
+                # it enough to no longer even be an error means there's
+                # nothing left to "skip" — clear the flag so the row
+                # doesn't confusingly keep showing a stale "Skipped"
+                # badge on what is now a plain valid/warning row. A row
+                # that's still an error after the edit keeps whatever
+                # error_skipped value it already had (fixing one of
+                # several issues shouldn't silently un-skip it).
+                if row.status != 'error':
+                    row.error_skipped = False
         if 'dedup_action' in request.data:
             row.dedup_action = request.data['dedup_action']
+        if 'error_skipped' in request.data:
+            if row.status != 'error':
+                return Response({'detail': 'Only Error rows can be skipped/unskipped.'}, status=400)
+            row.error_skipped = bool(request.data['error_skipped'])
         row.save()
         return Response({
             'id': row.id, 'status': row.status, 'errors': row.errors, 'warnings': row.warnings,
-            'dedup_action': row.dedup_action, 'data': row.raw_data,
+            'dedup_action': row.dedup_action, 'error_skipped': row.error_skipped, 'data': row.raw_data,
         })
 
     def delete(self, request, batch_id, row_id):
@@ -417,6 +462,97 @@ class ImportRowDetailView(APIView):
         batch.total_rows = max(0, batch.total_rows - 1)
         batch.save(update_fields=['total_rows'])
         return Response(_batch_summary(batch))
+
+
+_DEDUP_BULK_ACTIONS = {'skip', 'replace', 'keep_both', 'remove'}
+
+
+class ImportRowsBulkDedupActionView(APIView):
+    """POST /import-batches/<id>/rows/bulk-dedup-action/ — Feature 1: apply
+    one Skip/Replace/Keep Both/Remove decision to many duplicate rows at
+    once, instead of the admin clicking through each one individually.
+    Body: {"row_ids": [...], "action": "skip"|"replace"|"keep_both"|"remove"}.
+
+    Reuses the exact existing single-row semantics — this only sets
+    `dedup_action` (Skip/Replace/Keep Both, interpreted at import time by
+    run_import(), completely unchanged) or deletes rows (Remove, the same
+    operation ImportRowDetailView.delete() already performs one row at a
+    time) — no new duplicate-resolution meaning is invented here.
+
+    Server-side hard-filtered to `status='duplicate'` regardless of what
+    row_ids the client sends, so a stale selection (e.g. a row was edited
+    and is no longer a duplicate) or a misbehaving client can never apply
+    a dedup action to a Valid/Warning/Error row. A single `.update()`/
+    `.delete()` query (not a per-row loop) inside one transaction, so this
+    never sends — or partially applies — hundreds of individual writes."""
+    permission_classes = [IsAdminUser]
+
+    def post(self, request, batch_id):
+        try:
+            batch = ImportBatch.objects.get(pk=batch_id)
+        except ImportBatch.DoesNotExist:
+            return Response({'detail': 'Batch not found.'}, status=404)
+        if batch.status not in ('ready', 'failed'):
+            return Response(
+                {'detail': f'Batch is currently "{batch.status}" — duplicate rows can only be changed before import starts.'},
+                status=400,
+            )
+
+        action = request.data.get('action')
+        if action not in _DEDUP_BULK_ACTIONS:
+            return Response({'detail': f'"action" must be one of {sorted(_DEDUP_BULK_ACTIONS)}.'}, status=400)
+        row_ids = request.data.get('row_ids')
+        if not isinstance(row_ids, list) or not row_ids:
+            return Response({'detail': '"row_ids" must be a non-empty list.'}, status=400)
+
+        rows = ImportRow.objects.filter(batch_id=batch_id, id__in=row_ids, status='duplicate')
+        with transaction.atomic():
+            if action == 'remove':
+                applied_count = rows.count()
+                rows.delete()
+                if applied_count:
+                    batch.total_rows = max(0, batch.total_rows - applied_count)
+                    batch.save(update_fields=['total_rows'])
+            else:
+                applied_count = rows.update(dedup_action=action)
+
+        return Response({'applied_count': applied_count, **_batch_summary(batch)})
+
+
+class ImportRowsBulkSkipErrorView(APIView):
+    """POST /import-batches/<id>/rows/bulk-skip-error/ — Feature 2 in bulk:
+    mark (or, with skipped=false, un-mark — bulk "Undo Skip") many Error
+    rows as bypassed for this import, without touching `status`, `errors`,
+    or the raw question data at all — see ImportRow.error_skipped's own
+    docstring for why this is a separate field. Body:
+    {"row_ids": [...], "skipped": true|false} (skipped defaults to true).
+
+    Server-side hard-filtered to `status='error'`, same reasoning as the
+    dedup bulk view above — a Valid/Warning/Duplicate row can never be
+    touched by this endpoint regardless of what the client sends."""
+    permission_classes = [IsAdminUser]
+
+    def post(self, request, batch_id):
+        try:
+            batch = ImportBatch.objects.get(pk=batch_id)
+        except ImportBatch.DoesNotExist:
+            return Response({'detail': 'Batch not found.'}, status=404)
+        if batch.status not in ('ready', 'failed'):
+            return Response(
+                {'detail': f'Batch is currently "{batch.status}" — error rows can only be skipped before import starts.'},
+                status=400,
+            )
+
+        row_ids = request.data.get('row_ids')
+        if not isinstance(row_ids, list) or not row_ids:
+            return Response({'detail': '"row_ids" must be a non-empty list.'}, status=400)
+        skipped = bool(request.data.get('skipped', True))
+
+        rows = ImportRow.objects.filter(batch_id=batch_id, id__in=row_ids, status='error')
+        with transaction.atomic():
+            applied_count = rows.update(error_skipped=skipped)
+
+        return Response({'applied_count': applied_count, **_batch_summary(batch)})
 
 
 class ImportConfirmView(APIView):

@@ -641,6 +641,18 @@ class ImportRow(models.Model):
         choices=[('skip', 'Skip'), ('replace', 'Replace'), ('keep_both', 'Keep both')],
         help_text='Admin decision for a row flagged as a duplicate — required before it can be confirmed.',
     )
+    error_skipped = models.BooleanField(
+        default=False,
+        help_text='Bulk-import Preview & Validate audit: an explicit admin decision to bypass this Error row for '
+                   'the current import, without touching its `status` (stays "error") or deleting it — the row '
+                   'keeps showing its real validation errors and can still be edited/fixed, but no longer counts '
+                   'toward blocking the batch, and the UI shows it as "Skipped" with an Undo option. Deliberately '
+                   'a separate field rather than overloading `status`, which already has its own "skipped" value '
+                   'meaning something different (a duplicate row skipped at IMPORT time, set by run_import() — '
+                   'see ImportRow.STATUS_CHOICES/import_engine.run_import) — collapsing the two would make an '
+                   'error-skipped row indistinguishable from an imported-and-skipped-duplicate row, and would '
+                   'wrongly exclude it from run_import\'s error exclusion query the moment status changed.',
+    )
     created_question = models.ForeignKey(Question, on_delete=models.SET_NULL, null=True, blank=True, related_name='+')
 
     class Meta:

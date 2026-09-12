@@ -12,6 +12,8 @@ from .import_views import (
     ImportProcessingHandlerView,
     ImportRollbackView,
     ImportRowDetailView,
+    ImportRowsBulkDedupActionView,
+    ImportRowsBulkSkipErrorView,
     ImportStatusView,
     ImportTemplateView,
     ImportUploadView,
@@ -46,6 +48,14 @@ urlpatterns = [
     path('import-batches/<int:batch_id>/rows/', ImportBatchRowsView.as_view(), name='import-batch-rows'),
     path('import-batches/<int:batch_id>/taxonomy/', ImportBatchTaxonomyView.as_view(), name='import-batch-taxonomy'),
     path('import-batches/<int:batch_id>/rows/<int:row_id>/', ImportRowDetailView.as_view(), name='import-row-detail'),
+    path(
+        'import-batches/<int:batch_id>/rows/bulk-dedup-action/',
+        ImportRowsBulkDedupActionView.as_view(), name='import-rows-bulk-dedup-action',
+    ),
+    path(
+        'import-batches/<int:batch_id>/rows/bulk-skip-error/',
+        ImportRowsBulkSkipErrorView.as_view(), name='import-rows-bulk-skip-error',
+    ),
     path('import-batches/<int:batch_id>/confirm/', ImportConfirmView.as_view(), name='import-confirm'),
     path('import-batches/<int:batch_id>/create-test/', ImportBatchCreateTestView.as_view(), name='import-batch-create-test'),
     path('import-batches/<int:batch_id>/create-questions/', ImportBatchCreateQuestionsView.as_view(), name='import-batch-create-questions'),

@@ -669,6 +669,89 @@ class DocxParserExplanationTests(TestCase):
         self.assertEqual(len(questions[1]['options']), 4)
 
 
+def _add_omml_equation(paragraph, symbols):
+    """Injects a minimal, real OMML (<m:oMath>) equation into `paragraph`,
+    with one <m:t> text node per string in `symbols` — simulating a
+    question/option authored via Word's native Insert -> Equation tool,
+    which python-docx's high-level API has no support for constructing.
+    Used to reproduce and regression-test the "Question text is blank"
+    false-Error bug fixed in docx_parser._paragraph_math_text()."""
+    from docx.oxml.ns import qn
+    from lxml import etree
+
+    m_ns = 'http://schemas.openxmlformats.org/officeDocument/2006/math'
+    nsmap = {'m': m_ns}
+    oMath = etree.SubElement(paragraph._p, f'{{{m_ns}}}oMath', nsmap=nsmap)  # noqa: SLF001 - no public API for OMML
+    for sym in symbols:
+        r = etree.SubElement(oMath, f'{{{m_ns}}}r')
+        t = etree.SubElement(r, f'{{{m_ns}}}t')
+        t.text = sym
+    assert qn  # imported for clarity/parity with docx_parser.py's own import; unused directly here
+
+
+class DocxParserOmmlEquationTests(TestCase):
+    """Regression coverage for the Feature 3 false-Error audit: a
+    question/option/explanation whose entire content is a Word-native
+    equation (OMML, not typed text) must not be classified as blank."""
+
+    def test_question_containing_only_an_omml_equation_is_not_blank(self):
+        doc = DocxDocument()
+        p = doc.add_paragraph('Q1. ')
+        _add_omml_equation(p, ['G', 'R', 'E', '2', 'g'])
+        doc.add_paragraph('A) g/R')
+        doc.add_paragraph('B) 2g/R')
+        doc.add_paragraph('C) g*R')
+        doc.add_paragraph('D) 2g*R')
+        doc.add_paragraph('Answer: A')
+        buf = io.BytesIO()
+        doc.save(buf)
+        buf.seek(0)
+
+        questions = parse_docx(buf)
+
+        self.assertEqual(len(questions), 1)
+        text = questions[0]['text_html']
+        self.assertNotEqual(text.strip(), '')
+        for sym in ['G', 'R', 'E', '2', 'g']:
+            self.assertIn(sym, text)
+
+    def test_paragraph_html_recovers_equation_only_content_directly(self):
+        """Unit-level coverage of the actual function changed
+        (_paragraph_html), independent of parse_docx's unrelated
+        question/option-boundary heuristics — a paragraph whose only
+        content is an OMML equation (no plain-text runs at all, the
+        option-lettering case included) must not render as an empty <p>."""
+        from academics.importers.docx_parser import _paragraph_html
+
+        doc = DocxDocument()
+        p = doc.add_paragraph()
+        _add_omml_equation(p, ['2', 'g', 'R', 'squared'])
+
+        html = _paragraph_html(p)
+
+        self.assertNotEqual(html, '')
+        self.assertIn('squared', html)
+
+    def test_a_genuinely_blank_paragraph_with_no_text_and_no_equation_is_still_blank(self):
+        """Root-cause fixes must not weaken validation globally — a
+        paragraph with neither real text nor an OMML equation must still
+        render as empty, exactly as before this fix."""
+        from academics.importers.docx_parser import _paragraph_html
+
+        doc = DocxDocument()
+        p = doc.add_paragraph()  # no runs, no equation at all
+
+        self.assertEqual(_paragraph_html(p), '')
+
+    def test_a_paragraph_with_only_whitespace_runs_and_no_equation_is_still_blank(self):
+        from academics.importers.docx_parser import _paragraph_html
+
+        doc = DocxDocument()
+        p = doc.add_paragraph('   ')
+
+        self.assertEqual(_paragraph_html(p), '')
+
+
 def _build_docx_runs(paragraphs):
     """Like `_build_docx`, but each paragraph is either a plain string or a
     list of `(text, bold)` run tuples — needed to build documents with

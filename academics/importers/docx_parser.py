@@ -47,6 +47,32 @@ OPTION_RE = re.compile(r'^\s*([A-Da-d])\s*[.):]\s*')
 ANSWER_RE = re.compile(r'^\s*Answer\s*:?\s*([A-Da-d])', re.IGNORECASE)
 EXPLANATION_RE = re.compile(r'^\s*Explanation\s*:?\s*')
 
+# Bulk-import "false Error" audit: a question/option/explanation authored
+# via Word's native Insert -> Equation tool (e.g. a gravity formula like
+# G*R_E^2/g) is stored as OMML (<m:oMath>), a completely separate XML
+# structure from the plain <w:t> text runs python-docx's `Run.text`
+# reads. `para.runs` never sees an OMML equation's content at all — not
+# because the run is empty, but because it isn't a `<w:r>` text run in
+# the first place — so a paragraph consisting ONLY of such an equation
+# previously produced an empty `_paragraph_html()`, which
+# validate_parsed_question then reported as "Question text is blank": a
+# false Error for a genuinely non-blank, faculty-authored question.
+_MATH_NS = '{http://schemas.openxmlformats.org/officeDocument/2006/math}'
+
+
+def _paragraph_math_text(para):
+    """Best-effort textual recovery of any OMML equation(s) in this
+    paragraph, via OMML's own text nodes (<m:t>, distinct from <w:t>).
+    This is NOT a full OMML->LaTeX structural conversion — fraction bars,
+    exponent/subscript layout, radicals etc. are not reconstructed, only
+    the underlying symbols/characters — but it is enough that an
+    equation's content is never silently dropped to nothing. Returns ''
+    if the paragraph has no OMML content at all (the overwhelmingly
+    common case), so normal text-only paragraphs are completely
+    unaffected by this function's existence."""
+    texts = para._element.findall(f'.//{_MATH_NS}t')  # noqa: SLF001 - python-docx has no public OMML accessor
+    return ''.join(t.text or '' for t in texts)
+
 
 def _run_html(run, text, keep_bold=True):
     if not text:
@@ -84,6 +110,14 @@ def _paragraph_html(para, strip_prefix_len=0, keep_bold=True):
         if text:
             parts.append(_run_html(run, text, keep_bold=keep_bold))
     inline = ''.join(parts).strip()
+    if not inline:
+        # No plain-text runs at all — check for a Word-native equation
+        # before concluding the paragraph is genuinely blank. See
+        # _paragraph_math_text()'s docstring above for why this is
+        # necessary and what it does/doesn't reconstruct.
+        math_text = _paragraph_math_text(para).strip()
+        if math_text:
+            inline = math_text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
     return f'<p>{inline}</p>' if inline else ''
 
 
