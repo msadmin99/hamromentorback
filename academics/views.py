@@ -1086,6 +1086,153 @@ class QuestionViewSet(viewsets.ModelViewSet):
         })
 
     @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
+    def progress(self, request):
+        """QBank 2.0 Phase 4 — Progress & Learning Intelligence.
+
+        Deliberately QBank-practice-only (QuestionAttempt/QuestionEvent),
+        using QuestionAttempt.mastery_status throughout — NOT
+        tests_app.performance's combined Test+QBank subject_breakdown/
+        topic_mastery (a different scope, a different accuracy-bucket
+        mastery scale, already serving the existing /performance page).
+        This is a new, complementary lens ("how am I doing in QBank
+        practice specifically"), not a duplicate of that page — nothing
+        here is recomputed from data that page already owns, and nothing
+        here creates a third mastery definition (the documented
+        QuestionBankConfig-vs-performance.py discrepancy is left exactly
+        as it is)."""
+        from django.db.models import Q
+        from django.db.models.functions import TruncDate
+
+        user = request.user
+        course = request.query_params.get('course')
+        locked = _locked_subject_ids(user)
+
+        attempt_qs = QuestionAttempt.objects.filter(user=user, attempts_count__gt=0)
+        if locked:
+            attempt_qs = attempt_qs.exclude(question__subject_id__in=locked)
+        if course:
+            attempt_qs = attempt_qs.filter(
+                Q(question__courses__id=course) | Q(question__courses__isnull=True, question__subject__courses__id=course)
+            )
+
+        # By-subject: attempted/accuracy/mastered/weak/revision-due — all
+        # QBank-only, one GROUP BY query (not one query per subject).
+        by_subject_rows = (
+            attempt_qs.values('question__subject_id', 'question__subject__name', 'question__subject__slug')
+            .annotate(
+                attempted=Count('id'),
+                correct=Count('id', filter=Q(last_result=True)),
+                mastered=Count('id', filter=Q(mastery_status='mastered')),
+                weak=Count('id', filter=Q(mastery_status='weak')),
+                revision_due=Count('id', filter=Q(revision_due_at__lte=timezone.now())),
+            )
+        )
+
+        # total_questions per subject — same course/lock-scoped Question
+        # queryset dashboard() already builds, just grouped by subject
+        # instead of summed to one total.
+        question_qs = _question_course_scoped(Question.objects.all(), user)
+        if locked:
+            question_qs = question_qs.exclude(subject_id__in=locked)
+        if course:
+            question_qs = question_qs.filter(
+                Q(courses__id=course) | Q(courses__isnull=True, subject__courses__id=course)
+            )
+        total_by_subject = dict(
+            question_qs.values('subject_id').annotate(total=Count('id', distinct=True)).values_list('subject_id', 'total')
+        )
+
+        by_subject = []
+        for row in by_subject_rows:
+            sid = row['question__subject_id']
+            attempted = row['attempted']
+            by_subject.append({
+                'subject_id': sid,
+                'subject_name': row['question__subject__name'],
+                'subject_slug': row['question__subject__slug'],
+                'attempted': attempted,
+                'accuracy': round(row['correct'] / attempted * 100, 2) if attempted else 0.0,
+                'mastered': row['mastered'],
+                'weak': row['weak'],
+                'revision_due': row['revision_due'],
+                'total_questions': total_by_subject.get(sid, 0),
+            })
+        by_subject.sort(key=lambda r: r['accuracy'])
+
+        # Mastery distribution — the 5th bucket (new/unattempted) has no
+        # mastery_status to show in a bar built from attempt_qs, so this
+        # is deliberately the 4-way split *within* attempted questions
+        # only, not dashboard()'s "new = total - attempted" framing.
+        mastery_distribution = {
+            'learning': attempt_qs.filter(mastery_status='learning').count(),
+            'need_practice': attempt_qs.filter(mastery_status='need_practice').count(),
+            'weak': attempt_qs.filter(mastery_status='weak').count(),
+            'mastered': attempt_qs.filter(mastery_status='mastered').count(),
+        }
+
+        # Weakest/strongest topics — gated by the same existing minimum-
+        # sample threshold /questions/{id}/answer/ already uses before
+        # showing any peer-comparison signal (QuestionBankConfig.
+        # min_attempts_for_option_stats) — reused, not a new invented
+        # threshold, per the explicit Phase 4 instruction. `attempted`
+        # here counts DISTINCT questions tried in the topic (Count('id'),
+        # matching by_subject's own definition above), not raw attempt-
+        # events on however few questions — re-answering one question
+        # five times isn't five independent data points about the topic.
+        min_attempts = QuestionBankConfig.load().min_attempts_for_option_stats
+        topic_rows = (
+            attempt_qs.exclude(question__topic__isnull=True)
+            .values('question__topic_id', 'question__topic__name', 'question__subject__name')
+            .annotate(attempted=Count('id'), correct=Count('id', filter=Q(last_result=True)))
+            .filter(attempted__gte=min_attempts)
+        )
+        topics = [
+            {
+                'topic_id': r['question__topic_id'],
+                'topic_name': r['question__topic__name'],
+                'subject_name': r['question__subject__name'],
+                'attempted': r['attempted'],
+                'accuracy': round(r['correct'] / r['attempted'] * 100, 2),
+            }
+            for r in topic_rows
+        ]
+        weakest_topics = sorted(topics, key=lambda t: t['accuracy'])[:5]
+        strongest_topics = sorted(topics, key=lambda t: -t['accuracy'])[:5]
+
+        # Accuracy trend — QuestionEvent (source='qbank'), day-bucketed,
+        # last 90 days. Real timestamped events only; a day with zero
+        # activity is simply absent from the list, never a fabricated 0%.
+        cutoff = timezone.now() - timezone.timedelta(days=90)
+        event_qs = QuestionEvent.objects.filter(user=user, source='qbank', created_at__gte=cutoff)
+        if locked:
+            event_qs = event_qs.exclude(question__subject_id__in=locked)
+        if course:
+            event_qs = event_qs.filter(
+                Q(question__courses__id=course) | Q(question__courses__isnull=True, question__subject__courses__id=course)
+            )
+        trend_rows = (
+            event_qs.annotate(day=TruncDate('created_at'))
+            .values('day').annotate(attempted=Count('id'), correct=Count('id', filter=Q(is_correct=True)))
+            .order_by('day')
+        )
+        accuracy_trend = [
+            {
+                'date': r['day'].isoformat(),
+                'attempted': r['attempted'],
+                'accuracy': round(r['correct'] / r['attempted'] * 100, 2) if r['attempted'] else 0.0,
+            }
+            for r in trend_rows
+        ]
+
+        return Response({
+            'by_subject': by_subject,
+            'mastery_distribution': mastery_distribution,
+            'weakest_topics': weakest_topics,
+            'strongest_topics': strongest_topics,
+            'accuracy_trend': accuracy_trend,
+        })
+
+    @action(detail=False, methods=['get'], permission_classes=[IsAuthenticated])
     def mistakes(self, request):
         """Mistake Bank: subject-wise counts of currently-wrong questions,
         plus a filtered/ordered list. scope=frequent orders by how many

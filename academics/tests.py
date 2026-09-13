@@ -4674,3 +4674,139 @@ class MistakesEnrichmentAndCourseScopingTests(APITestCase):
         resp = self.client.get('/api/questions/mistakes/')
         ids = {r['id'] for r in resp.data['results']}
         self.assertNotIn(outside_q.id, ids)
+
+
+class QuestionProgressEndpointTests(APITestCase):
+    """QBank 2.0 Phase 4: GET /questions/progress/ — QBank-only progress
+    aggregation (by_subject, mastery_distribution, weakest/strongest
+    topics, accuracy_trend). Reuses QuestionAttempt/QuestionEvent only;
+    no new mastery/history mechanism."""
+
+    def setUp(self):
+        self.student = User.objects.create_user(username='progress1', email='progress1@example.com', password='pw12345')
+        self.subject = Subject.objects.create(name='Progress Subject', is_free=True)
+        self.chapter = Chapter.objects.create(subject=self.subject, name='Progress Chapter')
+        self.topic = Topic.objects.create(chapter=self.chapter, name='Progress Topic')
+        self.client.force_authenticate(user=self.student)
+
+    def _question(self, topic=None):
+        return Question.objects.create(subject=self.subject, chapter=self.chapter, topic=topic, text='Q')
+
+    def test_zero_state_never_errors(self):
+        resp = self.client.get('/api/questions/progress/')
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data['by_subject'], [])
+        self.assertEqual(resp.data['mastery_distribution'], {'learning': 0, 'need_practice': 0, 'weak': 0, 'mastered': 0})
+        self.assertEqual(resp.data['weakest_topics'], [])
+        self.assertEqual(resp.data['strongest_topics'], [])
+        self.assertEqual(resp.data['accuracy_trend'], [])
+
+    def test_by_subject_reflects_real_qbank_attempts_only(self):
+        from academics.services import record_question_result
+
+        q1 = self._question()
+        q2 = self._question()
+        record_question_result(self.student, q1, True, source='qbank')
+        record_question_result(self.student, q2, False, source='qbank')
+
+        resp = self.client.get('/api/questions/progress/')
+        row = resp.data['by_subject'][0]
+        self.assertEqual(row['subject_id'], self.subject.id)
+        self.assertEqual(row['attempted'], 2)
+        self.assertEqual(row['accuracy'], 50.0)
+
+    def test_mastery_distribution_uses_real_mastery_status_not_a_new_formula(self):
+        from academics.services import record_question_result
+
+        weak_q = self._question()
+        mastered_q = self._question()
+        record_question_result(self.student, weak_q, False, source='qbank')
+        record_question_result(self.student, mastered_q, True, source='qbank')
+        record_question_result(self.student, mastered_q, True, source='qbank')
+
+        weak_attempt = QuestionAttempt.objects.get(user=self.student, question=weak_q)
+        mastered_attempt = QuestionAttempt.objects.get(user=self.student, question=mastered_q)
+
+        resp = self.client.get('/api/questions/progress/')
+        dist = resp.data['mastery_distribution']
+        self.assertEqual(dist['weak'], QuestionAttempt.objects.filter(user=self.student, mastery_status='weak').count())
+        self.assertEqual(dist['mastered'], QuestionAttempt.objects.filter(user=self.student, mastery_status='mastered').count())
+        # Sanity: whatever the real thresholds produced, distribution counts match reality
+        self.assertIn(weak_attempt.mastery_status, ['weak', 'learning', 'need_practice'])
+        self.assertIn(mastered_attempt.mastery_status, ['mastered', 'learning', 'need_practice'])
+
+    def test_weak_topic_excluded_below_the_documented_minimum_attempts_threshold(self):
+        from academics.models import QuestionBankConfig
+        from academics.services import record_question_result
+
+        QuestionBankConfig.objects.create(pk=1, min_attempts_for_option_stats=5)
+        q = self._question(topic=self.topic)
+        record_question_result(self.student, q, False, source='qbank')  # only 1 attempt, threshold is 5
+
+        resp = self.client.get('/api/questions/progress/')
+        topic_ids = {t['topic_id'] for t in resp.data['weakest_topics']}
+        self.assertNotIn(self.topic.id, topic_ids)
+
+    def test_weak_topic_included_once_the_threshold_is_met(self):
+        from academics.models import QuestionBankConfig
+        from academics.services import record_question_result
+
+        QuestionBankConfig.objects.create(pk=1, min_attempts_for_option_stats=2)
+        # The threshold counts DISTINCT questions attempted in the topic,
+        # not raw attempt-events on one question (re-answering a single
+        # question repeatedly isn't a statistically meaningful sample of
+        # the topic) — so this needs two different questions, not one
+        # question answered twice.
+        q1 = self._question(topic=self.topic)
+        q2 = self._question(topic=self.topic)
+        record_question_result(self.student, q1, False, source='qbank')
+        record_question_result(self.student, q2, False, source='qbank')
+
+        resp = self.client.get('/api/questions/progress/')
+        topic_ids = {t['topic_id'] for t in resp.data['weakest_topics']}
+        self.assertIn(self.topic.id, topic_ids)
+
+    def test_accuracy_trend_only_includes_qbank_events_not_test_events(self):
+        from academics.services import record_question_result
+
+        q = self._question()
+        record_question_result(self.student, q, True, source='qbank')
+        record_question_result(self.student, q, False, source='test')
+
+        resp = self.client.get('/api/questions/progress/')
+        total_attempted_in_trend = sum(row['attempted'] for row in resp.data['accuracy_trend'])
+        self.assertEqual(total_attempted_in_trend, 1)
+
+    def test_course_param_narrows_by_subject_to_the_selected_course(self):
+        from courses.models import Course, Enrollment
+        from academics.services import record_question_result
+
+        course_a = Course.objects.create(name='Progress Course A', prefix='PROGA')
+        course_b = Course.objects.create(name='Progress Course B', prefix='PROGB')
+        Enrollment.objects.create(user=self.student, course=course_a)
+        Enrollment.objects.create(user=self.student, course=course_b)
+
+        subject_a = Subject.objects.create(name='Progress Subject A', is_free=True)
+        subject_a.courses.set([course_a])
+        subject_b = Subject.objects.create(name='Progress Subject B', is_free=True)
+        subject_b.courses.set([course_b])
+        q_a = Question.objects.create(subject=subject_a, text='A')
+        q_b = Question.objects.create(subject=subject_b, text='B')
+
+        record_question_result(self.student, q_a, True, source='qbank')
+        record_question_result(self.student, q_b, True, source='qbank')
+
+        resp = self.client.get(f'/api/questions/progress/?course={course_a.id}')
+        subject_ids = {row['subject_id'] for row in resp.data['by_subject']}
+        self.assertEqual(subject_ids, {subject_a.id})
+
+    def test_locked_pro_subject_excluded_from_by_subject(self):
+        pro_subject = Subject.objects.create(name='Progress Pro Subject', is_free=False)
+        q = Question.objects.create(subject=pro_subject, text='Pro question')
+        # Attempt exists (e.g. subscription lapsed since) but the student
+        # currently has no active QBank subscription unlocking it.
+        QuestionAttempt.objects.create(user=self.student, question=q, attempts_count=1, correct_count=1, last_result=True)
+
+        resp = self.client.get('/api/questions/progress/')
+        subject_ids = {row['subject_id'] for row in resp.data['by_subject']}
+        self.assertNotIn(pro_subject.id, subject_ids)
