@@ -183,6 +183,21 @@ class QuestionSerializer(serializers.ModelSerializer):
     mastery_status = serializers.SerializerMethodField()
     is_incorrect = serializers.SerializerMethodField()
     is_revision_due = serializers.SerializerMethodField()
+    # QBank 2.0 Phase 3: surfaces QuestionAttempt fields the Revision
+    # Center / Mistake Bank 2.0 need (wrong count, last attempted,
+    # confidence, the real revision date) — all already computed and
+    # stored by record_question_result(), never a new mastery/history
+    # mechanism. Nullable/additive: every existing caller of this
+    # serializer is unaffected (extra fields it doesn't render).
+    incorrect_count = serializers.SerializerMethodField()
+    attempts_count = serializers.SerializerMethodField()
+    confidence = serializers.SerializerMethodField()
+    last_attempted_at = serializers.SerializerMethodField()
+    revision_due_at = serializers.SerializerMethodField()
+    # QBank 2.0 Phase 3B: plain-language "why this question" text, set only
+    # by practice_session()'s smart_revision path (see its own docstring) —
+    # None for every other caller, never a second recommendation engine.
+    revision_reason = serializers.SerializerMethodField()
 
     class Meta:
         model = Question
@@ -192,6 +207,8 @@ class QuestionSerializer(serializers.ModelSerializer):
             'options', 'is_bookmarked',
             'instructor_difficulty', 'actual_difficulty', 'question_type', 'tags',
             'mastery_status', 'is_incorrect', 'is_revision_due',
+            'incorrect_count', 'attempts_count', 'confidence', 'last_attempted_at', 'revision_due_at',
+            'revision_reason',
         ]
 
     def get_image_data(self, obj):
@@ -221,6 +238,26 @@ class QuestionSerializer(serializers.ModelSerializer):
             return False
         from django.utils import timezone
         return due <= timezone.now()
+
+    def get_incorrect_count(self, obj):
+        return getattr(obj, 'incorrect_count_for_user', None)
+
+    def get_attempts_count(self, obj):
+        return getattr(obj, 'attempts_count_for_user', None)
+
+    def get_confidence(self, obj):
+        return getattr(obj, 'confidence_for_user', None) or ''
+
+    def get_last_attempted_at(self, obj):
+        answered_at = getattr(obj, 'answered_at_for_user', None)
+        return answered_at.isoformat() if answered_at else None
+
+    def get_revision_due_at(self, obj):
+        due = getattr(obj, 'revision_due_at_for_user', None)
+        return due.isoformat() if due else None
+
+    def get_revision_reason(self, obj):
+        return getattr(obj, 'revision_reason_for_user', None)
 
 
 class ReferenceBookSerializer(serializers.ModelSerializer):

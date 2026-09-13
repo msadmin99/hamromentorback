@@ -192,10 +192,26 @@ class TopicViewSet(viewsets.ModelViewSet):
         ).order_by('order', 'name', 'id')
 
 
+# QBank 2.0 Phase 3 — documented, plain constants (not a new
+# QuestionBankConfig field: these are simple, self-explanatory product
+# thresholds, not a tunable mastery/difficulty scale like the existing
+# config fields, so the smallest-architecture choice is a constant, not a
+# new admin-editable row + migration + Admin UI surface).
+#
+# A question counts as a "Repeated Mistake" once it's been answered
+# incorrectly at least this many times (QuestionAttempt.incorrect_count).
+REPEATED_MISTAKE_MIN_COUNT = 2
+# A "Recent Mistake" is a QuestionEvent(is_correct=False) within this many
+# days — independent of the question's current (possibly since-corrected)
+# mastery_status.
+RECENT_MISTAKE_WINDOW_DAYS = 7
+
+
 def _status_question_ids(user, statuses, base_qs):
     """Resolves the spec's independent status flags (New/Mastered/Weak/
-    Need Practice/Incorrect/Bookmarked/Need Revision) to a set of matching
-    question ids, OR'd together — 'New + Incorrect' means either, not both.
+    Need Practice/Incorrect/Bookmarked/Need Revision/Overdue/Due
+    Today/Repeated Mistake/Recent Mistake) to a set of matching question
+    ids, OR'd together — 'New + Incorrect' means either, not both.
     base_qs is the already subject/chapter/topic/difficulty-filtered
     Question queryset, so 'new' only considers questions actually in scope."""
     from django.utils import timezone as tz
@@ -215,7 +231,104 @@ def _status_question_ids(user, statuses, base_qs):
         ids |= set(attempt_qs.filter(is_bookmarked=True).values_list('question_id', flat=True))
     if 'need_revision' in statuses:
         ids |= set(attempt_qs.filter(revision_due_at__lte=tz.now()).values_list('question_id', flat=True))
+    # QBank 2.0 Phase 3A: Due Today / Overdue split need_revision above
+    # into two mutually-exclusive, calendar-date-based buckets — matching
+    # the Revision Center's own "Due Today" vs "Overdue" summary cards.
+    if 'overdue' in statuses:
+        start_of_today = tz.localtime(tz.now()).replace(hour=0, minute=0, second=0, microsecond=0)
+        ids |= set(attempt_qs.filter(revision_due_at__lt=start_of_today).values_list('question_id', flat=True))
+    if 'due_today' in statuses:
+        start_of_today = tz.localtime(tz.now()).replace(hour=0, minute=0, second=0, microsecond=0)
+        start_of_tomorrow = start_of_today + tz.timedelta(days=1)
+        ids |= set(
+            attempt_qs.filter(revision_due_at__gte=start_of_today, revision_due_at__lt=start_of_tomorrow)
+            .values_list('question_id', flat=True)
+        )
+    if 'repeated_mistake' in statuses:
+        ids |= set(
+            attempt_qs.filter(incorrect_count__gte=REPEATED_MISTAKE_MIN_COUNT).values_list('question_id', flat=True)
+        )
+    if 'recent_mistake' in statuses:
+        cutoff = tz.now() - tz.timedelta(days=RECENT_MISTAKE_WINDOW_DAYS)
+        ids |= set(
+            QuestionEvent.objects.filter(user=user, is_correct=False, created_at__gte=cutoff)
+            .values_list('question_id', flat=True)
+        )
     return ids
+
+
+def _revision_reason(question, now):
+    """One short, transparent, plain-language sentence for why a question
+    was selected by Smart Revision — same priority order the score below
+    weighs, so the stated reason always matches what actually drove the
+    ranking. Never a complicated score shown to the student."""
+    mastery = getattr(question, 'mastery_status_for_user', None) or 'new'
+    due_at = getattr(question, 'revision_due_at_for_user', None)
+    incorrect = getattr(question, 'incorrect_count_for_user', None) or 0
+    confidence = getattr(question, 'confidence_for_user', None)
+
+    if due_at and due_at < now:
+        days = max((now - due_at).days, 1)
+        return f"Overdue by {days} day{'s' if days != 1 else ''}."
+    if confidence == 'confident' and mastery in ('weak', 'need_practice', 'learning'):
+        return 'Answered incorrectly despite high confidence.'
+    if incorrect >= REPEATED_MISTAKE_MIN_COUNT:
+        return f"You've gotten this wrong {incorrect} times."
+    if mastery == 'weak':
+        return 'One of your weaker questions.'
+    if due_at and due_at <= now:
+        return 'Due for review today.'
+    return 'Recommended for revision.'
+
+
+def _smart_revision_score(question, now):
+    """Transparent, documented priority — factors and weights are
+    deliberately simple (not a hidden ML score): overdue days (capped),
+    mastery state, repeated-incorrect count (capped), and a confidence-
+    trap boost. Every input is a real, already-computed QuestionAttempt
+    field (see the annotations practice_session() adds above) — no new
+    signal is invented. Internal only; students see _revision_reason()'s
+    plain sentence instead of this number."""
+    mastery = getattr(question, 'mastery_status_for_user', None) or 'new'
+    due_at = getattr(question, 'revision_due_at_for_user', None)
+    incorrect = getattr(question, 'incorrect_count_for_user', None) or 0
+    confidence = getattr(question, 'confidence_for_user', None)
+
+    score = 0
+    if due_at and due_at < now:
+        overdue_days = (now - due_at).days
+        score += min(overdue_days, 14) * 10
+    elif due_at and due_at <= now:
+        score += 5  # due today, not yet overdue
+
+    mastery_weight = {'weak': 50, 'need_practice': 30, 'learning': 15, 'mastered': 0}
+    score += mastery_weight.get(mastery, 20)
+
+    score += min(incorrect, 5) * 8
+
+    if confidence == 'confident' and mastery in ('weak', 'need_practice', 'learning'):
+        score += 15
+
+    return score
+
+
+def _rank_for_smart_revision(qs, count):
+    """Smart Revision's selection: every candidate in `qs` (already
+    course/eligibility-scoped and restricted to actually-attempted
+    questions by the caller) is scored by _smart_revision_score and the
+    top `count` are returned, each carrying a matching revision_reason_
+    for_user. Evaluated in Python over this one student's own attempted-
+    question pool (bounded — hundreds, not the platform's full catalog),
+    not a platform-wide scan."""
+    from django.utils import timezone as tz
+
+    now = tz.now()
+    candidates = list(qs)
+    candidates.sort(key=lambda q: _smart_revision_score(q, now), reverse=True)
+    selected = candidates[:count]
+    for q in selected:
+        q.revision_reason_for_user = _revision_reason(q, now)
+    return selected
 
 
 # Scalability audit Phase B: Q(text__icontains=search) forced a full table
@@ -463,6 +576,13 @@ class QuestionViewSet(viewsets.ModelViewSet):
                 mastery_status_for_user=Subquery(attempt_for_user.values('mastery_status')[:1]),
                 last_result_for_user=Subquery(attempt_for_user.values('last_result')[:1]),
                 revision_due_at_for_user=Subquery(attempt_for_user.values('revision_due_at')[:1]),
+                # QBank 2.0 Phase 3: same Subquery mechanism, four more
+                # already-existing QuestionAttempt fields the Revision
+                # Center / Mistake Bank 2.0 need to read back.
+                incorrect_count_for_user=Subquery(attempt_for_user.values('incorrect_count')[:1]),
+                attempts_count_for_user=Subquery(attempt_for_user.values('attempts_count')[:1]),
+                confidence_for_user=Subquery(attempt_for_user.values('confidence')[:1]),
+                answered_at_for_user=Subquery(attempt_for_user.values('answered_at')[:1]),
             )
         # Question has no Meta.ordering — was never deterministic before
         # this (DRF's paginator would otherwise warn "may yield
@@ -891,6 +1011,58 @@ class QuestionViewSet(viewsets.ModelViewSet):
             )
         study_seconds = event_qs.aggregate(total=Sum('time_taken_seconds'))['total'] or 0
 
+        # QBank 2.0 Phase 3A/3H: Revision Center summary numbers — every
+        # one of these reuses attempt_qs/event_qs above (already course/
+        # subject-scoped), just with the specific bucketing the Revision
+        # Center needs. No new query pattern, no new mastery/revision
+        # algorithm — see _status_question_ids() for the identical Due
+        # Today/Overdue/Repeated/Recent definitions used by the list
+        # endpoints, kept consistent with these counts on purpose.
+        start_of_today = timezone.localtime(timezone.now()).replace(hour=0, minute=0, second=0, microsecond=0)
+        start_of_tomorrow = start_of_today + timezone.timedelta(days=1)
+        due_today = attempt_qs.filter(
+            revision_due_at__gte=start_of_today, revision_due_at__lt=start_of_tomorrow,
+        ).count()
+        overdue = attempt_qs.filter(revision_due_at__lt=start_of_today).count()
+        repeated_mistakes = attempt_qs.filter(incorrect_count__gte=REPEATED_MISTAKE_MIN_COUNT).count()
+        recent_cutoff = timezone.now() - timezone.timedelta(days=RECENT_MISTAKE_WINDOW_DAYS)
+        recent_mistakes = (
+            event_qs.filter(is_correct=False, created_at__gte=recent_cutoff)
+            .values('question_id').distinct().count()
+        )
+
+        # "Revision accuracy": accuracy across questions currently relevant
+        # to revision (weak/learning/need_practice, or due/overdue) — a
+        # real, computable metric from existing fields. Deliberately NOT
+        # "accuracy of Smart Revision sessions specifically": QuestionEvent
+        # doesn't distinguish a Smart Revision answer from any other QBank
+        # answer (both are source='qbank'), and adding that distinction
+        # would mean new event-level tracking — out of scope for Phase 3
+        # per "do not create duplicate tracking".
+        from django.db.models import Q as Q_revision
+        revision_relevant = attempt_qs.filter(
+            Q_revision(mastery_status__in=['weak', 'need_practice', 'learning'])
+            | Q_revision(revision_due_at__lte=timezone.now())
+        ).distinct()
+        revision_relevant_count = revision_relevant.count()
+        revision_accuracy = (
+            round(revision_relevant.filter(last_result=True).count() / revision_relevant_count * 100, 2)
+            if revision_relevant_count else None
+        )
+
+        # Last 7 days of QBank activity (source='qbank', same event_qs
+        # scoping as study_seconds above) — Phase 3I "Revision Activity".
+        # Real QuestionEvent rows only; a day with zero events is simply
+        # absent from the list rather than a fabricated zero entry, so the
+        # frontend can render "no activity" instead of misleadingly
+        # implying every day was tracked.
+        from django.db.models.functions import TruncDate
+        daily_activity = list(
+            event_qs.filter(created_at__gte=recent_cutoff)
+            .annotate(day=TruncDate('created_at'))
+            .values('day').annotate(count=Count('id')).order_by('-day')
+        )
+
         return Response({
             'total_questions': total_questions,
             'attempted': attempted,
@@ -903,6 +1075,12 @@ class QuestionViewSet(viewsets.ModelViewSet):
             'weak': attempt_qs.filter(mastery_status='weak').count(),
             'need_practice': attempt_qs.filter(mastery_status__in=['need_practice', 'learning']).count(),
             'need_revision': attempt_qs.filter(revision_due_at__lte=timezone.now()).count(),
+            'due_today': due_today,
+            'overdue': overdue,
+            'repeated_mistakes': repeated_mistakes,
+            'recent_mistakes': recent_mistakes,
+            'revision_accuracy': revision_accuracy,
+            'daily_activity': [{'date': row['day'].isoformat(), 'count': row['count']} for row in daily_activity],
             'topics_practiced': topics_practiced,
             'study_seconds': study_seconds,
         })
@@ -913,13 +1091,34 @@ class QuestionViewSet(viewsets.ModelViewSet):
         plus a filtered/ordered list. scope=frequent orders by how many
         times this question has been gotten wrong; scope=recent uses the
         QuestionEvent log (QuestionAttempt.answered_at is set only once, on
-        first attempt, so it can't answer "most recently wrong")."""
+        first attempt, so it can't answer "most recently wrong").
+
+        QBank 2.0 Phase 3E: previously had no course scoping at all (the
+        documented inconsistency vs. Bookmarks, which already filters by
+        ?course=). Two fixes, both mirroring patterns already used
+        elsewhere in this file: an optional ?course= narrows to one active
+        course (same Q_course pattern as dashboard()/practice_session()),
+        and — because this action returns full question CONTENT for
+        display/practice, unlike dashboard()'s counts-only response — a
+        question_course_scoped() filter is now applied unconditionally, so
+        a question a student can no longer access (lapsed course/subject
+        access) never appears here merely because a historical
+        QuestionAttempt row exists for it."""
+        from django.db.models import Q as Q_mistakes
+
         user = request.user
         locked = _locked_subject_ids(user)
+        course = request.query_params.get('course')
 
         base = QuestionAttempt.objects.filter(user=user, last_result=False)
+        base = base.filter(question__in=_question_course_scoped(Question.objects.all(), user))
         if locked:
             base = base.exclude(question__subject_id__in=locked)
+        if course:
+            base = base.filter(
+                Q_mistakes(question__courses__id=course)
+                | Q_mistakes(question__courses__isnull=True, question__subject__courses__id=course)
+            )
 
         by_subject = list(
             base.values('question__subject_id', 'question__subject__name')
@@ -950,8 +1149,23 @@ class QuestionViewSet(viewsets.ModelViewSet):
             attempts = list(qs.order_by('-incorrect_count')[:100])
 
         questions = [a.question for a in attempts]
+        # QBank 2.0 Phase 3D: attach the same *_for_user fields
+        # get_queryset()/practice_session() annotate via Subquery — here
+        # the QuestionAttempt row is already loaded (no extra query at
+        # all), so this is a plain attribute assignment, not a second
+        # mastery/history mechanism. Fixes the pre-existing bug where this
+        # page's mastery badge never rendered (mastery_status_for_user was
+        # never set, so QuestionSerializer always fell back to 'new').
+        by_qid_attempt = {a.question_id: a for a in attempts}
         for q in questions:
-            q.is_bookmarked_by_user = next((a.is_bookmarked for a in attempts if a.question_id == q.id), False)
+            attempt = by_qid_attempt.get(q.id)
+            q.is_bookmarked_by_user = attempt.is_bookmarked if attempt else False
+            q.mastery_status_for_user = attempt.mastery_status if attempt else None
+            q.incorrect_count_for_user = attempt.incorrect_count if attempt else None
+            q.attempts_count_for_user = attempt.attempts_count if attempt else None
+            q.confidence_for_user = attempt.confidence if attempt else None
+            q.answered_at_for_user = attempt.answered_at if attempt else None
+            q.revision_due_at_for_user = attempt.revision_due_at if attempt else None
 
         return Response({
             'by_subject': [
@@ -1123,11 +1337,31 @@ class QuestionViewSet(viewsets.ModelViewSet):
             mastery_status_for_user=Subquery(attempt_for_user.values('mastery_status')[:1]),
             last_result_for_user=Subquery(attempt_for_user.values('last_result')[:1]),
             revision_due_at_for_user=Subquery(attempt_for_user.values('revision_due_at')[:1]),
+            # QBank 2.0 Phase 3: same fields added to get_queryset()'s own
+            # annotation block — see that comment. Needed here so
+            # smart_revision's ranking below (and the Revision Center's
+            # transparent "why this question" text) can read them.
+            incorrect_count_for_user=Subquery(attempt_for_user.values('incorrect_count')[:1]),
+            confidence_for_user=Subquery(attempt_for_user.values('confidence')[:1]),
         )
 
-        # random_sample() replaces `.order_by('?')[:count]` — see
-        # academics/random_sample.py for why ORDER BY RAND() doesn't scale.
-        questions = random_sample(qs.distinct(), count)
+        # QBank 2.0 Phase 3B — Smart Revision: opt-in only (every existing
+        # caller — Quick Practice, Smart Practice tiles, the manual
+        # builder — omits this flag and gets byte-for-byte the same
+        # random_sample() behavior as before). A revision session only
+        # makes sense over questions this student has actually attempted
+        # (a never-seen question has no mastery/revision signal to act
+        # on), then ranked by a transparent, documented priority — never
+        # a second mastery/spaced-repetition algorithm, just an ordering
+        # over the same QuestionAttempt fields already computed elsewhere.
+        if data.get('smart_revision'):
+            qs = qs.filter(mastery_status_for_user__isnull=False)
+            questions = _rank_for_smart_revision(qs.distinct(), count)
+        else:
+            # random_sample() replaces `.order_by('?')[:count]` — see
+            # academics/random_sample.py for why ORDER BY RAND() doesn't scale.
+            questions = random_sample(qs.distinct(), count)
+
         bookmarked_ids = set(
             QuestionAttempt.objects.filter(user=user, question__in=questions, is_bookmarked=True)
             .values_list('question_id', flat=True)

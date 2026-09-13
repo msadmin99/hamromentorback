@@ -4377,3 +4377,300 @@ class Phase5ConfigurationConsistencyTests(APITestCase):
                 f'{field} differs between Create and Import for {exam_type}: '
                 f'{getattr(wizard_test, field)!r} != {getattr(import_test, field)!r}',
             )
+
+
+class RevisionStatusFilterTests(APITestCase):
+    """QBank 2.0 Phase 3: the four new _status_question_ids() keywords
+    (overdue, due_today, repeated_mistake, recent_mistake), exercised
+    through the real /questions/practice-session/ endpoint exactly like
+    the existing 'new'/'weak' status tests above."""
+
+    def setUp(self):
+        self.student = User.objects.create_user(username='revstatus', email='revstatus@example.com', password='pw12345')
+        self.subject = Subject.objects.create(name='Revision Status Subject')
+        self.overdue_q = Question.objects.create(subject=self.subject, text='Overdue question')
+        self.due_today_q = Question.objects.create(subject=self.subject, text='Due today question')
+        self.not_due_q = Question.objects.create(subject=self.subject, text='Not due question')
+        self.repeated_q = Question.objects.create(subject=self.subject, text='Repeated mistake question')
+        self.once_wrong_q = Question.objects.create(subject=self.subject, text='Wrong once question')
+        self.client.force_authenticate(user=self.student)
+
+    def _attempt_for(self, question):
+        return QuestionAttempt.objects.get(user=self.student, question=question)
+
+    def test_overdue_status_matches_only_past_due_questions(self):
+        from academics.services import record_question_result
+
+        record_question_result(self.student, self.overdue_q, False, source='qbank')
+        record_question_result(self.student, self.not_due_q, True, source='qbank')
+
+        overdue_attempt = self._attempt_for(self.overdue_q)
+        overdue_attempt.revision_due_at = timezone.now() - timezone.timedelta(days=2)
+        overdue_attempt.save(update_fields=['revision_due_at'])
+
+        resp = self.client.post('/api/questions/practice-session/', {'status': ['overdue'], 'count': 50}, format='json')
+        ids = {q['id'] for q in resp.data}
+        self.assertEqual(ids, {self.overdue_q.id})
+
+    def test_due_today_status_excludes_overdue_and_not_yet_due(self):
+        from academics.services import record_question_result
+
+        record_question_result(self.student, self.overdue_q, False, source='qbank')
+        record_question_result(self.student, self.due_today_q, False, source='qbank')
+        record_question_result(self.student, self.not_due_q, True, source='qbank')
+
+        self._attempt_for(self.overdue_q).revision_due_at = timezone.now() - timezone.timedelta(days=2)
+        self._attempt_for(self.overdue_q).save()
+        due_today_attempt = self._attempt_for(self.due_today_q)
+        due_today_attempt.revision_due_at = timezone.now()
+        due_today_attempt.save(update_fields=['revision_due_at'])
+        not_due_attempt = self._attempt_for(self.not_due_q)
+        not_due_attempt.revision_due_at = timezone.now() + timezone.timedelta(days=6)
+        not_due_attempt.save(update_fields=['revision_due_at'])
+
+        resp = self.client.post('/api/questions/practice-session/', {'status': ['due_today'], 'count': 50}, format='json')
+        ids = {q['id'] for q in resp.data}
+        self.assertEqual(ids, {self.due_today_q.id})
+
+    def test_repeated_mistake_requires_at_least_two_wrong_answers(self):
+        from academics.services import record_question_result
+
+        record_question_result(self.student, self.repeated_q, False, source='qbank')
+        record_question_result(self.student, self.repeated_q, False, source='qbank')
+        record_question_result(self.student, self.once_wrong_q, False, source='qbank')
+
+        resp = self.client.post('/api/questions/practice-session/', {'status': ['repeated_mistake'], 'count': 50}, format='json')
+        ids = {q['id'] for q in resp.data}
+        self.assertEqual(ids, {self.repeated_q.id})
+
+    def test_recent_mistake_uses_a_real_time_window(self):
+        from academics.services import record_question_result
+
+        record_question_result(self.student, self.once_wrong_q, False, source='qbank')
+        record_question_result(self.student, self.repeated_q, False, source='qbank')
+        QuestionEvent.objects.filter(user=self.student, question=self.repeated_q).update(
+            created_at=timezone.now() - timezone.timedelta(days=30)
+        )
+
+        resp = self.client.post('/api/questions/practice-session/', {'status': ['recent_mistake'], 'count': 50}, format='json')
+        ids = {q['id'] for q in resp.data}
+        self.assertIn(self.once_wrong_q.id, ids)
+        self.assertNotIn(self.repeated_q.id, ids)
+
+
+class SmartRevisionOrderingTests(APITestCase):
+    """QBank 2.0 Phase 3B: smart_revision must rank overdue+weak+repeated
+    questions ahead of merely-due, mastered questions — not database id or
+    random order — and must never include a never-attempted question."""
+
+    def setUp(self):
+        self.student = User.objects.create_user(username='smartrev', email='smartrev@example.com', password='pw12345')
+        self.subject = Subject.objects.create(name='Smart Revision Subject')
+        # Created in an order that would put the LEAST important question
+        # first by id, so a naive id/insertion-order sort would fail this
+        # test — the ranking must actually reorder them.
+        self.mastered_q = Question.objects.create(subject=self.subject, text='Mastered, due today')
+        self.learning_q = Question.objects.create(subject=self.subject, text='Learning, due today, wrong once')
+        self.weak_overdue_q = Question.objects.create(subject=self.subject, text='Weak, overdue, wrong 3 times')
+        self.never_attempted_q = Question.objects.create(subject=self.subject, text='Never attempted')
+        self.client.force_authenticate(user=self.student)
+
+    def test_priority_order_and_never_attempted_excluded(self):
+        from academics.services import record_question_result
+
+        record_question_result(self.student, self.mastered_q, True, source='qbank')
+        record_question_result(self.student, self.mastered_q, True, source='qbank')
+
+        record_question_result(self.student, self.learning_q, False, source='qbank')
+
+        record_question_result(self.student, self.weak_overdue_q, False, source='qbank')
+        record_question_result(self.student, self.weak_overdue_q, False, source='qbank')
+        record_question_result(self.student, self.weak_overdue_q, False, source='qbank')
+        weak_attempt = QuestionAttempt.objects.get(user=self.student, question=self.weak_overdue_q)
+        weak_attempt.revision_due_at = timezone.now() - timezone.timedelta(days=5)
+        weak_attempt.save(update_fields=['revision_due_at'])
+
+        resp = self.client.post(
+            '/api/questions/practice-session/', {'smart_revision': True, 'count': 10}, format='json', HTTP_ACCEPT='application/json',
+        )
+        ids = [q['id'] for q in resp.data]
+
+        self.assertNotIn(self.never_attempted_q.id, ids, 'a question with no attempt history must never appear in Smart Revision')
+        self.assertIn(self.weak_overdue_q.id, ids)
+        self.assertIn(self.learning_q.id, ids)
+        self.assertIn(self.mastered_q.id, ids)
+        self.assertLess(
+            ids.index(self.weak_overdue_q.id), ids.index(self.learning_q.id),
+            'the weak, overdue, repeatedly-wrong question must rank ahead of the merely-due learning question',
+        )
+        self.assertLess(
+            ids.index(self.learning_q.id), ids.index(self.mastered_q.id),
+            'a learning question due today must rank ahead of an already-mastered question',
+        )
+
+    def test_revision_reason_is_present_and_matches_the_top_factor(self):
+        from academics.services import record_question_result
+
+        record_question_result(self.student, self.weak_overdue_q, False, source='qbank')
+        record_question_result(self.student, self.weak_overdue_q, False, source='qbank')
+        attempt = QuestionAttempt.objects.get(user=self.student, question=self.weak_overdue_q)
+        attempt.revision_due_at = timezone.now() - timezone.timedelta(days=4)
+        attempt.save(update_fields=['revision_due_at'])
+
+        resp = self.client.post('/api/questions/practice-session/', {'smart_revision': True, 'count': 10}, format='json')
+        by_id = {q['id']: q for q in resp.data}
+        self.assertIn('Overdue by', by_id[self.weak_overdue_q.id]['revision_reason'])
+
+    def test_smart_revision_still_respects_course_and_subject_locking(self):
+        from courses.models import Course, Enrollment
+
+        course = Course.objects.create(name='Smart Revision Course', prefix='SMARTREV')
+        Enrollment.objects.create(user=self.student, course=course)
+        self.subject.courses.set([course])
+
+        other_course = Course.objects.create(name='Other Course', prefix='OTHERREV')
+        other_subject = Subject.objects.create(name='Other Subject')
+        other_subject.courses.set([other_course])
+        other_q = Question.objects.create(subject=other_subject, text='Not this students course')
+
+        # Force an attempt to exist even though the student has no access
+        # to this course anymore (e.g. a lapsed enrollment) — the point of
+        # this test is that history alone must never grant visibility.
+        QuestionAttempt.objects.create(user=self.student, question=other_q, mastery_status='weak', attempts_count=1, incorrect_count=1)
+
+        resp = self.client.post('/api/questions/practice-session/', {'smart_revision': True, 'count': 50}, format='json')
+        ids = {q['id'] for q in resp.data}
+        self.assertNotIn(other_q.id, ids, 'a question outside the students enrolled course must never leak into Smart Revision')
+
+
+class DashboardRevisionSummaryTests(APITestCase):
+    """QBank 2.0 Phase 3A/3H: dashboard()'s new due_today/overdue/
+    repeated_mistakes/recent_mistakes/revision_accuracy/daily_activity
+    fields."""
+
+    def setUp(self):
+        self.student = User.objects.create_user(username='dashrev', email='dashrev@example.com', password='pw12345')
+        self.subject = Subject.objects.create(name='Dashboard Revision Subject', is_free=True)
+        self.q1 = Question.objects.create(subject=self.subject, text='Q1')
+        self.q2 = Question.objects.create(subject=self.subject, text='Q2')
+        self.client.force_authenticate(user=self.student)
+
+    def test_zero_state_never_errors_and_reports_none_for_revision_accuracy(self):
+        resp = self.client.get('/api/questions/dashboard/')
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data['due_today'], 0)
+        self.assertEqual(resp.data['overdue'], 0)
+        self.assertEqual(resp.data['repeated_mistakes'], 0)
+        self.assertEqual(resp.data['recent_mistakes'], 0)
+        self.assertIsNone(resp.data['revision_accuracy'])
+        self.assertEqual(resp.data['daily_activity'], [])
+
+    def test_overdue_and_due_today_counts_are_mutually_exclusive(self):
+        from academics.services import record_question_result
+
+        record_question_result(self.student, self.q1, False, source='qbank')
+        record_question_result(self.student, self.q2, False, source='qbank')
+        a1 = QuestionAttempt.objects.get(user=self.student, question=self.q1)
+        a1.revision_due_at = timezone.now() - timezone.timedelta(days=3)
+        a1.save(update_fields=['revision_due_at'])
+        a2 = QuestionAttempt.objects.get(user=self.student, question=self.q2)
+        a2.revision_due_at = timezone.now()
+        a2.save(update_fields=['revision_due_at'])
+
+        resp = self.client.get('/api/questions/dashboard/')
+        self.assertEqual(resp.data['overdue'], 1)
+        self.assertEqual(resp.data['due_today'], 1)
+
+    def test_repeated_mistakes_count_matches_the_documented_threshold(self):
+        from academics.services import record_question_result
+
+        record_question_result(self.student, self.q1, False, source='qbank')
+        record_question_result(self.student, self.q1, False, source='qbank')
+        record_question_result(self.student, self.q2, False, source='qbank')
+
+        resp = self.client.get('/api/questions/dashboard/')
+        self.assertEqual(resp.data['repeated_mistakes'], 1)
+
+
+class MistakesEnrichmentAndCourseScopingTests(APITestCase):
+    """QBank 2.0 Phase 3D/3E: mistakes() bug fix (mastery_status/incorrect_
+    count/confidence/last_attempted_at now populated, previously always
+    'new'/None) and the new course scoping (previously entirely absent)."""
+
+    def setUp(self):
+        from courses.models import Course, Enrollment
+
+        self.student = User.objects.create_user(username='mistakescope', email='mistakescope@example.com', password='pw12345')
+        self.course_a = Course.objects.create(name='Mistakes Course A', prefix='MISTAKEA')
+        self.course_b = Course.objects.create(name='Mistakes Course B', prefix='MISTAKEB')
+        Enrollment.objects.create(user=self.student, course=self.course_a)
+        Enrollment.objects.create(user=self.student, course=self.course_b)
+
+        self.subject_a = Subject.objects.create(name='Mistakes Subject A', is_free=True)
+        self.subject_a.courses.set([self.course_a])
+        self.subject_b = Subject.objects.create(name='Mistakes Subject B', is_free=True)
+        self.subject_b.courses.set([self.course_b])
+
+        self.q_a = Question.objects.create(subject=self.subject_a, text='Course A question')
+        self.q_b = Question.objects.create(subject=self.subject_b, text='Course B question')
+        self.client.force_authenticate(user=self.student)
+
+    def test_mastery_status_and_wrong_count_are_populated_not_always_new(self):
+        from academics.services import record_question_result
+
+        record_question_result(self.student, self.q_a, False, source='qbank')
+        record_question_result(self.student, self.q_a, False, source='qbank')
+        attempt = QuestionAttempt.objects.get(user=self.student, question=self.q_a)
+
+        resp = self.client.get('/api/questions/mistakes/')
+        row = next(r for r in resp.data['results'] if r['id'] == self.q_a.id)
+        self.assertEqual(row['mastery_status'], attempt.mastery_status)
+        self.assertNotEqual(row['mastery_status'], 'new')
+        self.assertEqual(row['incorrect_count'], 2)
+
+    def test_confidence_is_exposed_for_confidence_trap_detection(self):
+        from academics.services import record_question_result
+
+        record_question_result(self.student, self.q_a, False, source='qbank', confidence='confident')
+
+        resp = self.client.get('/api/questions/mistakes/')
+        row = next(r for r in resp.data['results'] if r['id'] == self.q_a.id)
+        self.assertEqual(row['confidence'], 'confident')
+
+    def test_course_param_narrows_to_the_selected_course_only(self):
+        from academics.services import record_question_result
+
+        record_question_result(self.student, self.q_a, False, source='qbank')
+        record_question_result(self.student, self.q_b, False, source='qbank')
+
+        resp = self.client.get(f'/api/questions/mistakes/?course={self.course_a.id}')
+        ids = {r['id'] for r in resp.data['results']}
+        self.assertEqual(ids, {self.q_a.id})
+
+    def test_no_course_param_returns_mistakes_across_all_enrolled_courses(self):
+        from academics.services import record_question_result
+
+        record_question_result(self.student, self.q_a, False, source='qbank')
+        record_question_result(self.student, self.q_b, False, source='qbank')
+
+        resp = self.client.get('/api/questions/mistakes/')
+        ids = {r['id'] for r in resp.data['results']}
+        self.assertEqual(ids, {self.q_a.id, self.q_b.id})
+
+    def test_question_outside_any_accessible_course_never_leaks_into_mistakes(self):
+        from academics.services import record_question_result
+
+        from courses.models import Course
+
+        outside_course = Course.objects.create(name='Outside Course', prefix='OUTSIDEMISTAKE')
+        outside_subject = Subject.objects.create(name='Outside Subject', is_free=True)
+        outside_subject.courses.set([outside_course])
+        outside_q = Question.objects.create(subject=outside_subject, text='Outside question')
+
+        # A historical attempt exists (e.g. the student was once enrolled)
+        # but they are NOT currently enrolled in outside_course.
+        QuestionAttempt.objects.create(user=self.student, question=outside_q, last_result=False, incorrect_count=1, attempts_count=1)
+
+        resp = self.client.get('/api/questions/mistakes/')
+        ids = {r['id'] for r in resp.data['results']}
+        self.assertNotIn(outside_q.id, ids)
