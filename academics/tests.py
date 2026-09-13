@@ -4810,3 +4810,175 @@ class QuestionProgressEndpointTests(APITestCase):
         resp = self.client.get('/api/questions/progress/')
         subject_ids = {row['subject_id'] for row in resp.data['by_subject']}
         self.assertNotIn(pro_subject.id, subject_ids)
+
+
+class QuestionCourseFilterFallbackTests(APITestCase):
+    """Production audit P0-1 regression suite: QuestionViewSet.get_queryset()'s
+    explicit ?course= filter used to check ONLY Question.courses, silently
+    excluding any question relying on its Subject's course scope (the
+    documented, overwhelmingly common real-data shape — Question.courses is
+    blank on virtually every real question). Reproduces the exact failure
+    from the Phase 5 production acceptance audit:
+      GET /questions/?bookmarked=true            -> returns the question
+      GET /questions/?bookmarked=true&course=X   -> incorrectly returned []
+      GET /questions/{id}/?course=X              -> incorrectly 404'd
+    """
+
+    def setUp(self):
+        self.student = User.objects.create_user(username='p0student', email='p0student@example.com', password='pw12345')
+        from courses.models import Course as _Course, Enrollment as _Enrollment
+        self.course_a = _Course.objects.create(name='P0 Course A', prefix='P0COURSEA')
+        self.course_b = _Course.objects.create(name='P0 Course B', prefix='P0COURSEB')
+        _Enrollment.objects.create(user=self.student, course=self.course_a)
+
+        # TEST 1/2 fixture: Question.courses BLANK, Subject.courses = Course A
+        # (the real-data shape).
+        self.subject_inherited = Subject.objects.create(name='P0 Subject Inherited', is_free=True)
+        self.subject_inherited.courses.set([self.course_a])
+        self.question_inherited = Question.objects.create(subject=self.subject_inherited, text='Inherited-scope question')
+        # Question.courses deliberately left untouched (blank).
+
+        # TEST 3/4 fixture: Question.courses EXPLICITLY set to Course A only.
+        self.subject_explicit = Subject.objects.create(name='P0 Subject Explicit', is_free=True)
+        self.subject_explicit.courses.set([self.course_a])
+        self.question_explicit = Question.objects.create(subject=self.subject_explicit, text='Explicit-scope question')
+        self.question_explicit.courses.set([self.course_a])
+
+        # TEST 5 fixture: Pro-locked subject, inherited scope, historical attempt.
+        self.subject_pro = Subject.objects.create(name='P0 Pro Subject', is_free=False)
+        self.subject_pro.courses.set([self.course_a])
+        self.question_pro = Question.objects.create(subject=self.subject_pro, text='Pro-locked question')
+
+        self.client.force_authenticate(user=self.student)
+
+    def test_1_bookmarked_question_with_inherited_course_scope_appears_under_explicit_course_filter(self):
+        self.client.post(f'/api/questions/{self.question_inherited.id}/bookmark/', {'bookmark': True}, format='json')
+
+        resp_no_course = self.client.get('/api/questions/?bookmarked=true')
+        resp_with_course = self.client.get(f'/api/questions/?bookmarked=true&course={self.course_a.id}')
+
+        ids_no_course = {q['id'] for q in resp_no_course.data}
+        ids_with_course = {q['id'] for q in resp_with_course.data}
+        self.assertIn(self.question_inherited.id, ids_no_course)
+        self.assertIn(
+            self.question_inherited.id, ids_with_course,
+            'a question inheriting its Subject\'s course scope must not disappear once ?course= is passed',
+        )
+
+    def test_2_single_question_retrieve_with_course_param_does_not_404(self):
+        resp = self.client.get(f'/api/questions/{self.question_inherited.id}/?course={self.course_a.id}')
+        self.assertEqual(resp.status_code, 200)
+
+    def test_3_explicit_course_tag_still_excludes_a_different_course(self):
+        from courses.models import Enrollment
+        Enrollment.objects.create(user=self.student, course=self.course_b)
+        resp = self.client.get(f'/api/questions/?course={self.course_b.id}')
+        ids = {q['id'] for q in resp.data}
+        self.assertNotIn(self.question_explicit.id, ids, 'a question explicitly tagged to Course A must not appear under Course B')
+
+    def test_4_explicit_course_tag_still_included_for_the_correct_course(self):
+        resp = self.client.get(f'/api/questions/?course={self.course_a.id}')
+        ids = {q['id'] for q in resp.data}
+        self.assertIn(self.question_explicit.id, ids)
+
+    def test_5_pro_locked_subject_still_excluded_even_with_course_param(self):
+        resp = self.client.get(f'/api/questions/?course={self.course_a.id}')
+        ids = {q['id'] for q in resp.data}
+        self.assertNotIn(self.question_pro.id, ids, 'the P0 fix must not weaken Pro-subject locking')
+
+    def test_6_browse_overdue_count_now_matches_dashboard_overdue_count(self):
+        from academics.services import record_question_result
+
+        record_question_result(self.student, self.question_inherited, False, source='qbank')
+        attempt = QuestionAttempt.objects.get(user=self.student, question=self.question_inherited)
+        attempt.revision_due_at = timezone.now() - timezone.timedelta(days=2)
+        attempt.save(update_fields=['revision_due_at'])
+
+        dash = self.client.get(f'/api/questions/dashboard/?course={self.course_a.id}').data
+        browse = self.client.get(f'/api/questions/browse/?status=overdue&course={self.course_a.id}&page_size=50').data
+
+        self.assertEqual(
+            browse['count'], dash['overdue'],
+            'Revision Center summary count and category list count must agree once P0-1 is fixed',
+        )
+        self.assertEqual(dash['overdue'], 1)
+
+
+class DashboardLockedSubjectExclusionTests(APITestCase):
+    """Production audit P1-1 regression suite: dashboard()'s attempt_qs/
+    event_qs never excluded currently Pro-locked subjects (only
+    question_qs/total_questions did) — a student's historical QBank
+    activity on a subject they've since lost access to kept inflating
+    every derived dashboard metric. Fixed to match progress()'s own
+    already-correct exclusion."""
+
+    def setUp(self):
+        self.student = User.objects.create_user(username='p1student', email='p1student@example.com', password='pw12345')
+        QuestionBankConfig.objects.create(pk=1)
+
+        # Subject A: accessible at the time of the attempt, then Pro-locked
+        # (is_free=False, no active subscription for this student) —
+        # exactly the "student no longer has valid access" scenario.
+        self.subject = Subject.objects.create(name='P1 Subject', is_free=False)
+        self.question = Question.objects.create(subject=self.subject, text='Now-inaccessible question')
+        self.client.force_authenticate(user=self.student)
+
+    def test_locked_subject_history_excluded_from_every_dashboard_metric(self):
+        from academics.services import record_question_result
+
+        # Answer it wrong 3 times (repeated mistake), then set it overdue,
+        # and log a QuestionEvent too — populates every metric this bug affects.
+        record_question_result(self.student, self.question, False, source='qbank')
+        record_question_result(self.student, self.question, False, source='qbank')
+        record_question_result(self.student, self.question, False, source='qbank')
+        attempt = QuestionAttempt.objects.get(user=self.student, question=self.question)
+        attempt.revision_due_at = timezone.now() - timezone.timedelta(days=3)
+        attempt.save(update_fields=['revision_due_at'])
+
+        # Sanity: the subject is genuinely locked for this student (no
+        # active QBank subscription, is_free=False).
+        from academics.access import locked_subject_ids
+        self.assertIn(self.subject.id, locked_subject_ids(self.student))
+
+        data = self.client.get('/api/questions/dashboard/').data
+
+        self.assertEqual(data['attempted'], 0, 'attempted must exclude the locked subject')
+        self.assertEqual(data['correct'], 0)
+        self.assertEqual(data['incorrect'], 0)
+        self.assertEqual(data['weak'], 0)
+        self.assertEqual(data['mastered'], 0)
+        self.assertEqual(data['need_practice'], 0)
+        self.assertEqual(data['need_revision'], 0)
+        self.assertEqual(data['due_today'], 0)
+        self.assertEqual(data['overdue'], 0)
+        self.assertEqual(data['repeated_mistakes'], 0)
+        self.assertEqual(data['recent_mistakes'], 0)
+        self.assertIsNone(data['revision_accuracy'])
+        self.assertEqual(data['daily_activity'], [])
+        self.assertEqual(data['study_seconds'], 0)
+
+    def test_accessible_subject_history_still_counted(self):
+        from academics.services import record_question_result
+
+        open_subject = Subject.objects.create(name='P1 Open Subject', is_free=True)
+        open_question = Question.objects.create(subject=open_subject, text='Accessible question')
+        record_question_result(self.student, open_question, True, source='qbank')
+
+        data = self.client.get('/api/questions/dashboard/').data
+        self.assertEqual(data['attempted'], 1)
+        self.assertEqual(data['correct'], 1)
+
+    def test_dashboard_and_progress_apply_the_same_authorization_scope(self):
+        """Part 6 cross-check: dashboard() and progress() don't have to
+        return identical shapes, but the authorized population underneath
+        must be consistent — the locked subject must be invisible to both."""
+        from academics.services import record_question_result
+
+        record_question_result(self.student, self.question, False, source='qbank')
+
+        dash = self.client.get('/api/questions/dashboard/').data
+        prog = self.client.get('/api/questions/progress/').data
+
+        self.assertEqual(dash['attempted'], 0)
+        subj_ids_in_progress = {row['subject_id'] for row in prog['by_subject']}
+        self.assertNotIn(self.subject.id, subj_ids_in_progress)

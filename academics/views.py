@@ -525,14 +525,24 @@ class QuestionViewSet(viewsets.ModelViewSet):
         if year:
             qs = qs.filter(year=year)
         if course:
-            # Scalability audit Fix 2: was qs.filter(courses__id=course) —
-            # a JOIN to the same Question.courses M2M table as
-            # question_course_scoped() below. This one value can only
-            # ever match one M2M row per question (no fan-out on its own),
-            # but converting it to EXISTS keeps every course-related
-            # filter on this queryset off the JOIN path consistently, per
-            # the approved fix scope.
-            qs = qs.filter(Exists(Question.courses.through.objects.filter(question_id=OuterRef('pk'), course_id=course)))
+            # Production audit P0-1 fix: this used to be
+            # Exists(Question.courses.through.objects.filter(...course_id=course))
+            # ALONE — matching only a question's own explicit Question.courses
+            # tag. In real production data Question.courses is blank on
+            # virtually every question (the same fact documented at
+            # dashboard()/progress()'s own course filters below) — a
+            # question relying on its Subject's course scope was silently
+            # excluded the instant a caller passed ?course=, which is
+            # exactly the reproduced bug (GET /questions/?bookmarked=true
+            # returns a question; the same request with &course=<the
+            # student's own enrolled course> incorrectly returns empty,
+            # and GET /questions/{id}/?course=... incorrectly 404s).
+            # Every OTHER course filter in this file already uses this
+            # exact OR-with-subject-fallback shape (see dashboard()'s/
+            # progress()'s question_qs filters just below) — this was the
+            # one outlier, now brought in line with the proven pattern.
+            from django.db.models import Q as Q_qcourse
+            qs = qs.filter(Q_qcourse(courses__id=course) | Q_qcourse(courses__isnull=True, subject__courses__id=course))
         if teacher:
             qs = qs.filter(created_by_id=teacher)
         if search:
@@ -984,6 +994,18 @@ class QuestionViewSet(viewsets.ModelViewSet):
         total_questions = question_qs.distinct().count()
 
         attempt_qs = QuestionAttempt.objects.filter(user=user, attempts_count__gt=0)
+        # Production audit P1-1 fix: `locked` (above) was already applied to
+        # question_qs (total_questions) but never to attempt_qs/event_qs —
+        # every metric derived from those two (attempted/correct/incorrect/
+        # accuracy/mastered/weak/need_practice/need_revision/due_today/
+        # overdue/repeated_mistakes/recent_mistakes/revision_accuracy/
+        # daily_activity/study_seconds) kept counting historical QBank
+        # activity on a subject the student no longer has access to.
+        # Same exclusion progress() already applies correctly (see its own
+        # attempt_qs/event_qs construction) — this brings dashboard() in
+        # line with it, not a new authorization rule.
+        if locked:
+            attempt_qs = attempt_qs.exclude(question__subject_id__in=locked)
         if subject:
             attempt_qs = attempt_qs.filter(question__subject__slug=subject)
         if course:
@@ -1002,6 +1024,8 @@ class QuestionViewSet(viewsets.ModelViewSet):
         # Mode time, since this dashboard is QBank-scoped throughout; test
         # time already has its own home in kpi_overview()'s total_study_seconds.
         event_qs = QuestionEvent.objects.filter(user=user, source='qbank')
+        if locked:
+            event_qs = event_qs.exclude(question__subject_id__in=locked)
         if subject:
             event_qs = event_qs.filter(question__subject__slug=subject)
         if course:
