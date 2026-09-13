@@ -239,11 +239,21 @@ class SessionAnswerView(APIView):
                 for opt in Option.objects.filter(question_id=question.id).order_by('order')
             ]
 
+        # Explanation redesign — same tiny compatibility fix as
+        # QuestionViewSet.answer() (academics/views.py), which this view's
+        # own docstring already says to mirror exactly: resolve the
+        # optimized media_library asset the same way every Test-mode
+        # result screen already does, so an explanation image doesn't
+        # silently disappear here just because it was authored with only
+        # the newer asset field set.
+        from media_library.serializers import resolve_image_data
+
         return Response({
             'is_correct': sq.is_correct,
             'correct_option_id': correct_option.id if correct_option else None,
             'explanation': question.explanation,
             'explanation_image': request.build_absolute_uri(question.explanation_image.url) if question.explanation_image else None,
+            'explanation_image_data': resolve_image_data(question.explanation_image_asset, question.explanation_image),
             'explanation_latex': question.explanation_latex,
             'explanation_video_url': question.explanation_video_url,
             'references': question.references,

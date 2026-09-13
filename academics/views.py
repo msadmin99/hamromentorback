@@ -852,11 +852,25 @@ class QuestionViewSet(viewsets.ModelViewSet):
                 for e in QuestionEvent.objects.filter(user=request.user, question=question).order_by('-created_at')[:10]
             ]
 
+        # Explanation redesign (frontend presentation audit finding A):
+        # every other explanation surface (QuestionResultSerializer,
+        # MissedReviewQuestionSerializer, AttemptQuestionSnapshotResult-
+        # Serializer) resolves the optimized/responsive media_library asset
+        # first, falling back to the legacy raw field — this endpoint never
+        # did, so an explanation authored with only the newer
+        # explanation_image_asset set (no legacy explanation_image) showed
+        # no image at all in QBank practice while showing correctly on
+        # every Test result screen. Additive field, same resolution helper
+        # already used everywhere else — no schema change, no behavior
+        # change for existing rows that still have the legacy field set.
+        from media_library.serializers import resolve_image_data
+
         return Response({
             'is_correct': is_correct,
             'correct_option_id': correct_option.id if correct_option else None,
             'explanation': question.explanation,
             'explanation_image': request.build_absolute_uri(question.explanation_image.url) if question.explanation_image else None,
+            'explanation_image_data': resolve_image_data(question.explanation_image_asset, question.explanation_image),
             'explanation_latex': question.explanation_latex,
             'explanation_video_url': question.explanation_video_url,
             'references': question.references,
