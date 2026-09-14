@@ -29,7 +29,17 @@ steps:
       # has a problem: it disables stats processing entirely rather than
       # falling back to the deadlock-prone synchronous per-question
       # locking.
-      - --set-env-vars=DB_NAME=hamromentor,DB_USER=hamromentor_app,DB_HOST=/cloudsql/hamromentor-app:us-central1:hamromentor-db-uc1,DJANGO_DEBUG=False,GCP_PROJECT_ID=hamromentor-app,GCP_REGION=us-central1,MEDIA_GCS_PRIVATE_BUCKET=hamromentor-media-private,MEDIA_GCS_PUBLIC_BUCKET=hamromentor-media-public,CLOUD_TASKS_QUEUE=image-processing,BACKEND_INTERNAL_URL=https://api.drgutka.com,IMAGE_PROCESSING_ASYNC=True,REDIS_HOST=10.101.211.19,REDIS_PORT=6379,CLOUD_TASKS_IMPORT_QUEUE=bulk-import,IMPORT_PROCESSING_ASYNC=True,CLOUD_TASKS_STATS_QUEUE=question-stats,STATS_PROCESSING_ASYNC=True,STATS_PROCESSING_ENABLED=True,EMAIL_BACKEND=notifications.postmark_backend.EmailBackend,CLOUD_TASKS_EMAIL_QUEUE=email,EMAIL_PROCESSING_ASYNC=True,POSTMARK_API_URL=https://api.postmarkapp.com/email,POSTMARK_MESSAGE_STREAM=outbound,EMAIL_TIMEOUT=10,DEFAULT_FROM_EMAIL=Dr. Gutka <support@drgutka.com>
+      # EMAIL_TEST_ALLOWED_RECIPIENTS gates ONLY notifications.views.
+      # AdminEmailTestSendView (POST /api/notifications/email/test-send/)
+      # — the admin-only, confirmation-phrase-gated, 3/hour-throttled
+      # controlled test-send endpoint. It is read nowhere else: the real
+      # notification pipeline (services.create_notification ->
+      # email_tasks.py -> email_adapter.py -> Postmark) never checks this
+      # setting and is completely unaffected by its value. Sourced from
+      # the _EMAIL_TEST_ALLOWED_RECIPIENTS substitution (never a literal
+      # address in source control) so the actual test recipient is
+      # supplied per-deploy, not committed.
+      - --set-env-vars=DB_NAME=hamromentor,DB_USER=hamromentor_app,DB_HOST=/cloudsql/hamromentor-app:us-central1:hamromentor-db-uc1,DJANGO_DEBUG=False,GCP_PROJECT_ID=hamromentor-app,GCP_REGION=us-central1,MEDIA_GCS_PRIVATE_BUCKET=hamromentor-media-private,MEDIA_GCS_PUBLIC_BUCKET=hamromentor-media-public,CLOUD_TASKS_QUEUE=image-processing,BACKEND_INTERNAL_URL=https://api.drgutka.com,IMAGE_PROCESSING_ASYNC=True,REDIS_HOST=10.101.211.19,REDIS_PORT=6379,CLOUD_TASKS_IMPORT_QUEUE=bulk-import,IMPORT_PROCESSING_ASYNC=True,CLOUD_TASKS_STATS_QUEUE=question-stats,STATS_PROCESSING_ASYNC=True,STATS_PROCESSING_ENABLED=True,EMAIL_BACKEND=notifications.postmark_backend.EmailBackend,CLOUD_TASKS_EMAIL_QUEUE=email,EMAIL_PROCESSING_ASYNC=True,POSTMARK_API_URL=https://api.postmarkapp.com/email,POSTMARK_MESSAGE_STREAM=outbound,EMAIL_TIMEOUT=10,DEFAULT_FROM_EMAIL=Dr. Gutka <support@drgutka.com>,EMAIL_TEST_ALLOWED_RECIPIENTS=${_EMAIL_TEST_ALLOWED_RECIPIENTS}
       - --set-secrets=DB_PASSWORD=db-password:latest,DJANGO_SECRET_KEY=django-secret-key:latest,MEDIA_PROCESSING_SECRET=media-processing-secret:latest,CRON_SECRET=cron-secret:latest,IMPORT_PROCESSING_SECRET=import-processing-secret:latest,STATS_PROCESSING_SECRET=question-stats-secret:latest,POSTMARK_SERVER_TOKEN=POSTMARK_SERVER_TOKEN:latest,EMAIL_PROCESSING_SECRET=email-processing-secret:latest
       - --memory=1Gi
       - --cpu=1
@@ -38,3 +48,11 @@ images:
   - 'asia-south1-docker.pkg.dev/hamromentor-app/hamromentor-repo/backend:$COMMIT_SHA'
 options:
   logging: CLOUD_LOGGING_ONLY
+# _EMAIL_TEST_ALLOWED_RECIPIENTS: no default email address is set here on
+# purpose (never invent/commit a personal address). Left as '' so this
+# file stays valid for every normal deploy that doesn't need the test
+# endpoint enabled; supply a real value only when you actually want to
+# run the one-off admin test send (see the deploy command in the audit
+# report for the exact --substitutions flag).
+substitutions:
+  _EMAIL_TEST_ALLOWED_RECIPIENTS: ''
