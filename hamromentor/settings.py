@@ -144,6 +144,53 @@ STATS_PROCESSING_ASYNC = os.environ.get('STATS_PROCESSING_ASYNC', 'True') == 'Tr
 # worker has a problem, never a reason to revert to inline processing.
 STATS_PROCESSING_ENABLED = os.environ.get('STATS_PROCESSING_ENABLED', 'True') == 'True'
 
+# Phase 3 — Web Push notification channel. Same Cloud Tasks pattern as
+# every queue above: a dedicated queue (push traffic must never be able
+# to starve behind an unrelated bulk-import/stats backlog), a per-queue
+# shared secret matching the existing X-<Name>-Secret convention, and a
+# sync-fallback-when-off default for local development (no Cloud Tasks
+# queue to enqueue to there). See notifications/push_tasks.py.
+CLOUD_TASKS_PUSH_QUEUE = os.environ.get('CLOUD_TASKS_PUSH_QUEUE', 'web-push')
+PUSH_PROCESSING_SECRET = os.environ.get('PUSH_PROCESSING_SECRET', 'dev-push-secret-change-me')
+PUSH_PROCESSING_ASYNC = os.environ.get('PUSH_PROCESSING_ASYNC', 'False') == 'True'
+
+# VAPID keypair (RFC 8292) — identifies this server to browser push
+# services. VAPID_PRIVATE_KEY is a genuine secret (Secret-Manager-backed
+# in production, exactly like CRON_SECRET/MEDIA_PROCESSING_SECRET above —
+# see docs/PHASE_3_WEB_PUSH_READINESS.md §H). VAPID_PUBLIC_KEY is NOT
+# secret by design (every subscribing browser is handed it) but still
+# lives in Django, served to the frontend only via
+# GET /api/notifications/push/vapid-public-key/ — never committed to any
+# Frontend env file, so rotating it needs no Frontend redeploy.
+# VAPID_CLAIM_EMAIL is the contact address the spec requires servers to
+# identify themselves with; a push service may contact it if this
+# server's key is ever abusing the push service.
+# Dev-only default keypair (DEBUG only, exactly like CRON_SECRET's own
+# 'dev-cron-secret-change-me' pattern above) — a real, valid EC keypair is
+# required for pywebpush to do anything at all (an arbitrary placeholder
+# string would fail to decode), so unlike other dev-secret defaults this
+# one is a genuine, generated-for-this-repo P-256 keypair, used ONLY when
+# DEBUG and no real env var is set. Never used outside DEBUG — production
+# always sources both from Secret Manager (see docs/
+# PHASE_3_WEB_PUSH_READINESS.md §H).
+_DEV_VAPID_PRIVATE_KEY = '_50ZfU2MRwUS8SfKcUifpSAdp7Q29dwhH7oMsQjMLBA'
+_DEV_VAPID_PUBLIC_KEY = 'BL1EuGmUfW3uZRyrosRGA22iCh1jwt3ALHFk3KtsDo2cRGgMjfKXjxzN6rCAxPJ8A77LF8BI_MCqGouaZWp-q0g'
+VAPID_PRIVATE_KEY = os.environ.get('VAPID_PRIVATE_KEY', _DEV_VAPID_PRIVATE_KEY if _DEBUG_ENV else '')
+VAPID_PUBLIC_KEY = os.environ.get('VAPID_PUBLIC_KEY', _DEV_VAPID_PUBLIC_KEY if _DEBUG_ENV else '')
+VAPID_CLAIM_EMAIL = os.environ.get('VAPID_CLAIM_EMAIL', 'admin@drgutka.com')
+
+# Phase 4 — Email notification channel. Same Cloud Tasks pattern as every
+# queue above (a dedicated queue so an email backlog/failure can never
+# throttle push/stats/import traffic, a per-queue shared secret matching
+# the existing X-<Name>-Secret convention, sync-fallback-when-off for
+# local development). See notifications/email_tasks.py.
+CLOUD_TASKS_EMAIL_QUEUE = os.environ.get('CLOUD_TASKS_EMAIL_QUEUE', 'email')
+EMAIL_PROCESSING_SECRET = os.environ.get('EMAIL_PROCESSING_SECRET', 'dev-email-secret-change-me')
+EMAIL_PROCESSING_ASYNC = os.environ.get('EMAIL_PROCESSING_ASYNC', 'False') == 'True'
+EMAIL_TEST_ALLOWED_RECIPIENTS = tuple(
+    email.strip().lower() for email in os.environ.get('EMAIL_TEST_ALLOWED_RECIPIENTS', '').split(',') if email.strip()
+)
+
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.environ.get('DJANGO_DEBUG', 'True') == 'True'
 
