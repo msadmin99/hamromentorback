@@ -68,6 +68,12 @@ def adopt_test_into_template(test, requesting_user):
         created_by=requesting_user,
     )
     TestAttempt.objects.filter(test=test, session__isnull=True).update(session=session)
+    # Phase 2 notification hook deliberately NOT called here: this session
+    # is a one-time historical reconstruction of a Test's pre-existing
+    # scheduled_start/end (often already in the past by the time the first
+    # reschedule happens), not a new scheduling action a student should be
+    # notified about. schedule_session_reminders() is only ever called for
+    # the newly-created session inside create_reschedule_session() below.
     return template
 
 
@@ -113,6 +119,24 @@ def create_reschedule_session(test_id, requesting_user, *, session_name=None, st
     )
     if access_type == 'course' and access_course_ids:
         session.access_courses.set(access_course_ids)
+
+    # Phase 2 notification hook. Deliberately does NOT cancel any prior
+    # session under the same exam_template: real 'Reschedule / Schedule
+    # Again' behavior (confirmed by reading this function, not assumed)
+    # never mutates or supersedes an existing session — it always adds a
+    # new, independent ExamSession row, and this codebase allows a single
+    # Test to legitimately carry multiple concurrent sessions (see the
+    # 'Session {n}' numbering above). There is no session-to-supersede
+    # argument on this call, so auto-cancelling "the previous one" would
+    # require guessing which session the caller means — exactly the kind
+    # of invented behavior the acceptance contract prohibits. A prior
+    # session's reminders are only ever cancelled by an explicit, targeted
+    # ExamSessionViewSet.cancel() call against that specific session.
+    def _schedule_reminders():
+        from notifications.exam_integration import schedule_session_reminders
+        schedule_session_reminders(session)
+
+    transaction.on_commit(_schedule_reminders)
     return session
 
 

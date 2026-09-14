@@ -1,0 +1,63 @@
+{% comment %}
+Phase 4 — shared HTML email shell. Every value below is interpolated via
+Django's own template engine with autoescaping ON (the project-wide
+default, confirmed in hamromentor/settings.py's TEMPLATES config — no
+{% autoescape off %} anywhere in this file) — this is the actual HTML-
+injection defense for untrusted content (e.g. an Announcement's own
+message text) reaching an email, not a custom sanitizer. Do not add
+"|safe" to any variable below without a documented, specific reason.
+
+Deliberately plain, table-based HTML (not a CSS framework) — this is the
+convention real email clients need (many strip <style> blocks or ignore
+modern CSS), not a stylistic choice to redo later.
+{% endcomment %}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{ title }}</title>
+</head>
+<body style="margin:0;padding:0;background-color:#f2f5f7;font-family:Helvetica,Arial,sans-serif;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#f2f5f7;padding:24px 12px;">
+  <tr>
+    <td align="center">
+      <table role="presentation" width="480" cellpadding="0" cellspacing="0" style="max-width:480px;width:100%;background-color:#ffffff;border-radius:12px;overflow:hidden;">
+        <tr>
+          <td style="background-color:#0c1f2e;padding:22px 28px;text-align:center;">
+            <span style="color:#ffffff;font-size:19px;font-weight:bold;">Dr. <span style="color:#ff5a5f;">Gutka</span></span>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:32px 28px 8px 28px;">
+            {% if course_name %}
+            <p style="margin:0 0 10px 0;font-size:11px;font-weight:bold;letter-spacing:.05em;text-transform:uppercase;color:#2f7fb8;">{{ course_name }}</p>
+            {% endif %}
+            <h1 style="margin:0 0 16px 0;font-size:20px;line-height:1.35;color:#111827;">{{ title }}</h1>
+            <p style="margin:0 0 26px 0;font-size:15px;line-height:1.6;color:#374151;white-space:pre-line;">{{ body }}</p>
+            {% if cta_url %}
+            <table role="presentation" cellpadding="0" cellspacing="0">
+              <tr>
+                <td style="border-radius:8px;background-color:#2f7fb8;">
+                  <a href="{{ cta_url }}" style="display:inline-block;padding:12px 26px;font-size:14px;font-weight:bold;color:#ffffff;text-decoration:none;">{{ cta_label }}</a>
+                </td>
+              </tr>
+            </table>
+            {% endif %}
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:20px 28px 26px 28px;border-top:1px solid #e5e7eb;">
+            <p style="margin:0;font-size:12px;line-height:1.5;color:#9ca3af;">
+              You're receiving this because you have an account with Dr. Gutka. You can manage
+              which notifications you receive by email from your account's Notification
+              Preferences.
+            </p>
+          </td>
+        </tr>
+      </table>
+    </td>
+  </tr>
+</table>
+</body>
+</html>

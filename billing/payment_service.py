@@ -443,6 +443,8 @@ def activate(purchase_id, *, actor=None, request=None, allow_unpaid=False):
 
     record_payment_event(purchase, 'approved', previous_status, 'approved', request=request, actor=actor)
     send_payment_notification(purchase.user, 'payment_approved', purchase)
+    from notifications.billing_integration import notify_payment_approved
+    notify_payment_approved(purchase)
     return purchase
 
 

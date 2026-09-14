@@ -55,14 +55,20 @@ if not CRON_SECRET and not _DEBUG_ENV:
 REFERRAL_FRIEND_DISCOUNT_PERCENT = int(os.environ.get('REFERRAL_FRIEND_DISCOUNT_PERCENT', 10))
 REFERRAL_REWARD_AMOUNT = int(os.environ.get('REFERRAL_REWARD_AMOUNT', 100))
 
-# Email — defaults to printing to the console in dev. Set EMAIL_HOST/EMAIL_HOST_USER/
-# EMAIL_HOST_PASSWORD (and switch EMAIL_BACKEND to smtp) once real SMTP creds exist.
+# Email provider. Production uses the Postmark HTTP API through
+# notifications.email_adapter; local development keeps the console backend
+# unless explicitly configured otherwise.
 EMAIL_BACKEND = os.environ.get('EMAIL_BACKEND', 'django.core.mail.backends.console.EmailBackend')
-EMAIL_HOST = os.environ.get('EMAIL_HOST', '')
-EMAIL_PORT = int(os.environ.get('EMAIL_PORT', 587))
-EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER', '')
-EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')
+EMAIL_HOST = os.environ.get('EMAIL_HOST', '')  # legacy/compatibility only
+EMAIL_PORT = int(os.environ.get('EMAIL_PORT', 587))  # legacy/compatibility only
+EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER', '')  # legacy/compatibility only
+EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')  # legacy/compatibility only
 EMAIL_USE_TLS = os.environ.get('EMAIL_USE_TLS', 'True') == 'True'
+EMAIL_USE_SSL = os.environ.get('EMAIL_USE_SSL', 'False') == 'True'
+POSTMARK_SERVER_TOKEN = os.environ.get('POSTMARK_SERVER_TOKEN', '')
+POSTMARK_API_URL = os.environ.get('POSTMARK_API_URL', 'https://api.postmarkapp.com/email')
+POSTMARK_MESSAGE_STREAM = os.environ.get('POSTMARK_MESSAGE_STREAM', 'outbound')
+EMAIL_TIMEOUT = int(os.environ.get('EMAIL_TIMEOUT', 10))
 DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'Dr. Gutka <no-reply@hamromentor.com>')
 
 # Student-facing Frontend base URL — used to build links inside outbound emails
@@ -177,6 +183,7 @@ INSTALLED_APPS = [
     'media_library',
     'smart_practice',
     'entitlements',
+    'notifications',
 ]
 
 MIDDLEWARE = [

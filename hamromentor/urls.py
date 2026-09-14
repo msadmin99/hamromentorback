@@ -16,6 +16,7 @@ urlpatterns = [
     path('api/media/', include('media_library.urls')),
     path('api/', include('smart_practice.urls')),
     path('api/', include('entitlements.urls')),
+    path('api/', include('notifications.urls')),
 ]
 
 if settings.DEBUG:

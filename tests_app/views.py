@@ -508,6 +508,37 @@ class TestViewSet(viewsets.ModelViewSet):
         record_deletion(request, 'Test', test.id, label, result='success')
         return response
 
+    def perform_update(self, serializer):
+        """Phase 2 notification hook: publishing an exam (the plain
+        `is_draft: True -> False` PATCH this ViewSet's own comment above
+        already documents as "generic... not a distinct action") is the
+        real moment a Daily/Grand Test actually becomes visible to
+        students — tests_app.access.can_access_test denies everyone but
+        staff/the creator while is_draft=True, so any ExamSession created
+        for this Test before publish produced zero notifications (correct
+        — no student could see it yet). This re-runs the same scheduling
+        function for every not-yet-finished session under this Test the
+        moment it's published, so the "available" event actually reaches
+        its audience instead of silently never firing. dedupe_key makes
+        this safe to call unconditionally for every still-open session —
+        a session already notified (e.g. created after publish) is a
+        no-op; only genuinely new recipients are created."""
+        # serializer.instance still holds the pre-save field values here —
+        # DRF sets it from get_object() before validation/save ever touch
+        # it, so this is the old is_draft with no extra query.
+        was_draft = serializer.instance.is_draft
+        test = serializer.save()
+        if was_draft and not test.is_draft and test.exam_type in ('grand', 'daily'):
+            from notifications.exam_integration import schedule_session_reminders
+
+            sessions = list(test.sessions.exclude(status__in=['completed', 'cancelled']))
+
+            def _schedule_all():
+                for session in sessions:
+                    schedule_session_reminders(session)
+
+            transaction.on_commit(_schedule_all)
+
     def get_serializer_class(self):
         user = self.request.user
         if user.is_authenticated and user.is_staff:
@@ -1013,11 +1044,43 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
             qs = qs.filter(status__in=['scheduled', 'registration_open', 'live'], end_datetime__gte=timezone.now())
         return qs
 
+    def perform_create(self, serializer):
+        """Phase 2 notification hook: the plain admin 'create a session'
+        flow is one of exactly two real code paths that produce an
+        ExamSession (the other is exam_versioning.create_reschedule_session,
+        hooked separately — see that function). Additive only: scheduling
+        notifications never blocks or alters session creation itself, and
+        schedule_session_reminders() is itself a no-op for any exam_type
+        other than grand/daily."""
+        from notifications.exam_integration import schedule_session_reminders
+
+        session = serializer.save()
+        # transaction.on_commit: runs immediately here today (this action
+        # isn't wrapped in an atomic block), and stays correct unchanged if
+        # that ever changes — never notify before the session row is
+        # actually durable (architecture prompt's transaction-safety rule).
+        transaction.on_commit(lambda: schedule_session_reminders(session))
+
     def perform_update(self, serializer):
         session = self.get_object()
         if session.status == 'completed' or session.attempts.filter(status='submitted').exists():
             raise ValidationError('This session has already been conducted and can no longer be edited.')
-        serializer.save()
+        old_start, old_end = session.start_datetime, session.end_datetime
+        updated = serializer.save()
+        if updated.start_datetime != old_start or updated.end_datetime != old_end:
+            # Real 'Edit Session' time change (Admin's EditSessionModal) —
+            # see notifications.services.reschedule_notifications_for_session's
+            # own docstring for why this is a distinct case from
+            # 'Reschedule / Schedule Again' and needs a hard-delete-then-
+            # recreate, not a soft cancel.
+            def _resync_reminders():
+                from notifications.exam_integration import schedule_session_reminders
+                from notifications.services import reschedule_notifications_for_session
+
+                reschedule_notifications_for_session(updated)
+                schedule_session_reminders(updated)
+
+            transaction.on_commit(_resync_reminders)
 
     def destroy(self, request, *args, **kwargs):
         from core.deletion_audit import record_deletion
@@ -1063,11 +1126,18 @@ class ExamSessionViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'])
     def cancel(self, request, pk=None):
+        from notifications.services import cancel_notifications_for_session
+
         session = self.get_object()
         if session.status == 'completed':
             return Response({'detail': 'A completed session cannot be cancelled.'}, status=status.HTTP_400_BAD_REQUEST)
         session.status = 'cancelled'
         session.save(update_fields=['status'])
+        # Phase 2: this session's own pending/scheduled reminders (and only
+        # this session's — see cancel_notifications_for_session's own
+        # docstring on why it scopes by metadata['session_id'], not test_id,
+        # given a single Test can have multiple independent sessions).
+        transaction.on_commit(lambda: cancel_notifications_for_session(session))
         return Response(ExamSessionSerializer(session, context={'request': request}).data)
 
     @action(detail=True, methods=['post'], permission_classes=[HasFeature('exam_release_solutions')])
