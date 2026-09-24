@@ -1200,6 +1200,32 @@ class ExamManagementDashboardApiTests(APITestCase):
         self.assertIn(scheduled_test.id, ids)
         self.assertNotIn(unscheduled_test.id, ids)
 
+    def test_ordering_param_sorts_by_scheduled_start_ascending_with_nulls_last(self):
+        """Admin Exam Management's Daily Test tab requests ?ordering=scheduled_start
+        so the soonest-scheduled test appears first, across pagination pages —
+        every other caller (default, no param) keeps the existing newest-first
+        ordering untouched."""
+        later = Test.objects.create(
+            title='Ordering Dash Exam Later', exam_type='daily', is_draft=False,
+            scheduled_start=timezone.now() + timezone.timedelta(days=5),
+        )
+        sooner = Test.objects.create(
+            title='Ordering Dash Exam Sooner', exam_type='daily', is_draft=False,
+            scheduled_start=timezone.now() + timezone.timedelta(days=1),
+        )
+        unscheduled = Test.objects.create(
+            title='Ordering Dash Exam Unscheduled', exam_type='daily', is_draft=False,
+        )
+        self.client.force_authenticate(user=self.staff)
+
+        resp = self.client.get('/api/tests/browse/?exam_type=daily&standalone=true&ordering=scheduled_start&page_size=10')
+
+        ids = [row['id'] for row in resp.data['results']]
+        self.assertEqual(
+            [i for i in ids if i in (sooner.id, later.id, unscheduled.id)],
+            [sooner.id, later.id, unscheduled.id],
+        )
+
     def test_standalone_filter_excludes_templated_exam_versions(self):
         template = ExamTemplate.objects.create(title='Templated Dash Exam', exam_type='mock', created_by=self.staff)
         templated_test = Test.objects.create(title='Templated Dash v1', exam_type='mock', exam_template=template)

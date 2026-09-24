@@ -648,6 +648,20 @@ class TestViewSet(viewsets.ModelViewSet):
                 answered_count=Count('answers', distinct=True),
             ).order_by('-start_time')
             qs = qs.prefetch_related(Prefetch('attempts', queryset=user_attempts_qs, to_attr='_prefetched_user_attempts'))
+        # Optional caller-requested ordering override — whitelisted, so a
+        # client can never inject an arbitrary field/direction. Scoped to
+        # this one request only; every caller that omits it (every
+        # student-facing page, and every other Admin Exam Management tab)
+        # keeps the default "-scheduled_start" (newest-first) ordering
+        # below, byte-for-byte unchanged.
+        ordering = self.request.query_params.get('ordering')
+        if ordering == 'scheduled_start':
+            # nulls_last: an unscheduled Daily Test has nothing to sort by —
+            # it belongs after every scheduled one, not intermixed ahead of
+            # them (MySQL's default is nulls-first on ASC, the opposite of
+            # what an admin scanning "what's coming up" would expect).
+            from django.db.models import F
+            return qs.distinct().order_by(F('scheduled_start').asc(nulls_last=True), 'created_at', 'id')
         # Explicit order (matching Test.Meta.ordering) rather than relying on
         # the model default combining predictably with .distinct() — DRF's
         # paginator warns ("may yield inconsistent results") when it can't
