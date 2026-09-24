@@ -12,7 +12,8 @@ from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from billing.models import Purchase
-from courses.models import Enrollment, EnrollmentRequest
+from courses.models import Course, Enrollment, EnrollmentRequest
+from hamromentor.errors import error_response
 from hamromentor.permissions import IsAdminRoleOrAbove, IsSuperAdmin
 from tests_app.models import TestAttempt
 
@@ -123,15 +124,28 @@ class MeView(APIView):
 
 class ActiveCourseView(APIView):
     """Switches the student's 'current subcourse' — everything the dashboard
-    shows (QBank, Mock/Daily/Grand Test, PYQ, performance) is scoped to this."""
+    shows (QBank, Mock/Daily/Grand Test, PYQ, performance) is scoped to this.
+
+    Deliberately allows switching to ANY existing course, not only ones the
+    student already has an Enrollment in — this is a pure UI/navigation
+    pointer, never an authorization grant. Every real content gate
+    (courses.access.eligible_course_ids for academic visibility;
+    billing.access.has_qbank_access/has_mock_test_access/
+    has_daily_test_access/has_pyq_access/get_grand_test_access for paid
+    content) re-derives eligibility from Enrollment/Subscription/
+    GrandTestAccess scoped to the resource's own course — none of them
+    ever reads request.user.active_course_id. So switching here can never
+    grant QBank/Mock/Daily/PYQ/Grand Test access a student hasn't actually
+    paid for; it only changes which course's (already-gated) content the
+    dashboard requests next. No Enrollment row is created or required."""
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
         course_id = request.data.get('course_id')
         if not course_id:
-            return Response({'detail': 'course_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
-        if not Enrollment.objects.filter(user=request.user, course_id=course_id, is_active=True).exists():
-            return Response({'detail': 'You are not enrolled in that course.'}, status=status.HTTP_403_FORBIDDEN)
+            return error_response(status.HTTP_400_BAD_REQUEST, 'course_id_required', 'course_id is required.')
+        if not Course.objects.filter(pk=course_id).exists():
+            return error_response(status.HTTP_404_NOT_FOUND, 'course_not_found', 'That course does not exist.')
         request.user.active_course_id = course_id
         request.user.save(update_fields=['active_course'])
         return Response(UserSerializer(request.user).data)
