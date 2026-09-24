@@ -3,7 +3,6 @@ from decimal import Decimal
 from rest_framework import serializers
 
 from .models import (
-    MAX_COMBO_DISCOUNT_PERCENT,
     ComboPlan,
     Coupon,
     GrandTestAccess,
@@ -113,11 +112,6 @@ class ComboPlanSerializer(serializers.ModelSerializer):
     def get_final_price(self, obj):
         value = self._individual_value(obj)
         return value - (value * obj.discount_percent / 100)
-
-    def validate_discount_percent(self, value):
-        if value > MAX_COMBO_DISCOUNT_PERCENT:
-            raise serializers.ValidationError(f'Discount cannot exceed {MAX_COMBO_DISCOUNT_PERCENT}%.')
-        return value
 
     def validate_plans(self, value):
         if len({p.product_type for p in value}) != len(value):

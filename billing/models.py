@@ -13,7 +13,6 @@ from django.utils.text import slugify
 # REFERRAL_FRIEND_DISCOUNT_PERCENT in settings.py, which is a single env-
 # overridable scalar; a tier table doesn't fit that pattern cleanly).
 COMBO_DISCOUNT_TIERS = {2: 15, 3: 25, 4: 30, 5: 35}
-MAX_COMBO_DISCOUNT_PERCENT = 35
 
 
 class SubscriptionPlan(models.Model):
@@ -91,7 +90,7 @@ class ComboPlan(models.Model):
         help_text='Exact plan rows included in this combo (pick specific durations/quotas).',
     )
     discount_percent = models.PositiveIntegerField(
-        default=15, help_text=f'Percent off the combined individual price. Capped at {MAX_COMBO_DISCOUNT_PERCENT}%.',
+        default=15, help_text='Percent off the combined individual price.',
     )
     is_popular = models.BooleanField(default=False, help_text='Shows a "Popular" badge on the combo card.')
     is_best_value = models.BooleanField(default=False, help_text='Shows a "Best Value" badge on the combo card.')

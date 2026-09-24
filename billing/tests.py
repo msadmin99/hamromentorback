@@ -735,13 +735,19 @@ class ComboPlanPurchaseTests(BillingTestCase):
         self.assertIsNone(resp.data['coupon'])
         self.assertEqual(str(resp.data['discount_amount']), '120.00')  # still the 15% tier, not the 50% coupon
 
-    def test_combo_plan_serializer_rejects_discount_over_35_percent(self):
+    def test_admin_combo_plan_accepts_a_discount_above_the_old_35_percent_cap(self):
+        # The Admin "Create combo" discount used to be capped at 35% —
+        # removed by request (this cap only ever applied to admin-created
+        # ComboPlan rows, never the separate, unrelated COMBO_DISCOUNT_TIERS
+        # auto-pricing used by the self-service "Build Your Own Combo"
+        # feature, which is untouched).
         self.client.force_authenticate(user=self.staff)
         resp = self.client.post('/api/combo-plans/', {
-            'name': 'Too Generous', 'course': self.course.id, 'plans': [self.plan.id, self.mock_plan.id],
-            'discount_percent': 40,
+            'name': 'Generous Combo', 'course': self.course.id, 'plans': [self.plan.id, self.mock_plan.id],
+            'discount_percent': 90,
         })
-        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.status_code, 201, resp.data)
+        self.assertEqual(resp.data['discount_percent'], 90)
 
     def test_combo_plan_serializer_exposes_live_computed_pricing(self):
         from billing.serializers import ComboPlanSerializer
