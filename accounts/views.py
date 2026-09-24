@@ -152,7 +152,8 @@ class ActiveCourseView(APIView):
 
 
 class AdminUserViewSet(viewsets.ModelViewSet):
-    """Staff-only user management: list students, toggle active/staff status."""
+    """Staff-only user management: list students, toggle active/staff status,
+    permanently delete a student account."""
     queryset = User.objects.filter(is_staff=False).select_related('profile').order_by('-date_joined')
     serializer_class = AdminUserSerializer
     permission_classes = [IsAdminRoleOrAbove]
@@ -163,10 +164,54 @@ class AdminUserViewSet(viewsets.ModelViewSet):
     # http_method_names — the old list only blocked it at dispatch time),
     # so create() is explicitly disabled again just below to preserve this
     # viewset's original "no account creation here" contract.
-    http_method_names = ['get', 'post', 'patch', 'head', 'options']
+    # 'delete' enables destroy() below — see get_permissions() for why it's
+    # gated stricter than the rest of this viewset.
+    http_method_names = ['get', 'post', 'patch', 'delete', 'head', 'options']
 
     def create(self, request, *args, **kwargs):
         return Response({'detail': 'Method "POST" not allowed.'}, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    def get_permissions(self):
+        # Permanent delete is materially more dangerous than list/edit/
+        # block — same reasoning AdminAccountViewSet.destroy already
+        # applies to staff accounts, mirrored here: Super-Admin only, not
+        # the broader Admin+ this viewset otherwise allows.
+        if self.action == 'destroy':
+            return [IsSuperAdmin()]
+        return super().get_permissions()
+
+    def destroy(self, request, *args, **kwargs):
+        """Permanent delete — blocked if this account has payment/purchase
+        history (Purchase.user is CASCADE; financial records must not be
+        destroyed this way), mirroring AdminAccountViewSet.destroy's exact
+        reasoning for staff accounts. Deactivate the account (is_active=
+        False, already supported by the existing PATCH endpoint) instead.
+
+        Not blocked on Enrollment/TestAttempt/QuestionAttempt/Notification
+        etc. — unlike a staff account's TeacherCourse (which would destroy
+        *other* students' access), everything else CASCADE-linked to a
+        student account is that student's own data."""
+        from core.deletion_audit import record_deletion
+
+        student = self.get_object()
+        label = student.email
+
+        if student.purchases.exists():
+            msg = (
+                'This account has payment/purchase history and cannot be permanently deleted — '
+                'deactivate it instead to preserve financial records.'
+            )
+            record_deletion(request, 'StudentAccount', student.id, label, result='failure', failure_reason=msg)
+            return Response({'detail': msg}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            response = super().destroy(request, *args, **kwargs)
+        except Exception as exc:
+            record_deletion(request, 'StudentAccount', student.id, label, result='failure', failure_reason=str(exc)[:500])
+            return Response({'detail': 'Deletion failed. No partial deletion should remain.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        record_deletion(request, 'StudentAccount', student.id, label, result='success')
+        return response
 
     def get_queryset(self):
         qs = super().get_queryset()
