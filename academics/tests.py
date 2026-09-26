@@ -1164,6 +1164,40 @@ class DocxParserTableTests(TestCase):
         self.assertNotIn('stray', questions[0]['text_html'])
 
 
+class DocxParserDiagramOnlyStemTests(TestCase):
+    """Regression coverage: a question stem that is nothing but a picture
+    (no caption text at all after the "Q5." marker) must still count as a
+    real question — flush() previously required non-empty text_html,
+    silently dropping the entire question, image and all."""
+
+    def test_question_with_no_stem_text_but_a_stem_image_is_not_dropped(self):
+        from docx.shared import Inches
+        from PIL import Image
+
+        png_bytes = io.BytesIO()
+        Image.new('RGB', (2, 2), color='green').save(png_bytes, format='PNG')
+        png_bytes.seek(0)
+
+        doc = DocxDocument()
+        p = doc.add_paragraph()
+        p.add_run('Q1. ')
+        run = p.add_run()
+        run.add_picture(png_bytes, width=Inches(1))
+        doc.add_paragraph('A) 1')
+        doc.add_paragraph('B) 2')
+        doc.add_paragraph('C) 3')
+        doc.add_paragraph('D) 4')
+        doc.add_paragraph('Answer: A')
+        buf = io.BytesIO()
+        doc.save(buf)
+        buf.seek(0)
+
+        questions = parse_docx(buf, batch_id='diagram-only-stem-batch')
+
+        self.assertEqual(len(questions), 1)
+        self.assertTrue(questions[0]['question_image_path'])
+
+
 class DocxParserContinuationImageTests(TestCase):
     """Regression coverage for the other half of the same reported bug: an
     image (diagram/photo) on the SECOND or later paragraph of a question's
@@ -1345,6 +1379,97 @@ class SaveTempImageS3PermissionTests(TestCase):
 
         mock_upload.assert_not_called()
         self.assertTrue(default_storage_exists(path))
+
+
+class DiagramOnlyContentValidationTests(TestCase):
+    """Regression coverage for a real reported bug: MAT-4.docx Q16's 4
+    options are each nothing but a picture (no caption text at all) — the
+    validator's own "is this blank?" check only looked at text, so every
+    option normalized to blank, producing "Only 0 option(s) found — at
+    least 2 are required." and "No option is marked correct", blocking a
+    perfectly valid question from ever reaching the database. Covers all
+    three locations (question stem / options / explanation), matching the
+    same image-only fix applied in import_engine.py and docx_parser.py."""
+
+    def test_diagram_only_options_are_not_treated_as_blank(self):
+        from academics.import_validation import validate_parsed_question
+
+        pq = {
+            'text_html': '<p>Choose the correct diagram.</p>',
+            'options': [
+                {'text_html': '', 'is_correct': True, 'image_path': 'import_temp/x/a.png'},
+                {'text_html': '', 'is_correct': False, 'image_path': 'import_temp/x/b.png'},
+                {'text_html': '', 'is_correct': False, 'image_path': 'import_temp/x/c.png'},
+                {'text_html': '', 'is_correct': False, 'image_path': 'import_temp/x/d.png'},
+            ],
+            'explanation_html': '',
+        }
+
+        errors, warnings = validate_parsed_question(pq)
+
+        self.assertEqual(errors, [])
+
+    def test_diagram_only_options_are_never_flagged_as_duplicates_of_each_other(self):
+        from academics.import_validation import validate_parsed_question
+
+        pq = {
+            'text_html': '<p>Choose the correct diagram.</p>',
+            'options': [
+                {'text_html': '', 'is_correct': True, 'image_path': 'import_temp/x/a.png'},
+                {'text_html': '', 'is_correct': False, 'image_path': 'import_temp/x/b.png'},
+            ],
+            'explanation_html': '',
+        }
+
+        errors, warnings = validate_parsed_question(pq)
+
+        self.assertFalse(any('duplicates' in e for e in errors))
+
+    def test_diagram_only_question_stem_is_not_treated_as_blank(self):
+        from academics.import_validation import validate_parsed_question
+
+        pq = {
+            'text_html': '',
+            'question_image_path': 'import_temp/x/stem.png',
+            'options': [{'text_html': 'A', 'is_correct': True}, {'text_html': 'B', 'is_correct': False}],
+            'explanation_html': '',
+        }
+
+        errors, warnings = validate_parsed_question(pq)
+
+        self.assertNotIn('Question text is blank.', errors)
+
+    def test_diagram_only_explanation_is_not_flagged_as_missing(self):
+        from academics.import_validation import validate_parsed_question
+
+        pq = {
+            'text_html': '<p>Stem.</p>',
+            'options': [{'text_html': 'A', 'is_correct': True}, {'text_html': 'B', 'is_correct': False}],
+            'explanation_html': '',
+            'explanation_image_path': 'import_temp/x/exp.png',
+        }
+
+        errors, warnings = validate_parsed_question(pq)
+
+        self.assertNotIn('No explanation provided.', warnings)
+
+    def test_genuinely_blank_option_with_no_text_and_no_image_is_still_blank(self):
+        """The fix must not make validation blind to real gaps — an option
+        with neither text nor an image is still correctly counted as
+        missing."""
+        from academics.import_validation import validate_parsed_question
+
+        pq = {
+            'text_html': '<p>Stem.</p>',
+            'options': [
+                {'text_html': 'A', 'is_correct': True}, {'text_html': '', 'is_correct': False},
+            ],
+            'explanation_html': '',
+        }
+
+        errors, warnings = validate_parsed_question(pq)
+
+        self.assertIn('Only 1 option(s) found — at least 2 are required.', errors)
 
 
 def _pq(text, option_texts):
@@ -3977,6 +4102,34 @@ class CreateQuestionFromRowOptionBulkCreateTests(TestCase):
         ])
         question = create_question_from_row(data, self.batch, [])
         self.assertEqual(question.options.count(), 2)
+
+    def test_diagram_only_option_with_blank_text_is_not_skipped(self):
+        """Regression coverage for a real reported bug: MAT-4.docx Q16 is a
+        Venn-diagram MCQ whose 4 options are each nothing but a picture (no
+        caption text beyond the "a."/"b."/... marker the parser strips) —
+        every option was silently dropped on import, leaving the question
+        with zero options in the database, even though the parser itself
+        correctly extracted all 4 images. Only a genuinely empty option (no
+        text AND no image) should ever be skipped."""
+        from academics.import_engine import create_question_from_row
+        from django.core.files.base import ContentFile
+        from django.core.files.storage import default_storage
+
+        image_path = default_storage.save('import_temp/diagram-only-option-test/fake.png', ContentFile(b'fake-png-bytes'))
+        data = _row_data(options=[
+            {'text_html': '', 'is_correct': True, 'image_path': image_path},
+            {'text_html': '', 'is_correct': False, 'image_path': image_path},
+            {'text_html': '', 'is_correct': False, 'image_path': image_path},
+            {'text_html': '', 'is_correct': False, 'image_path': image_path},
+        ])
+
+        with patch('academics.import_engine._attach_image', return_value=None):
+            question = create_question_from_row(data, self.batch, [])
+
+        options = list(question.options.order_by('order'))
+        self.assertEqual(len(options), 4)
+        self.assertTrue(options[0].is_correct)
+        self.assertFalse(any(o.is_correct for o in options[1:]))
 
     def test_query_count_for_options_does_not_scale_with_option_count(self):
         """4 options vs 10 options must cost the same query count — proves

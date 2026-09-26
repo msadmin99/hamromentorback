@@ -99,7 +99,11 @@ def create_question_from_row(data, batch, course_list):
     # path an option takes, so interleaving the two never affects ordering.
     options_to_bulk_create = []
     for i, opt in enumerate(data.get('options') or []):
-        if not (opt.get('text_html') or '').strip():
+        # A diagram-only option (no caption text at all, just a picture —
+        # e.g. a Venn-diagram MCQ) must not be dropped here just because
+        # its text is blank; only a genuinely empty option (no text AND
+        # no image) is skipped.
+        if not (opt.get('text_html') or '').strip() and not opt.get('image_path'):
             continue
         opt_image = load_temp_image(opt.get('image_path'))
         if opt_image:

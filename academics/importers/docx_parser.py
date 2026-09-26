@@ -227,7 +227,12 @@ def parse_docx(file_obj, batch_id=None):
 
     def flush():
         nonlocal current
-        if current is not None and current['text_html']:
+        # A diagram-only stem (a "Q5." marker followed by nothing but a
+        # picture, no caption text at all) must still count as a real
+        # question, not get silently dropped here — matches the same
+        # image-only fix applied to options/explanation elsewhere in this
+        # pipeline (see import_validation.py/import_engine.py).
+        if current is not None and (current['text_html'] or current.get('question_image_path')):
             questions.append(current)
         current = None
 
