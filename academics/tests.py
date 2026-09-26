@@ -774,6 +774,53 @@ def _build_docx_runs(paragraphs):
     return buf
 
 
+class DocxParserFiveOptionTests(TestCase):
+    """Regression coverage for a real reported bug: a non-verbal-reasoning
+    question (MAT-4.docx Q4/Q12) has 5 answer options (a-e), not the usual
+    4 — OPTION_RE only recognized [A-Da-d], so "e." was never seen as a
+    new option marker at all: it silently fell through to the "plain
+    continuation" branch and got appended onto option d's own text
+    instead of becoming its own 5th option."""
+
+    def test_a_fifth_lettered_option_is_recognized_as_its_own_option_not_merged_into_the_fourth(self):
+        buf = _build_docx([
+            'Q1. Which figure continues the series?',
+            'a. 1', 'b. 2', 'c. 3', 'd. 4', 'e. 5',
+            'Answer: c',
+        ])
+
+        questions = parse_docx(buf)
+
+        self.assertEqual(len(questions), 1)
+        options = questions[0]['options']
+        self.assertEqual(len(options), 5)
+        self.assertEqual([o['text_html'] for o in options], ['<p>1</p>', '<p>2</p>', '<p>3</p>', '<p>4</p>', '<p>5</p>'])
+        self.assertEqual([o['is_correct'] for o in options], [False, False, True, False, False])
+
+    def test_answer_key_referencing_the_fifth_option_is_recognized(self):
+        buf = _build_docx([
+            'Q1. Which figure continues the series?',
+            'a. 1', 'b. 2', 'c. 3', 'd. 4', 'e. 5',
+            'Answer: e',
+        ])
+
+        questions = parse_docx(buf)
+
+        options = questions[0]['options']
+        self.assertEqual([o['is_correct'] for o in options], [False, False, False, False, True])
+
+    def test_four_option_questions_are_completely_unaffected(self):
+        buf = _build_docx([
+            'Q1. Stem?',
+            'A) 1', 'B) 2', 'C) 3', 'D) 4',
+            'Answer: B',
+        ])
+
+        questions = parse_docx(buf)
+
+        self.assertEqual(len(questions[0]['options']), 4)
+
+
 class DocxParserBoldCorrectAnswerTests(TestCase):
     """Regression coverage for the final, non-negotiable product rule:
     OPTION formatting from a .docx import must never carry bold, whether

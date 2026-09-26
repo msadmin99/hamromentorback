@@ -44,8 +44,21 @@ from docx.table import Table
 from .base import ParsedQuestion, save_temp_image
 
 QUESTION_RE = re.compile(r'^\s*(Q\.?\s*)?(\d+)\s*[.):]\s*')
-OPTION_RE = re.compile(r'^\s*([A-Da-d])\s*[.):]\s*')
-ANSWER_RE = re.compile(r'^\s*Answer\s*:?\s*([A-Da-d])', re.IGNORECASE)
+# Real reported bug: a non-verbal-reasoning question (MAT-4.docx Q4, "Select
+# a figure ... which will continue the same series") had 5 answer options
+# (a-e), not the usual 4 — [A-Da-d] silently failed to recognize "e." as a
+# new option marker at all, so it fell through to the "plain continuation"
+# branch and got appended onto option d's own text instead of becoming its
+# own 5th option. A-J covers every option-count convention actually seen in
+# this exam bank's own aptitude/reasoning sections (never observed beyond
+# e/5) with real headroom, while still excluding letters far enough into
+# the alphabet that an unrelated single-letter-plus-punctuation line (an
+# outline heading, an inline labeled list inside prose) is very unlikely to
+# collide — and even where it might, the same mode-guard that already
+# excludes an "A) ..." breakdown appearing inside an explanation from being
+# misread as new options applies uniformly, regardless of letter range.
+OPTION_RE = re.compile(r'^\s*([A-Ja-j])\s*[.):]\s*')
+ANSWER_RE = re.compile(r'^\s*Answer\s*:?\s*([A-Ja-j])', re.IGNORECASE)
 EXPLANATION_RE = re.compile(r'^\s*Explanation\s*:?\s*')
 
 # Bulk-import "false Error" audit: a question/option/explanation authored
