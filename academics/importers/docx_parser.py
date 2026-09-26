@@ -39,6 +39,7 @@ import re
 
 from docx import Document
 from docx.oxml.ns import qn
+from docx.table import Table
 
 from .base import ParsedQuestion, save_temp_image
 
@@ -89,16 +90,11 @@ def _run_html(run, text, keep_bold=True):
     return escaped
 
 
-def _paragraph_html(para, strip_prefix_len=0, keep_bold=True):
-    """Renders one paragraph's runs to an HTML fragment.
-
-    `keep_bold=False` (used for OPTION paragraphs only — see module
-    docstring) unconditionally drops any `<strong>` wrapping a bold run
-    would otherwise get, regardless of whether the bold covers the whole
-    option or just part of it, and regardless of whether the option turns
-    out to be the correct answer. Sup/sub/italic are never affected by
-    this flag. Question and explanation paragraphs always call this with
-    the default `keep_bold=True`, so bold there is completely unchanged."""
+def _paragraph_inline_html(para, strip_prefix_len=0, keep_bold=True):
+    """The same run-by-run rendering `_paragraph_html` wraps in `<p>` —
+    split out so a table cell (which needs the bare inline content, not a
+    block-level paragraph nested inside a <td>) can reuse the exact same
+    bold/italic/sup-sub/equation-recovery logic instead of duplicating it."""
     parts = []
     consumed = 0
     for run in para.runs:
@@ -118,7 +114,47 @@ def _paragraph_html(para, strip_prefix_len=0, keep_bold=True):
         math_text = _paragraph_math_text(para).strip()
         if math_text:
             inline = math_text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+    return inline
+
+
+def _paragraph_html(para, strip_prefix_len=0, keep_bold=True):
+    """Renders one paragraph's runs to an HTML fragment.
+
+    `keep_bold=False` (used for OPTION paragraphs only — see module
+    docstring) unconditionally drops any `<strong>` wrapping a bold run
+    would otherwise get, regardless of whether the bold covers the whole
+    option or just part of it, and regardless of whether the option turns
+    out to be the correct answer. Sup/sub/italic are never affected by
+    this flag. Question and explanation paragraphs always call this with
+    the default `keep_bold=True`, so bold there is completely unchanged."""
+    inline = _paragraph_inline_html(para, strip_prefix_len=strip_prefix_len, keep_bold=keep_bold)
     return f'<p>{inline}</p>' if inline else ''
+
+
+def _table_html(table):
+    """Renders a native Word table (a docx.table.Table encountered while
+    walking the document body) as a plain HTML <table> fragment — cell
+    formatting (bold/italic/sup/sub, even an OMML equation) goes through
+    the exact same per-run rendering as a normal paragraph via
+    _paragraph_inline_html, so a table cell is never a second, lesser-
+    featured text path. Multiple paragraphs within one cell join on
+    <br> rather than nesting block-level <p> tags inside a <td>, matching
+    how a real Word table cell reads (a soft return between short lines,
+    not separate document sections). Produces plain <table>/<tr>/<td>
+    markup with no wrapper of its own — this is what both the Admin's
+    TipTap-based Preview & Validate editor (RichEditor.js's Table
+    extension) and the student Frontend's DOMPurify-sanitized RichContent
+    renderer already round-trip natively, so no new storage field or
+    schema change is needed: it lives in the same text_html/explanation_html
+    string as everything else."""
+    rows_html = []
+    for row in table.rows:
+        cells_html = []
+        for cell in row.cells:
+            inline = '<br>'.join(h for h in (_paragraph_inline_html(p) for p in cell.paragraphs) if h)
+            cells_html.append(f'<td>{inline}</td>')
+        rows_html.append(f'<tr>{"".join(cells_html)}</tr>')
+    return f'<table>{"".join(rows_html)}</table>' if rows_html else ''
 
 
 def _paragraph_image(para, document, batch_id, slot):
@@ -137,6 +173,34 @@ def _paragraph_image(para, document, batch_id, slot):
     return ''
 
 
+def _attach_section_image_if_missing(para, document, batch_id, current, mode, questions):
+    """Fills whichever section's single image slot (question stem /
+    current option / explanation) is still empty, from an embedded image
+    on `para` — used for BOTH a paragraph that also carries real caption
+    text (a continuation line) and a paragraph that is ONLY an image with
+    no text at all (a bare diagram on its own line), which would
+    otherwise never reach any image-extraction call at all: the caller's
+    `if not raw_text: continue` guard skips a text-less paragraph before
+    ever checking it for an image. A diagram/photo is just as likely to
+    sit on a section's second (or later) line as its very first — only
+    the first line's image used to be checked. Each slot still holds at
+    most one image (the model fields are single-valued), so this only
+    fills a slot that's still empty — it never overwrites an image
+    already found on an earlier line of the same section."""
+    if mode == 'question' and not current.get('question_image_path'):
+        img = _paragraph_image(para, document, batch_id, f'q{len(questions) + 1}_question')
+        if img:
+            current['question_image_path'] = img
+    elif mode == 'option' and current['options'] and not current['options'][-1].get('image_path'):
+        img = _paragraph_image(para, document, batch_id, f'q{len(questions) + 1}_option{len(current["options"])}')
+        if img:
+            current['options'][-1]['image_path'] = img
+    elif mode == 'explanation' and not current.get('explanation_image_path'):
+        img = _paragraph_image(para, document, batch_id, f'q{len(questions) + 1}_explanation')
+        if img:
+            current['explanation_image_path'] = img
+
+
 def parse_docx(file_obj, batch_id=None):
     try:
         document = Document(file_obj)
@@ -153,9 +217,36 @@ def parse_docx(file_obj, batch_id=None):
             questions.append(current)
         current = None
 
-    for para in document.paragraphs:
+    for block in document.iter_inner_content():
+        if isinstance(block, Table):
+            # A native Word table (Insert > Table, e.g. a reasoning-question
+            # matrix/grid) — document.paragraphs alone structurally excludes
+            # these (a <w:tbl> is a body-level sibling of <w:p>, not a
+            # paragraph), so without this branch its cell contents were
+            # never visited at all and the question silently lost its data.
+            # iter_inner_content() (python-docx >= 1.1) walks paragraphs and
+            # tables together in true document order, so a table is
+            # attached to whichever section was open at the point it
+            # actually appears in the file — same as any other continuation
+            # content below.
+            if current is None:
+                continue  # stray table before the first recognized question marker
+            table_html = _table_html(block)
+            if not table_html:
+                continue
+            if mode == 'question':
+                current['text_html'] += table_html
+            elif mode == 'option' and current['options']:
+                current['options'][-1]['text_html'] += table_html
+            elif mode == 'explanation':
+                current['explanation_html'] += table_html
+            continue
+
+        para = block
         raw_text = para.text.strip()
         if not raw_text:
+            if current is not None:
+                _attach_section_image_if_missing(para, document, batch_id, current, mode, questions)
             continue
 
         m = QUESTION_RE.match(raw_text)
@@ -208,6 +299,7 @@ def parse_docx(file_obj, batch_id=None):
 
         # plain continuation of whichever section is currently open
         html_val = _paragraph_html(para, keep_bold=(mode != 'option'))
+        _attach_section_image_if_missing(para, document, batch_id, current, mode, questions)
         if not html_val:
             continue
         if mode == 'question':

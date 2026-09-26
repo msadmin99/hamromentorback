@@ -1064,6 +1064,138 @@ class DocxParserBoldCorrectAnswerTests(TestCase):
             self.assertNotIn('<strong>', opt['text_html'])
 
 
+def _build_docx_with_tables(items):
+    """Like _build_docx, but an item that's a list-of-rows (each row a list
+    of per-cell strings) becomes a real Word table (doc.add_table) at that
+    position instead of a paragraph — python-docx appends each add_table/
+    add_paragraph call to the end of the body in call order, so interleaving
+    them here reproduces a genuine "text, then a table, then more text"
+    document exactly as a faculty author would have built it."""
+    doc = DocxDocument()
+    for item in items:
+        if isinstance(item, list):
+            rows = item
+            table = doc.add_table(rows=len(rows), cols=len(rows[0]))
+            for r, row_cells in enumerate(rows):
+                for c, cell_text in enumerate(row_cells):
+                    table.cell(r, c).text = cell_text
+        else:
+            doc.add_paragraph(item)
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf
+
+
+class DocxParserTableTests(TestCase):
+    """Regression coverage for a real reported bug: a question whose stem
+    depends on a native Word table (e.g. a "find the missing number in the
+    matrix" reasoning question) imported with the table's data silently
+    missing — document.paragraphs structurally excludes <w:tbl> elements,
+    so the parser never even saw the table existed. Covers all three
+    locations a table can appear (stem, option, explanation), matching the
+    embedded-image coverage DocxParserExplanationTests etc. already have
+    for pictures."""
+
+    def test_table_in_question_stem_is_embedded_as_html_table(self):
+        buf = _build_docx_with_tables([
+            'Q1. Find the missing number in the given matrix:',
+            [['26', '18', '10'], ['11', '9', '7'], ['5', '4', '1'], ['10', '5', '?']],
+            'A) 2', 'B) 4', 'C) 5', 'D) 6',
+            'Answer: A',
+            'Explanation: Column-wise subtraction yields the missing value.',
+        ])
+
+        questions = parse_docx(buf)
+
+        self.assertEqual(len(questions), 1)
+        text_html = questions[0]['text_html']
+        self.assertIn('<table>', text_html)
+        self.assertIn('<td>26</td>', text_html)
+        self.assertIn('<td>?</td>', text_html)
+        # The table must not swallow the four real options into the stem.
+        self.assertEqual(len(questions[0]['options']), 4)
+
+    def test_table_in_explanation_is_embedded_as_html_table(self):
+        buf = _build_docx_with_tables([
+            'Q1. Stem with no table?',
+            'A) 1', 'B) 2', 'C) 3', 'D) 4',
+            'Answer: B',
+            'Explanation: See the breakdown below.',
+            [['Step', 'Value'], ['1', '10'], ['2', '20']],
+        ])
+
+        questions = parse_docx(buf)
+
+        explanation_html = questions[0]['explanation_html']
+        self.assertIn('<table>', explanation_html)
+        self.assertIn('<td>Step</td>', explanation_html)
+        self.assertIn('<td>20</td>', explanation_html)
+
+    def test_table_in_an_option_is_embedded_as_html_table(self):
+        buf = _build_docx_with_tables([
+            'Q1. Which table shows a valid truth table for AND?',
+            'A)',
+            [['A', 'B', 'A AND B'], ['0', '0', '0'], ['1', '1', '1']],
+            'B) Not this one',
+            'C) Not this one either',
+            'D) Definitely not this one',
+            'Answer: A',
+        ])
+
+        questions = parse_docx(buf)
+
+        option_a_html = questions[0]['options'][0]['text_html']
+        self.assertIn('<table>', option_a_html)
+        self.assertIn('<td>A AND B</td>', option_a_html)
+
+    def test_table_before_any_question_marker_is_ignored_not_crashed(self):
+        buf = _build_docx_with_tables([
+            [['stray', 'table']],
+            'Q1. Real question?',
+            'A) 1', 'B) 2', 'C) 3', 'D) 4',
+            'Answer: A',
+        ])
+
+        questions = parse_docx(buf)
+
+        self.assertEqual(len(questions), 1)
+        self.assertNotIn('stray', questions[0]['text_html'])
+
+
+class DocxParserContinuationImageTests(TestCase):
+    """Regression coverage for the other half of the same reported bug: an
+    image (diagram/photo) on the SECOND or later paragraph of a question's
+    stem was silently dropped, since only the section's very first
+    paragraph was ever checked for an embedded image."""
+
+    def test_image_on_a_continuation_paragraph_of_the_question_stem_is_extracted(self):
+        from docx.shared import Inches
+        from PIL import Image
+
+        png_bytes = io.BytesIO()
+        Image.new('RGB', (2, 2), color='red').save(png_bytes, format='PNG')
+        png_bytes.seek(0)
+
+        doc = DocxDocument()
+        doc.add_paragraph('Q1. Look at the circuit diagram below:')
+        img_para = doc.add_paragraph()
+        run = img_para.add_run()
+        run.add_picture(png_bytes, width=Inches(1))
+        doc.add_paragraph('A) 1')
+        doc.add_paragraph('B) 2')
+        doc.add_paragraph('C) 3')
+        doc.add_paragraph('D) 4')
+        doc.add_paragraph('Answer: A')
+        buf = io.BytesIO()
+        doc.save(buf)
+        buf.seek(0)
+
+        questions = parse_docx(buf, batch_id='continuation-image-batch')
+
+        self.assertTrue(questions[0]['question_image_path'])
+
+
 def _pq(text, option_texts):
     return {'text_html': text, 'options': [{'text_html': t} for t in option_texts]}
 
