@@ -181,6 +181,80 @@ class ImportRowDeleteTests(APITestCase):
         self.assertEqual(resp.data['status'], 'valid')
         self.assertEqual(resp.data['errors'], [])
 
+    def test_list_rows_includes_resolved_image_urls_for_a_diagram_only_row(self):
+        """Regression coverage for a real reported bug: the Preview &
+        Validate screen showed a diagram-only question/option as visually
+        blank — raw_data's image_path fields are bare S3 storage keys, not
+        browser-renderable URLs, and nothing resolved one into the other
+        before this fix."""
+        row = ImportRow.objects.create(
+            batch=self.batch, row_number=3, status='valid',
+            raw_data={
+                'text_html': '', 'question_image_path': 'import_temp/x/stem.png',
+                'options': [
+                    {'text_html': '', 'is_correct': True, 'image_path': 'import_temp/x/a.png'},
+                    {'text_html': '', 'is_correct': False, 'image_path': 'import_temp/x/b.png'},
+                ],
+                'explanation_html': '', 'explanation_image_path': 'import_temp/x/exp.png',
+            },
+        )
+
+        resp = self.client.get(f'/api/import-batches/{self.batch.id}/rows/')
+
+        self.assertEqual(resp.status_code, 200)
+        result = next(r for r in resp.data['results'] if r['id'] == row.id)
+        self.assertIn('image_urls', result)
+        self.assertIsNotNone(result['image_urls']['question_image_url'])
+        self.assertIsNotNone(result['image_urls']['explanation_image_url'])
+        self.assertEqual(len(result['image_urls']['option_image_urls']), 2)
+        self.assertIsNotNone(result['image_urls']['option_image_urls'][0])
+        self.assertIsNotNone(result['image_urls']['option_image_urls'][1])
+
+    def test_image_urls_are_none_when_no_image_was_extracted(self):
+        resp = self.client.get(f'/api/import-batches/{self.batch.id}/rows/')
+
+        self.assertEqual(resp.status_code, 200)
+        result = next(r for r in resp.data['results'] if r['id'] == self.good_row.id)
+        self.assertIsNone(result['image_urls']['question_image_url'])
+        self.assertIsNone(result['image_urls']['explanation_image_url'])
+        self.assertEqual(result['image_urls']['option_image_urls'], [None, None])
+
+    def test_patch_response_also_includes_resolved_image_urls(self):
+        row = ImportRow.objects.create(
+            batch=self.batch, row_number=4, status='valid',
+            raw_data={
+                'text_html': '', 'question_image_path': 'import_temp/x/stem2.png',
+                'options': [
+                    {'text_html': 'A', 'is_correct': True}, {'text_html': 'B', 'is_correct': False},
+                ],
+                'explanation_html': '',
+            },
+        )
+
+        resp = self.client.patch(f'/api/import-batches/{self.batch.id}/rows/{row.id}/', {'data': row.raw_data}, format='json')
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsNotNone(resp.data['image_urls']['question_image_url'])
+
+    def test_resolved_image_url_is_never_persisted_into_raw_data(self):
+        """The image_urls the frontend sees must never leak into raw_data
+        via a round-trip Save — RowDetail's local edit state is seeded
+        from `data` (raw_data) alone, but this guards the backend
+        contract regardless of what the frontend actually sends."""
+        row = ImportRow.objects.create(
+            batch=self.batch, row_number=5, status='valid',
+            raw_data={
+                'text_html': '<p>Q</p>', 'question_image_path': 'import_temp/x/stem3.png',
+                'options': [{'text_html': 'A', 'is_correct': True}, {'text_html': 'B', 'is_correct': False}],
+                'explanation_html': '',
+            },
+        )
+
+        self.client.patch(f'/api/import-batches/{self.batch.id}/rows/{row.id}/', {'data': row.raw_data}, format='json')
+
+        row.refresh_from_db()
+        self.assertNotIn('question_image_url', row.raw_data)
+
 
 class ImportBatchCreateTestModeMismatchTests(APITestCase):
     """Covers the bug where a batch could reach 'ready' with import_mode

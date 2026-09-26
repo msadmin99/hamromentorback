@@ -189,6 +189,38 @@ class ImportUploadView(APIView):
             raise
 
 
+def _resolve_row_image_urls(raw_data):
+    """Read-only preview URLs for whatever images this row's parser
+    extracted (question stem / each option / explanation) — a real
+    reported bug: the Preview & Validate screen showed every diagram-only
+    question/option as visually blank (no way to confirm a picture had
+    even been captured before confirming the import), because raw_data's
+    image_path fields are bare S3 storage keys, not browser-renderable
+    URLs, and the frontend had no way to turn one into the other itself.
+
+    Deliberately returned as a SEPARATE sibling key on the row response
+    (never merged into `data`/raw_data) — RowDetail's "Save edit" PATCHes
+    its whole `data` state back verbatim, and a derived, computed field
+    living inside raw_data would get silently persisted into the
+    canonical import record forever the first time anyone edited that
+    row's text, for no benefit (S3 keys are stable; nothing needs it
+    recomputed later, but nothing should be storing it as fact either)."""
+    def _url(path):
+        if not path:
+            return None
+        if settings.AWS_S3_PUBLIC_BUCKET:
+            from media_library import s3_storage
+            return s3_storage.public_url(path)
+        from django.core.files.storage import default_storage
+        return default_storage.url(path)
+
+    return {
+        'question_image_url': _url(raw_data.get('question_image_path')),
+        'explanation_image_url': _url(raw_data.get('explanation_image_path')),
+        'option_image_urls': [_url(o.get('image_path')) for o in (raw_data.get('options') or [])],
+    }
+
+
 def _batch_summary(batch):
     # Bulk-import taxonomy audit: was one .count() query per status (7
     # separate round trips, every call — this fires after every taxonomy
@@ -413,6 +445,7 @@ class ImportBatchRowsView(APIView):
                     'id': r.id, 'row_number': r.row_number, 'status': r.status,
                     'errors': r.errors, 'warnings': r.warnings, 'duplicate_of_id': r.duplicate_of_id,
                     'dedup_action': r.dedup_action, 'error_skipped': r.error_skipped, 'data': r.raw_data,
+                    'image_urls': _resolve_row_image_urls(r.raw_data),
                 }
                 for r in page_rows
             ],
@@ -455,6 +488,7 @@ class ImportRowDetailView(APIView):
         return Response({
             'id': row.id, 'status': row.status, 'errors': row.errors, 'warnings': row.warnings,
             'dedup_action': row.dedup_action, 'error_skipped': row.error_skipped, 'data': row.raw_data,
+            'image_urls': _resolve_row_image_urls(row.raw_data),
         })
 
     def delete(self, request, batch_id, row_id):
