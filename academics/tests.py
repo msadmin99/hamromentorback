@@ -14,6 +14,7 @@ from academics.import_dedup import (
     SIMILARITY_THRESHOLD, _length_could_match, _MAX_LENGTH_RATIO, _options_similarity, existing_texts_for_subject,
     find_duplicate, normalize_option_set, normalize_text,
 )
+from academics.importers.base import save_temp_image
 from academics.importers.docx_parser import parse_docx
 from academics.models import (
     Chapter, ImportBatch, ImportRow, Option, Question, QuestionAttempt, QuestionBankConfig,
@@ -1287,6 +1288,63 @@ class DocxParserSoftLineBreakTests(TestCase):
 
         self.assertIn('first line<br>second line', questions[0]['options'][0]['text_html'])
         self.assertIn('first line<br>second line', questions[0]['explanation_html'])
+
+
+class SaveTempImageS3PermissionTests(TestCase):
+    """Regression coverage for a real production incident: MAT-4.docx (5
+    embedded images) failed bulk import on its first image with "An error
+    occurred (403) when calling the HeadObject operation: Forbidden".
+    Root cause, confirmed live against the actual bucket: this app's
+    runtime IAM user has PutObject/GetObject but not ListBucket, and S3
+    returns 403 (not 404) for a HeadObject on a nonexistent key without
+    ListBucket permission — Django's default_storage.save() always calls
+    that HeadObject (via get_available_name -> exists()) before writing,
+    so every fresh image save was guaranteed to fail once S3 was actually
+    configured. save_temp_image now bypasses that pre-check by writing
+    directly through s3_storage when AWS_S3_PUBLIC_BUCKET is set."""
+
+    def test_writes_directly_via_s3_storage_when_s3_is_configured(self):
+        from django.test import override_settings
+
+        with override_settings(AWS_S3_PUBLIC_BUCKET='drgutka-media-public'):
+            with patch('media_library.s3_storage.upload_bytes') as mock_upload:
+                path = save_temp_image('batch123', 'q1_question', b'fake-png-bytes', ext='png')
+
+        mock_upload.assert_called_once()
+        call_args = mock_upload.call_args.args
+        self.assertEqual(call_args[0], 'drgutka-media-public')
+        self.assertEqual(call_args[1], path)
+        self.assertEqual(call_args[2], b'fake-png-bytes')
+        self.assertEqual(call_args[3], 'image/png')
+        self.assertTrue(path.startswith('import_temp/batch123/q1_question_'))
+        self.assertTrue(path.endswith('.png'))
+
+    def test_never_calls_default_storage_save_when_s3_is_configured(self):
+        """The whole point of the fix: default_storage.save() is what
+        triggers the broken HeadObject pre-check — it must not be called
+        at all on this path, not just "also" call s3_storage."""
+        from django.test import override_settings
+
+        with override_settings(AWS_S3_PUBLIC_BUCKET='drgutka-media-public'):
+            with patch('media_library.s3_storage.upload_bytes'), \
+                 patch('academics.importers.base.default_storage.save') as mock_default_save:
+                save_temp_image('batch456', 'q2_explanation', b'more-bytes', ext='jpg')
+
+        mock_default_save.assert_not_called()
+
+    def test_falls_back_to_default_storage_when_s3_is_not_configured(self):
+        """Local dev/tests (the common case — no AWS_S3_PUBLIC_BUCKET set)
+        must be completely unaffected by this fix: same default_storage.save()
+        behavior as before, via FileSystemStorage, which has no IAM/
+        ListBucket concept at all."""
+        from django.test import override_settings
+
+        with override_settings(AWS_S3_PUBLIC_BUCKET=''):
+            with patch('media_library.s3_storage.upload_bytes') as mock_upload:
+                path = save_temp_image('batch789', 'q3_option1', b'local-bytes', ext='png')
+
+        mock_upload.assert_not_called()
+        self.assertTrue(default_storage_exists(path))
 
 
 def _pq(text, option_texts):
