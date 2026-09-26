@@ -79,6 +79,20 @@ def _run_html(run, text, keep_bold=True):
     if not text:
         return ''
     escaped = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+    # A soft line break (Shift+Enter, python-docx's Run.text renders it as a
+    # literal "\n" WITHIN one run/paragraph — a real reported bug: a
+    # "Statement: ... / Arguments: / I. ... / II. ..." reasoning question
+    # authored as ONE paragraph with manual line breaks (a very common way
+    # to compose exactly this style of question) previously ran together
+    # into a single unbroken line on the student view, because a bare "\n"
+    # inside an HTML text node is just collapsed to whitespace by the
+    # browser's default rendering — the line structure the source document
+    # actually had was silently destroyed on the way in. This must happen
+    # BEFORE the sup/sub/em/strong wrapping below, not after, so a <br>
+    # that falls mid-way through a bold/italic run still nests correctly
+    # (e.g. "<strong>line one<br>line two</strong>", not a <br> stranded
+    # outside its own run's formatting).
+    escaped = escaped.replace('\n', '<br>')
     if run.font.superscript:
         escaped = f'<sup>{escaped}</sup>'
     elif run.font.subscript:

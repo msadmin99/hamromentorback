@@ -1196,6 +1196,99 @@ class DocxParserContinuationImageTests(TestCase):
         self.assertTrue(questions[0]['question_image_path'])
 
 
+class DocxParserSoftLineBreakTests(TestCase):
+    """Regression coverage for a real reported bug: a "Statement: ... /
+    Arguments: / I. ... / II. ..." reasoning question authored as ONE
+    Word paragraph with manual Shift+Enter line breaks (rather than
+    separate paragraphs) rendered as a single unbroken run-on line on the
+    student view — a soft line break has no paragraph boundary for the
+    parser to see at all; python-docx exposes it as a literal "\\n"
+    character inside Run.text, which a browser's default HTML rendering
+    silently collapses to nothing, destroying the line structure the
+    source document actually had."""
+
+    def test_soft_line_breaks_within_one_paragraph_become_br_tags(self):
+        doc = DocxDocument()
+        p = doc.add_paragraph()
+        p.add_run('Q1. Statement: Should the government open more medical colleges?')
+        p.add_run().add_break()
+        p.add_run('Arguments:')
+        p.add_run().add_break()
+        p.add_run('I. Yes, there is urgent need.')
+        p.add_run().add_break()
+        p.add_run('II. No, existing colleges lack infrastructure.')
+        doc.add_paragraph('A) Only I is strong')
+        doc.add_paragraph('B) Only II is strong')
+        doc.add_paragraph('C) Either is strong')
+        doc.add_paragraph('D) Neither is strong')
+        doc.add_paragraph('Answer: A')
+        buf = io.BytesIO()
+        doc.save(buf)
+        buf.seek(0)
+
+        questions = parse_docx(buf)
+
+        text_html = questions[0]['text_html']
+        self.assertEqual(text_html.count('<br>'), 3)
+        self.assertIn('colleges?<br>Arguments:', text_html)
+        self.assertIn('Arguments:<br>I. Yes', text_html)
+        self.assertIn('urgent need.<br>II. No', text_html)
+        self.assertNotIn('\n', text_html)
+
+    def test_soft_line_break_inside_a_bold_run_still_nests_correctly(self):
+        doc = DocxDocument()
+        p = doc.add_paragraph()
+        run = p.add_run('Q1. Bold line one')
+        run.bold = True
+        run.add_break()
+        run2 = p.add_run('bold line two')
+        run2.bold = True
+        doc.add_paragraph('A) 1')
+        doc.add_paragraph('B) 2')
+        doc.add_paragraph('C) 3')
+        doc.add_paragraph('D) 4')
+        doc.add_paragraph('Answer: A')
+        buf = io.BytesIO()
+        doc.save(buf)
+        buf.seek(0)
+
+        questions = parse_docx(buf)
+
+        # The break lands inside the FIRST run's own text (python-docx
+        # appends a trailing "\n" to whichever run .add_break() is called
+        # on), so this renders as two adjacent <strong> tags rather than
+        # one spanning both lines — visually identical in a browser (two
+        # adjacent inline elements with the same styling render as one
+        # continuous run), just not textually merged into a single tag.
+        text_html = questions[0]['text_html']
+        self.assertIn('<strong>Bold line one<br></strong>', text_html)
+        self.assertIn('<strong>bold line two</strong>', text_html)
+
+    def test_soft_line_break_in_an_option_and_explanation_also_becomes_br(self):
+        doc = DocxDocument()
+        doc.add_paragraph('Q1. Stem?')
+        p = doc.add_paragraph()
+        p.add_run('A) first line')
+        p.add_run().add_break()
+        p.add_run('second line')
+        doc.add_paragraph('B) 2')
+        doc.add_paragraph('C) 3')
+        doc.add_paragraph('D) 4')
+        doc.add_paragraph('Answer: A')
+        exp_p = doc.add_paragraph()
+        exp_p.add_run('Explanation: first line')
+        exp_p.add_run().add_break()
+        exp_p.add_run('second line')
+        buf = io.BytesIO()
+        doc.save(buf)
+        buf.seek(0)
+
+        questions = parse_docx(buf)
+
+        self.assertIn('first line<br>second line', questions[0]['options'][0]['text_html'])
+        self.assertIn('first line<br>second line', questions[0]['explanation_html'])
+
+
 def _pq(text, option_texts):
     return {'text_html': text, 'options': [{'text_html': t} for t in option_texts]}
 
