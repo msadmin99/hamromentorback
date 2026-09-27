@@ -161,16 +161,25 @@ class ScheduleSessionRemindersGrandTestTests(TestCase):
         course_ids = {n.course_id for n in created}
         self.assertEqual(course_ids, {self.course.id})
 
-    def test_ineligible_student_no_commercial_access_excluded_at_schedule_time(self):
-        ineligible = _make_user('no_access_student')
-        _enroll(ineligible, self.course)
-        # Deliberately no GrandTestAccess grant for `ineligible`.
+    def test_registered_student_without_grand_test_access_still_receives_the_reminder(self):
+        """Business-rule fix: notification eligibility is course registration,
+        NOT commercial access. A student enrolled in the course but who has
+        never purchased/subscribed to this specific Grand Test must still
+        get the "exam starts soon" reminder — see notifications/eligibility.py's
+        module docstring. Formerly named
+        test_ineligible_student_no_commercial_access_excluded_at_schedule_time
+        and asserted the OPPOSITE (exclusion) — that was the bug."""
+        registered_no_purchase = _make_user('no_access_student')
+        _enroll(registered_no_purchase, self.course)
+        # Deliberately no GrandTestAccess grant for `registered_no_purchase`.
 
         start = timezone.now() + timedelta(days=2)
         session = _make_session(self.test, start, start + timedelta(hours=2))
-        exam_integration.schedule_session_reminders(session)
+        created = exam_integration.schedule_session_reminders(session)
 
-        self.assertFalse(Notification.objects.filter(user=ineligible).exists())
+        self.assertTrue(Notification.objects.filter(user=registered_no_purchase).exists())
+        notified_user_ids = {n.user_id for n in created}
+        self.assertIn(registered_no_purchase.id, notified_user_ids)
 
     def test_no_courses_assigned_yields_no_notifications(self):
         test = _make_test('grand', title='Unassigned Grand Test', courses=())
@@ -221,13 +230,20 @@ class ScheduleSessionRemindersDailyTestTests(TestCase):
         self.assertIn('DAILY_TEST_AVAILABLE', event_types)
         self.assertNotIn('DAILY_TEST_ENDING', event_types)
 
-    def test_pro_daily_test_requires_a_subscription(self):
+    def test_pro_daily_test_reminder_does_not_require_a_subscription(self):
+        """Same business-rule fix as the Grand Test case above: a course-
+        registered student gets the Daily Test reminder even for a PRO
+        (subscription-gated) daily test they haven't subscribed to. Formerly
+        named test_pro_daily_test_requires_a_subscription and asserted `[]`
+        (no notifications) — that was the bug; has_daily_test_access
+        (commercial) must not gate this event."""
         pro_test = _make_test('daily', title='Pro Daily Test', courses=[self.course], is_pro=True)
         start = timezone.now() + timedelta(hours=1)
         session = _make_session(pro_test, start, start + timedelta(hours=5))
 
         created = exam_integration.schedule_session_reminders(session)
-        self.assertEqual(created, [])  # no subscription -> has_daily_test_access is False
+        self.assertIn('DAILY_TEST_AVAILABLE', {n.event_type for n in created})
+        self.assertIn(self.student.id, {n.user_id for n in created})
 
 
 class CancelAndRescheduleNotificationsTests(TestCase):

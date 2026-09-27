@@ -20,8 +20,12 @@ from .models import Notification, NotificationDelivery, NotificationPreference
 User = get_user_model()
 
 
-def _make_user(username='student1'):
-    return User.objects.create_user(username=username, email=f'{username}@example.com', password='pw12345')
+def _make_user(username='student1', **kw):
+    # email_verified=True by default — see notifications/tests_email_delivery.py's
+    # identical helper: this file is Phase 1's core create_notification/
+    # dedupe/preference-resolution suite, unrelated to email verification.
+    kw.setdefault('email_verified', True)
+    return User.objects.create_user(username=username, email=f'{username}@example.com', password='pw12345', **kw)
 
 
 def _make_course(name='CEE-MBBS'):
@@ -299,29 +303,55 @@ class SchedulingTests(APITestCase):
 
 
 # =====================================================================
-# Eligibility (§31) — the one real, working example
+# Eligibility (§31) — course-registration audience rule
 # =====================================================================
+# BUSINESS-RULE FIX: is_eligible_for_grand_test_notification no longer
+# requires GrandTestAccess (commercial access) — see notifications/
+# eligibility.py's module docstring. The three tests below used to prove
+# the opposite (no grant -> ineligible, revoked grant -> ineligible) using
+# a Test whose `created_by` is the same user, which made can_view_test()
+# trivially True regardless of any grant — exactly the case that exposed
+# the fix cleanly. Replaced with tests that prove the actual current rule:
+# a real, working example dedicated to it lives in
+# notifications/tests_exam_reminder_audience.py; these three stay here as
+# the direct unit-level proof for this exact function.
 
 class GrandTestEligibilityTests(APITestCase):
     def setUp(self):
         self.user = _make_user()
         self.test = _make_test(self.user)
 
-    def test_ineligible_with_no_access_grant_at_all(self):
-        self.assertFalse(eligibility.is_eligible_for_grand_test_notification(self.user, self.test))
+    def test_eligible_with_no_access_grant_at_all(self):
+        """No GrandTestAccess row anywhere — still eligible for the
+        reminder (course/view eligibility only; see module docstring)."""
+        self.assertFalse(GrandTestAccess.objects.filter(user=self.user, test=self.test).exists())
+        self.assertTrue(eligibility.is_eligible_for_grand_test_notification(self.user, self.test))
 
     def test_eligible_once_a_real_grant_exists(self):
+        """A purchase does not remove eligibility either — course/view
+        eligibility is unaffected by whether commercial access exists."""
         GrandTestAccess.objects.create(user=self.user, test=self.test, granted_at=timezone.now())
         self.assertTrue(eligibility.is_eligible_for_grand_test_notification(self.user, self.test))
 
-    def test_ineligible_once_the_grant_is_revoked(self):
-        """§31: eligibility can change between scheduling and delivery — a
-        revoked GrandTestAccess (e.g. the paying purchase was refunded)
-        must fail this check even though a row still exists."""
+    def test_still_eligible_once_a_grant_is_revoked(self):
+        """A revoked GrandTestAccess (e.g. the paying purchase was refunded)
+        no longer affects this check at all — it was the commercial-access
+        check that used to fail here; only view-eligibility (course/batch/
+        draft-state) governs the reminder now."""
         GrandTestAccess.objects.create(
             user=self.user, test=self.test, granted_at=timezone.now(), revoked_at=timezone.now(),
         )
-        self.assertFalse(eligibility.is_eligible_for_grand_test_notification(self.user, self.test))
+        self.assertTrue(eligibility.is_eligible_for_grand_test_notification(self.user, self.test))
+
+    def test_ineligible_when_the_exam_is_not_even_viewable(self):
+        """View-eligibility (draft-state/course/batch scoping) is the one
+        thing that still governs this check — proven with a user who
+        neither created the test nor is enrolled in any of its courses, on
+        a draft exam (can_access_test's very first, unconditional gate)."""
+        stranger = _make_user('stranger_no_relation')
+        self.test.is_draft = True
+        self.test.save(update_fields=['is_draft'])
+        self.assertFalse(eligibility.is_eligible_for_grand_test_notification(stranger, self.test))
 
 
 # =====================================================================

@@ -65,12 +65,21 @@ def _eligible_students_for_test(test):
     (architecture prompt §1: never fake or guess a course). A student
     enrolled in more than one of the test's courses is yielded once per
     matching course; each is a separately, correctly course-scoped
-    notification. Commercial+view eligibility (§31, §2) is checked here,
-    at schedule time, via the real existing functions — never
+    notification.
+
+    Course registration is the audience filter, not commercial access
+    (see notifications/eligibility.py's module docstring for the full
+    business-rule reasoning): the candidate set below already comes from
+    active Enrollment rows in one of this test's courses, and the one
+    remaining check — is_eligible_for_*_notification — only verifies the
+    exam is even visible to this student (course/batch/individual
+    assignment, draft-state), never whether they purchased it. Checked
+    here, at schedule time, via the real existing function — never
     re-implemented — so an ineligible student never gets a row created for
     them in the first place (delivery-time re-checking in
     services.dispatch_due_notifications handles the case where eligibility
-    changes AFTER scheduling)."""
+    changes AFTER scheduling, e.g. their enrollment lapses before the
+    reminder fires)."""
     is_eligible = is_eligible_for_grand_test_notification if test.exam_type == 'grand' else is_eligible_for_daily_test_notification
     seen = set()
     for course in test.courses.all():
@@ -160,6 +169,65 @@ def schedule_session_reminders(session):
                 ))
 
     return created
+
+
+def audience_counts(test):
+    """Admin-facing preview (§ "ADMIN CONFIGURATION" — show the distinction
+    between registered students and exam subscribers, never require the
+    admin to hand-pick recipients). Read-only, on-demand (an admin viewing
+    one exam's schedule), never called from the scheduling hot path —
+    schedule_session_reminders/_eligible_students_for_test above stay a
+    lazy queryset iteration regardless of how this function is implemented.
+
+    Returns:
+      registered_students — distinct active-enrollment users across every
+        course this test belongs to (the actual reminder audience's source
+        set, before the view/draft-state check below).
+      reminder_audience — the same set, narrowed to students for whom the
+        exam is actually visible (course/batch/individual assignment,
+        draft-state) — i.e. exactly who schedule_session_reminders() would
+        notify right now. Course registration is the ONLY filter; this
+        number is deliberately NOT narrowed by commercial access.
+      exam_subscribers — how many of the registered students currently also
+        hold commercial access to this specific exam (billing.access.
+        get_grand_test_access / has_daily_test_access) — informational only,
+        so an admin can see the purchase-vs-registration gap; never used to
+        filter the reminder audience itself.
+    """
+    from billing.access import get_grand_test_access, has_daily_test_access
+
+    if test.exam_type not in ('grand', 'daily') or not test.courses.exists():
+        return {'registered_students': 0, 'exam_subscribers': 0, 'reminder_audience': 0}
+
+    registered_user_ids = set(
+        Enrollment.objects.filter(course__in=test.courses.all(), is_active=True)
+        .values_list('user_id', flat=True)
+    )
+    if not registered_user_ids:
+        return {'registered_students': 0, 'exam_subscribers': 0, 'reminder_audience': 0}
+
+    from django.contrib.auth import get_user_model
+    users = get_user_model().objects.filter(id__in=registered_user_ids)
+
+    is_eligible = is_eligible_for_grand_test_notification if test.exam_type == 'grand' else is_eligible_for_daily_test_notification
+    has_commercial_access = (
+        (lambda u: get_grand_test_access(u, test) is not None) if test.exam_type == 'grand'
+        else (lambda u: has_daily_test_access(u, test))
+    )
+
+    reminder_audience = 0
+    exam_subscribers = 0
+    for user in users:
+        if is_eligible(user, test):
+            reminder_audience += 1
+        if has_commercial_access(user):
+            exam_subscribers += 1
+
+    return {
+        'registered_students': len(registered_user_ids),
+        'exam_subscribers': exam_subscribers,
+        'reminder_audience': reminder_audience,
+    }
 
 
 def notify_result_available(attempt):
