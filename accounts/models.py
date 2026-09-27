@@ -108,13 +108,6 @@ ALL_FEATURES = [
     'dashboard', 'courses', 'question_bank', 'question_entry', 'video_lectures', 'daily_practice', 'students',
     'test_series', 'self_mock_test', 'enrollment_requests', 'question_reports', 'daily_live_exam', 'mock_test',
     'website_settings', 'advanced', 'billing', 'teacher_applications', 'marketplace_courses',
-    # Phase 7B — Admin Notification Dashboard (read-only). Deliberately
-    # NOT added to EDITOR_ALLOWED_FEATURES below: the dashboard's own
-    # backend endpoints are gated IsAdminRoleOrAbove (notifications/views.py),
-    # which excludes Editor-role accounts outright — this feature key just
-    # keeps the frontend nav/route gate consistent with that, the same
-    # dual-layer pattern 'billing' already uses for Payments/Analytics.
-    'notifications',
     *EXAM_MANAGEMENT_FEATURES,
 ]
 

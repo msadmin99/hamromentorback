@@ -77,14 +77,15 @@ class LoginView(APIView):
         try:
             user = User.objects.get(Q(email__iexact=identifier) | Q(phone=identifier))
         except User.DoesNotExist:
-            return error_response(status.HTTP_401_UNAUTHORIZED, 'invalid_credentials', 'Invalid credentials.')
+            return Response({'detail': 'Invalid credentials.'}, status=status.HTTP_401_UNAUTHORIZED)
 
         if not user.check_password(data['password']):
-            return error_response(status.HTTP_401_UNAUTHORIZED, 'invalid_credentials', 'Invalid credentials.')
+            return Response({'detail': 'Invalid credentials.'}, status=status.HTTP_401_UNAUTHORIZED)
 
         if not user.is_active:
-            return error_response(
-                status.HTTP_403_FORBIDDEN, 'account_blocked', 'This account has been blocked. Contact support.',
+            return Response(
+                {'detail': 'This account has been blocked. Contact support.'},
+                status=status.HTTP_403_FORBIDDEN,
             )
 
         device_id = data.get('device_id')
@@ -98,9 +99,9 @@ class LoginView(APIView):
                 if device_count >= MAX_DEVICES:
                     user.is_active = False
                     user.save(update_fields=['is_active'])
-                    return error_response(
-                        status.HTTP_403_FORBIDDEN, 'device_limit_reached',
-                        'Login limit of 3 devices reached. Account blocked.',
+                    return Response(
+                        {'detail': 'Login limit of 3 devices reached. Account blocked.'},
+                        status=status.HTTP_403_FORBIDDEN,
                     )
                 Device.objects.create(
                     user=user, device_id=device_id, device_label=data.get('device_label', ''),
@@ -721,7 +722,7 @@ class AccountSettingsView(APIView):
         if payment_channel is not None:
             valid_channels = dict(StudentProfile.PAYMENT_CHANNEL_CHOICES)
             if payment_channel and payment_channel not in valid_channels:
-                return error_response(400, 'invalid_payment_channel', 'Invalid preferred_payment_channel.')
+                return Response({'detail': 'Invalid preferred_payment_channel.'}, status=400)
             profile, _ = StudentProfile.objects.get_or_create(user=request.user)
             profile.preferred_payment_channel = payment_channel
             profile.save(update_fields=['preferred_payment_channel'])
@@ -738,15 +739,13 @@ class ChangePasswordView(APIView):
         confirm = request.data.get('confirm_password', '')
 
         if not request.user.check_password(current):
-            return error_response(
-                status.HTTP_400_BAD_REQUEST, 'current_password_incorrect', 'Current password is incorrect.',
-            )
+            return Response({'detail': 'Current password is incorrect.'}, status=status.HTTP_400_BAD_REQUEST)
         if new != confirm:
-            return error_response(status.HTTP_400_BAD_REQUEST, 'password_mismatch', 'New passwords do not match.')
+            return Response({'detail': 'New passwords do not match.'}, status=status.HTTP_400_BAD_REQUEST)
         try:
             validate_password(new, user=request.user)
         except Exception as exc:
-            return error_response(status.HTTP_400_BAD_REQUEST, 'invalid_password', ' '.join(exc.messages))
+            return Response({'detail': ' '.join(exc.messages)}, status=status.HTTP_400_BAD_REQUEST)
 
         request.user.set_password(new)
         request.user.save()
@@ -896,11 +895,11 @@ class ProfilePhotoUploadView(APIView):
     def post(self, request):
         file_obj = request.FILES.get('photo')
         if not file_obj:
-            return error_response(status.HTTP_400_BAD_REQUEST, 'no_photo_uploaded', 'No photo uploaded.')
+            return Response({'detail': 'No photo uploaded.'}, status=status.HTTP_400_BAD_REQUEST)
         try:
             verification_storage.validate_photo(file_obj)
         except verification_storage.InvalidUpload as exc:
-            return error_response(status.HTTP_400_BAD_REQUEST, 'photo_upload_failed', str(exc))
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
         profile, _ = StudentProfile.objects.get_or_create(user=request.user)
         old_photo = profile.photo if profile.photo else None
@@ -940,19 +939,17 @@ class MyVerificationView(APIView):
         document_type = request.data.get('document_type')
         valid_types = dict(VerificationDocument.DOCUMENT_TYPE_CHOICES)
         if document_type not in valid_types:
-            return error_response(
-                status.HTTP_400_BAD_REQUEST, 'unknown_document_type', f'Unknown document_type "{document_type}".',
-            )
+            return Response({'detail': f'Unknown document_type "{document_type}".'}, status=status.HTTP_400_BAD_REQUEST)
         file_obj = request.FILES.get('file')
         if not file_obj:
-            return error_response(status.HTTP_400_BAD_REQUEST, 'no_file_uploaded', 'No file uploaded.')
+            return Response({'detail': 'No file uploaded.'}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
             bucket, key, content_type, size = verification_storage.store_verification_document(
                 file_obj, request.user.id, document_type,
             )
         except verification_storage.InvalidUpload as exc:
-            return error_response(status.HTTP_400_BAD_REQUEST, 'verification_upload_failed', str(exc))
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
         document = VerificationDocument.objects.create(
             user=request.user, document_type=document_type, storage_bucket=bucket, storage_key=key,

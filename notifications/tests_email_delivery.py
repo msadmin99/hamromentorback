@@ -148,61 +148,63 @@ class TransactionSafetyTests(TestCase):
 
 
 class AsyncEnqueueConstructionTests(TestCase):
-    """AWS migration, Phase 3/9 (originally Phase 4E against Cloud Tasks) —
-    every other test in this file exercises only the
+    """Phase 4E (docs/PHASE_4E_EMAIL_QUEUE_INFRASTRUCTURE.md §10) — every
+    existing test up to this phase exercised only the
     EMAIL_PROCESSING_ASYNC=False sync-fallback branch of
-    enqueue_email_delivery_task (the local/test default). This closes that
-    gap by mocking only the true external boundary (boto3's SQS client,
-    via hamromentor.sqs's own lazily-imported boto3.client('sqs')), never
-    email_tasks.py's or hamromentor.sqs's own logic — proving the CODE
-    sends the exact expected message to the exact expected queue,
-    independent of whether a real queue exists to receive it."""
+    enqueue_email_delivery_task (the local/test default). Nothing
+    previously proved the ASYNC branch itself builds a correct Cloud
+    Tasks request — this closes that gap by mocking only the true
+    external boundary (google.cloud.tasks_v2.CloudTasksClient), never
+    email_tasks.py's own logic. The real `email` queue itself (project
+    hamromentor-app, region us-central1) and a real dispatch's mechanics
+    were separately verified outside the test suite (§12 of the Phase 4E
+    report) — this test proves the CODE constructs that dispatch
+    correctly, independent of whether a real queue exists to receive it."""
 
     def setUp(self):
         self.user = _make_user('async_enqueue_student')
-        # hamromentor.sqs._client() is @lru_cache'd (process-wide, across
-        # tests) — without clearing it here, a client mocked/cached by an
-        # earlier test in the same run would leak into this one instead
-        # of the fresh mock each `with patch('boto3.client')` block below
-        # sets up. Same precedent as media_library.tests's
-        # gcs_storage._iam_signing_credentials.cache_clear() pattern.
-        from hamromentor import sqs
-        sqs._client.cache_clear()
 
-    @override_settings(EMAIL_PROCESSING_ASYNC=True, AWS_SQS_EMAIL_QUEUE_URL='https://sqs.ap-south-1.amazonaws.com/123456789012/email')
-    def test_async_path_sends_the_exact_expected_sqs_message(self):
+    @override_settings(
+        EMAIL_PROCESSING_ASYNC=True, CLOUD_TASKS_EMAIL_QUEUE='email',
+        GCP_PROJECT_ID='hamromentor-app', GCP_REGION='us-central1',
+        BACKEND_INTERNAL_URL='https://api.drgutka.com', EMAIL_PROCESSING_SECRET='real-secret-value',
+    )
+    def test_async_path_builds_the_exact_expected_cloud_tasks_request(self):
         notification = Notification.objects.create(
             user=self.user, event_type='ANNOUNCEMENT', category='announcements', title='Hi', body='Body',
         )
         delivery = NotificationDelivery.objects.create(notification=notification, channel=CHANNEL_EMAIL)
 
-        # hamromentor/sqs.py imports `boto3` LOCALLY inside _client() (not
-        # a module-level name) — patched at boto3.client itself, matching
-        # this file's own existing convention of patching the true
-        # external boundary, never hamromentor.sqs's own logic.
-        with patch('boto3.client') as mock_boto_client, \
+        # email_tasks.py imports `from google.cloud import tasks_v2` LOCALLY
+        # inside the function (not a module-level name) — patched at its
+        # real source (google.cloud.tasks_v2), not on email_tasks itself,
+        # which has no such attribute to patch.
+        with patch('google.cloud.tasks_v2.CloudTasksClient') as mock_client_cls, \
              patch('notifications.email_tasks.process_email_delivery') as mock_process:
-            mock_sqs_client = mock_boto_client.return_value
-            mock_sqs_client.send_message.return_value = {'MessageId': 'fake-message-id'}
+            mock_client = mock_client_cls.return_value
+            mock_client.queue_path.return_value = 'projects/hamromentor-app/locations/us-central1/queues/email'
             email_tasks.enqueue_email_delivery_task(delivery.id)
 
         # The sync path must NEVER also run when async is enabled — this
         # is exactly the "async send + sync send for the same delivery"
-        # duplicate-email risk §15/§16 of the original Phase 4E brief
-        # warns about, unaffected by which queue technology sits behind it.
+        # duplicate-email risk §15/§16 of the brief warns about.
         mock_process.assert_not_called()
 
-        mock_boto_client.assert_called_once_with('sqs', region_name='ap-south-1')
-        mock_sqs_client.send_message.assert_called_once()
-        call_kwargs = mock_sqs_client.send_message.call_args.kwargs
-        self.assertEqual(call_kwargs['QueueUrl'], 'https://sqs.ap-south-1.amazonaws.com/123456789012/email')
+        mock_client.queue_path.assert_called_once_with('hamromentor-app', 'us-central1', 'email')
+        mock_client.create_task.assert_called_once()
+        request = mock_client.create_task.call_args.kwargs['request']
+        self.assertEqual(request['parent'], 'projects/hamromentor-app/locations/us-central1/queues/email')
+
+        http_request = request['task']['http_request']
+        self.assertEqual(http_request['url'], 'https://api.drgutka.com/api/notifications/email/process/')
+        self.assertEqual(http_request['headers']['X-Email-Processing-Secret'], 'real-secret-value')
 
         import json as _json
-        body = _json.loads(call_kwargs['MessageBody'])
+        body = _json.loads(http_request['body'])
         self.assertEqual(body, {'delivery_id': delivery.id})
 
     @override_settings(EMAIL_PROCESSING_ASYNC=False)
-    def test_sync_path_never_touches_the_sqs_client(self):
+    def test_sync_path_never_touches_cloud_tasks_client(self):
         """The mirror image of the test above — proves the two branches
         are mutually exclusive, never both firing for one enqueue call."""
         notification = Notification.objects.create(
@@ -210,12 +212,12 @@ class AsyncEnqueueConstructionTests(TestCase):
         )
         delivery = NotificationDelivery.objects.create(notification=notification, channel=CHANNEL_EMAIL)
 
-        with patch('boto3.client') as mock_boto_client, \
+        with patch('google.cloud.tasks_v2.CloudTasksClient') as mock_client_cls, \
              patch('notifications.email_tasks.process_email_delivery') as mock_process:
             email_tasks.enqueue_email_delivery_task(delivery.id)
 
         mock_process.assert_called_once_with(delivery.id)
-        mock_boto_client.assert_not_called()
+        mock_client_cls.assert_not_called()
 
     def test_one_delivery_row_produces_at_most_one_enqueue_call_via_the_real_pipeline(self):
         """§16 — proves the real create_notification() -> on_commit ->

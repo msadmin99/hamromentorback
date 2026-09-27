@@ -1,7 +1,7 @@
 from decimal import Decimal
 
 from django.conf import settings
-from django.core.mail import get_connection, send_mail
+from django.core.mail import send_mail
 from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -384,17 +384,17 @@ class ApplyCouponView(APIView):
 
             teacher_course = get_object_or_404(TeacherCourse, pk=data['teacher_course_id'])
         if data['kind'] == 'subscription' and not plan:
-            return error_response(400, 'plan_required', 'plan_id is required.', valid=False)
+            return Response({'detail': 'plan_id is required.'}, status=400)
         if data['kind'] == 'grand_test' and not grand_test:
-            return error_response(400, 'grand_test_required', 'grand_test_id is required.', valid=False)
+            return Response({'detail': 'grand_test_id is required.'}, status=400)
         if data['kind'] == 'teacher_course' and not teacher_course:
-            return error_response(400, 'teacher_course_required', 'teacher_course_id is required.', valid=False)
+            return Response({'detail': 'teacher_course_id is required.'}, status=400)
 
         amount, discount, final, coupon, error = compute_price(
             data['kind'], plan, grand_test, data.get('code', ''), request.user, teacher_course=teacher_course,
         )
         if error:
-            return error_response(400, 'coupon_invalid', error, valid=False)
+            return Response({'detail': error, 'valid': False}, status=400)
         discount_source = None
         if coupon:
             discount_source = 'coupon'
@@ -422,16 +422,14 @@ class ComboQuoteView(APIView):
         else:
             plan_ids = request.data.get('plan_ids') or []
         if not plan_ids:
-            return error_response(
-                400, 'combo_selection_required', 'Select at least 2 products to build a combo.', valid=False,
-            )
+            return Response({'valid': False, 'detail': 'Select at least 2 products to build a combo.'}, status=400)
         plans = list(SubscriptionPlan.objects.filter(pk__in=plan_ids))
         if len(plans) != len(set(plan_ids)):
-            return error_response(400, 'plans_not_found', 'One or more selected plans were not found.', valid=False)
+            return Response({'valid': False, 'detail': 'One or more selected plans were not found.'}, status=400)
         try:
             individual_value, discount_percent, you_save, final_price = _validate_and_price_combo(plans)
         except PaymentError as exc:
-            return error_response(400, 'pricing_error', exc.message, valid=False)
+            return Response({'valid': False, 'detail': exc.message}, status=400)
         return Response({
             'valid': True, 'individual_value': individual_value, 'discount_percent': discount_percent,
             'you_save': you_save, 'final_price': final_price,
@@ -555,13 +553,13 @@ class PurchaseViewSet(viewsets.ModelViewSet):
 
             teacher_course = get_object_or_404(TeacherCourse, pk=data['teacher_course_id'], status='approved')
         if data['kind'] == 'subscription' and not plan:
-            return error_response(400, 'plan_required', 'plan_id is required.')
+            return Response({'detail': 'plan_id is required.'}, status=400)
         if data['kind'] == 'grand_test' and not grand_test:
-            return error_response(400, 'grand_test_required', 'grand_test_id is required.')
+            return Response({'detail': 'grand_test_id is required.'}, status=400)
         if data['kind'] == 'teacher_course' and not teacher_course:
-            return error_response(400, 'teacher_course_required', 'teacher_course_id is required.')
+            return Response({'detail': 'teacher_course_id is required.'}, status=400)
         if data['kind'] == 'grand_test' and GrandTestAccess.objects.filter(user=request.user, test=grand_test).exists():
-            return error_response(400, 'already_has_access', 'You already have access to this Grand Test.')
+            return Response({'detail': 'You already have access to this Grand Test.'}, status=400)
         if data['kind'] == 'teacher_course':
             from marketplace.models import CourseEnrollment
 
@@ -569,13 +567,13 @@ class PurchaseViewSet(viewsets.ModelViewSet):
                 user=request.user, course=teacher_course, is_active=True,
             ).filter(Q(expires_at__isnull=True) | Q(expires_at__gte=timezone.now())).exists()
             if already_enrolled:
-                return error_response(400, 'already_has_access', 'You already have access to this course.')
+                return Response({'detail': 'You already have access to this course.'}, status=400)
 
         amount, discount, final, coupon, error = compute_price(
             data['kind'], plan, grand_test, data.get('coupon_code', ''), request.user, teacher_course=teacher_course,
         )
         if error:
-            return error_response(400, 'pricing_error', error)
+            return Response({'detail': error}, status=400)
 
         purchase = Purchase.objects.create(
             user=request.user, kind=data['kind'], plan=plan, grand_test=grand_test, teacher_course=teacher_course,
@@ -603,13 +601,13 @@ class PurchaseViewSet(viewsets.ModelViewSet):
             else:
                 plan_ids = data.get('plan_ids') or []
                 if not plan_ids:
-                    return error_response(400, 'combo_selection_required', 'combo_plan_id or plan_ids is required.')
+                    return Response({'detail': 'combo_plan_id or plan_ids is required.'}, status=400)
                 plans = list(SubscriptionPlan.objects.filter(pk__in=plan_ids))
                 if len(plans) != len(set(plan_ids)):
-                    return error_response(400, 'plans_not_found', 'One or more selected plans were not found.')
+                    return Response({'detail': 'One or more selected plans were not found.'}, status=400)
                 individual_value, _discount_percent, you_save, final_price = _validate_and_price_combo(plans)
         except PaymentError as exc:
-            return error_response(400, 'pricing_error', exc.message)
+            return Response({'detail': exc.message}, status=400)
 
         purchase = Purchase.objects.create(
             user=request.user, kind='combo', combo_plan=combo_plan,
@@ -688,7 +686,7 @@ class PurchaseViewSet(viewsets.ModelViewSet):
                 screenshot_file=data['payment_screenshot'],
             )
         except PaymentError as exc:
-            return error_response(400, 'payment_error', exc.message)
+            return Response({'detail': exc.message}, status=400)
         return Response(PurchaseSerializer(purchase).data)
 
     # FIX (P0 security audit): these four actions previously used bare
@@ -753,7 +751,7 @@ class PurchaseViewSet(viewsets.ModelViewSet):
         try:
             purchase = payment_service.cancel(purchase.id, actor=request.user, request=request)
         except PaymentError as exc:
-            return error_response(400, 'payment_error', exc.message)
+            return Response({'detail': exc.message}, status=400)
         return Response(PurchaseSerializer(purchase).data)
 
     @action(detail=True, methods=['get'], permission_classes=[IsAuthenticated])
@@ -764,10 +762,10 @@ class PurchaseViewSet(viewsets.ModelViewSet):
         up in server access/referrer logs the way a redirect target would."""
         purchase = self.get_object()
         if not (request.user.is_staff or purchase.user_id == request.user.id):
-            return error_response(403, 'not_allowed', 'Not allowed.')
+            return Response({'detail': 'Not allowed.'}, status=403)
         url = screenshot_view_url(purchase.payment_screenshot_bucket, purchase.payment_screenshot_key)
         if not url:
-            return error_response(404, 'screenshot_not_found', 'No screenshot on file for this purchase.')
+            return Response({'detail': 'No screenshot on file for this purchase.'}, status=404)
         return Response({'url': url})
 
     @action(detail=True, methods=['get'], permission_classes=[IsAdminRoleOrAbove], url_path='audit-log')
@@ -815,7 +813,7 @@ class PurchaseViewSet(viewsets.ModelViewSet):
             'Dr. Gutka Support',
         ]
         if not purchase.user.email:
-            return error_response(400, 'no_email_on_file', 'No email address on file for this account.')
+            return Response({'detail': 'No email address on file for this account.'}, status=400)
         send_mail(
             f'Your invoice {purchase.order_id} — Dr. Gutka', '\n'.join(lines),
             settings.DEFAULT_FROM_EMAIL, [purchase.user.email], fail_silently=False,
@@ -883,47 +881,19 @@ class SendRenewalRemindersView(APIView):
         today = timezone.localdate()
         counts = {'checked': 0, 'sent': 0, 'skipped': 0, 'failed': 0}
         subs = Subscription.objects.filter(is_active=True, expires_at__isnull=False).select_related('user', 'course')
-        # Phase 4 (docs/PHASE_4_EMAIL_TRACEABILITY_AND_DESIGN.md §11/§20-21):
-        # one shared SMTP connection for the whole sweep instead of one
-        # fresh connection per matching subscription — the real,
-        # evidence-based scaling risk that audit identified, now closed
-        # with a minimally-scoped change (send_notification/_send_email
-        # both default `connection=None`, so every OTHER caller of either
-        # is completely unaffected). get_connection() itself respects
-        # EMAIL_TIMEOUT (set globally in settings), so this loop can no
-        # longer block indefinitely on an unresponsive server either.
-        #
-        # Phase 4C (docs/PHASE_4C_EMAIL_PRODUCTION_READINESS.md §14/§25):
-        # get_connection() alone does NOT open a connection — it only
-        # constructs the backend object. Without the explicit open() call
-        # below, Django's own EmailBackend.send_messages() sees an
-        # unopened connection on every single send_mail() call inside the
-        # loop, opens one, sends, and then closes it again itself (it only
-        # ever skips that auto-close when the connection was ALREADY open
-        # on entry) — meaning every prior version of this loop silently
-        # opened and closed its own fresh SMTP connection per recipient
-        # despite passing `connection=` through, defeating the entire
-        # point of this change. Calling open() here first is what actually
-        # makes every subsequent send_mail() in the loop see an
-        # already-open connection and skip the auto-close.
-        connection = get_connection()
-        connection.open()
-        try:
-            for sub in subs:
-                counts['checked'] += 1
-                days_left = (sub.expires_at.date() - today).days
-                notification_type = next((t for t, d in REMINDER_SCHEDULE.items() if d == days_left), None)
-                if not notification_type:
-                    continue
-                if NotificationLog.objects.filter(subscription=sub, notification_type=notification_type).exists():
-                    continue
-                logs = send_notification(sub.user, notification_type, sub, connection=connection)
-                for log in logs:
-                    counts[log.status] = counts.get(log.status, 0) + 1
-                from notifications.billing_integration import notify_subscription_lifecycle
-                notify_subscription_lifecycle(sub, notification_type)
-        finally:
-            connection.close()
+        for sub in subs:
+            counts['checked'] += 1
+            days_left = (sub.expires_at.date() - today).days
+            notification_type = next((t for t, d in REMINDER_SCHEDULE.items() if d == days_left), None)
+            if not notification_type:
+                continue
+            if NotificationLog.objects.filter(subscription=sub, notification_type=notification_type).exists():
+                continue
+            logs = send_notification(sub.user, notification_type, sub)
+            for log in logs:
+                counts[log.status] = counts.get(log.status, 0) + 1
+            from notifications.billing_integration import notify_subscription_lifecycle
+            notify_subscription_lifecycle(sub, notification_type)
 
         return Response(counts)
 

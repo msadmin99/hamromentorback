@@ -55,7 +55,7 @@ def _valid_upload(name='doc.png'):
 # 3 + 4. Real HTTP start-attempt regression (free + paid, all 4 states),
 # including the live Free Starter fallback path.
 # ---------------------------------------------------------------------------
-@override_settings(MEDIA_GCS_PRIVATE_BUCKET='test-private-bucket', AWS_S3_PRIVATE_BUCKET='test-private-bucket')
+@override_settings(MEDIA_GCS_PRIVATE_BUCKET='test-private-bucket')
 class RealStartAttemptRegressionTests(APITestCase):
     """Exercises the ACTUAL POST /api/tests/{id}/start/ endpoint (the real
     _start_attempt code path, including whatever Free Starter/entitlements
@@ -221,7 +221,7 @@ class RegistrationAuditTests(APITestCase):
 # ---------------------------------------------------------------------------
 # 9. Admin authorization — real role semantics, not just is_staff
 # ---------------------------------------------------------------------------
-@override_settings(MEDIA_GCS_PRIVATE_BUCKET='test-private-bucket', AWS_S3_PRIVATE_BUCKET='test-private-bucket')
+@override_settings(MEDIA_GCS_PRIVATE_BUCKET='test-private-bucket')
 class AdminRoleBoundaryTests(APITestCase):
     def setUp(self):
         self.student = User.objects.create_user(username='role_stu', email='role_stu@example.com', password='pw12345')
@@ -299,7 +299,7 @@ class AdminRoleBoundaryTests(APITestCase):
 # ---------------------------------------------------------------------------
 # 10. Mass-assignment audit
 # ---------------------------------------------------------------------------
-@override_settings(MEDIA_GCS_PRIVATE_BUCKET='test-private-bucket', AWS_S3_PRIVATE_BUCKET='test-private-bucket')
+@override_settings(MEDIA_GCS_PRIVATE_BUCKET='test-private-bucket')
 class MassAssignmentAuditTests(APITestCase):
     def setUp(self):
         self.student = User.objects.create_user(username='mass_stu', email='mass_stu@example.com', password='pw12345')
@@ -361,7 +361,7 @@ class MassAssignmentAuditTests(APITestCase):
 # ---------------------------------------------------------------------------
 # 6 + 11. State machine + resubmission lifecycle, zero manual DB steps
 # ---------------------------------------------------------------------------
-@override_settings(MEDIA_GCS_PRIVATE_BUCKET='test-private-bucket', AWS_S3_PRIVATE_BUCKET='test-private-bucket')
+@override_settings(MEDIA_GCS_PRIVATE_BUCKET='test-private-bucket')
 class ResubmissionLifecycleTests(APITestCase):
     def setUp(self):
         self.student = User.objects.create_user(username='resub_stu', email='resub_stu@example.com', password='pw12345')
@@ -440,7 +440,7 @@ class ResubmissionLifecycleTests(APITestCase):
 # ---------------------------------------------------------------------------
 # 12. Document/profile consistency edge cases
 # ---------------------------------------------------------------------------
-@override_settings(MEDIA_GCS_PRIVATE_BUCKET='test-private-bucket', AWS_S3_PRIVATE_BUCKET='test-private-bucket')
+@override_settings(MEDIA_GCS_PRIVATE_BUCKET='test-private-bucket')
 class DocumentProfileConsistencyTests(APITestCase):
     def setUp(self):
         self.student = User.objects.create_user(username='cons_stu', email='cons_stu@example.com', password='pw12345')
@@ -497,7 +497,7 @@ class DocumentProfileConsistencyTests(APITestCase):
 # ---------------------------------------------------------------------------
 # 7. Malicious upload adversarial cases
 # ---------------------------------------------------------------------------
-@override_settings(MEDIA_GCS_PRIVATE_BUCKET='test-private-bucket', AWS_S3_PRIVATE_BUCKET='test-private-bucket')
+@override_settings(MEDIA_GCS_PRIVATE_BUCKET='test-private-bucket')
 class MaliciousUploadTests(APITestCase):
     def setUp(self):
         self.student = User.objects.create_user(username='mal_stu', email='mal_stu@example.com', password='pw12345')
@@ -615,7 +615,7 @@ class QueryPerformanceAuditTests(APITestCase):
 # signing failure) must never leak into exam access, login, or any other
 # unrelated endpoint.
 # ---------------------------------------------------------------------------
-@override_settings(MEDIA_GCS_PRIVATE_BUCKET='test-private-bucket', AWS_S3_PRIVATE_BUCKET='test-private-bucket')
+@override_settings(MEDIA_GCS_PRIVATE_BUCKET='test-private-bucket')
 class ErrorIsolationTests(APITestCase):
     def setUp(self):
         self.course = Course.objects.create(name='Isolation Course', prefix='ISO')
