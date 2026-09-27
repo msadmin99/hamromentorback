@@ -49,6 +49,7 @@ class BulkImportActionsTestCase(APITestCase):
         self.batch = ImportBatch.objects.create(
             uploaded_by=self.staff, file_name='q.xlsx', file_format='xlsx', status='ready', total_rows=0,
             subject=self.subject, chapter=self.chapter, topic=self.topic,
+            dedup_status='completed',   # Preview & Validate state: the duplicate check has run
         )
 
     def _dedup_url(self):
@@ -304,9 +305,29 @@ class ErrorSkipRevalidationTests(BulkImportActionsTestCase):
         self.assertEqual(resp.data['status'], 'valid')
         self.assertFalse(resp.data['error_skipped'])
 
-    def test_a_still_broken_edit_keeps_the_existing_skip_flag(self):
-        """Editing one field but leaving the row still an Error must not
+    def test_an_edit_that_leaves_a_bypassable_error_keeps_the_existing_skip_flag(self):
+        """Editing one field but leaving the row still an Error whose remaining
+        error is one that may be ignored (a duplicated option) must not
         silently un-skip it — only becoming non-error clears the flag."""
+        dup_options = [{'text_html': 'Same', 'is_correct': True}, {'text_html': 'Same', 'is_correct': False}]
+        row = _mk_row(
+            self.batch, 1, 'error',
+            raw_data={'text_html': '<p>Q1</p>', 'options': dup_options},
+            errors=['Option 2 duplicates option 1 ("Same").'],
+            error_skipped=True,
+        )
+        edited = {'text_html': '<p>Q1 (edited stem)</p>', 'options': dup_options}
+
+        resp = self.client.patch(f'/api/import-batches/{self.batch.id}/rows/{row.id}/', {'data': edited}, format='json')
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data['status'], 'error')
+        self.assertTrue(resp.data['error_skipped'])
+
+    def test_an_edit_that_leaves_an_unbypassable_error_clears_the_skip_flag(self):
+        """If the edit leaves an error that may NOT be ignored (here: only one
+        option), the earlier Skip decision no longer applies and is cleared —
+        the row can never be imported broken because of a stale flag."""
         row = _mk_row(
             self.batch, 1, 'error',
             raw_data={'text_html': '', 'options': [{'text_html': 'A', 'is_correct': True}]},
@@ -319,7 +340,7 @@ class ErrorSkipRevalidationTests(BulkImportActionsTestCase):
 
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.data['status'], 'error')
-        self.assertTrue(resp.data['error_skipped'])
+        self.assertFalse(resp.data['error_skipped'])
 
 
 # --- ids_only selection support -----------------------------------------
@@ -393,7 +414,12 @@ class ImportSummaryCountsTests(BulkImportActionsTestCase):
         self.assertEqual(data['duplicate_skip_count'], 10)
         self.assertEqual(data['skipped_error_count'], 10)
         self.assertEqual(data['unskipped_error_count'], 4)
-        self.assertEqual(data['skipped_projected_count'], 20)  # 10 duplicate-skip + 10 error-skip, no double count
+        # Skip semantics: a skipped ERROR is imported anyway, so it is NOT part of
+        # the "will not create a new question" projection — only the 10 duplicate
+        # skips are. The 10 skipped errors are counted as importable instead.
+        self.assertEqual(data['skipped_projected_count'], 10)
+        self.assertEqual(data['bypassed_error_count'], 10)
+        self.assertEqual(data['importable_count'], 25 + 10 + 30 + 10)  # valid + warning + duplicate + skipped errors
 
     def test_skipped_projected_count_is_zero_on_a_fresh_batch(self):
         _mk_row(self.batch, 1, 'valid')

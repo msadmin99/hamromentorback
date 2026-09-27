@@ -21,6 +21,7 @@ from django.utils import timezone
 from media_library.service import create_media_asset_from_file
 from tests_app.models import Answer, TestQuestion
 
+from .import_bypass import attaches_existing_only, importability_problem
 from .importers.base import load_temp_image
 from .models import ImportBatch, Option, Question
 
@@ -178,7 +179,13 @@ def run_import(batch_id):
         batch.save(update_fields=['status', 'started_at'])
 
         course_list = list(batch.courses.all())
-        rows = batch.rows.exclude(status__in=['error', 'imported', 'skipped']).order_by('row_number')
+        # Unresolved Errors stay out; an Error the admin chose to SKIP (import
+        # anyway — import_bypass.py) is included and re-checked per row below.
+        rows = (
+            batch.rows.exclude(status__in=['imported', 'skipped'])
+            .exclude(Q(status='error') & Q(error_skipped=False))
+            .order_by('row_number')
+        )
 
         since_last_flush = 0
         FLUSH_EVERY = 20
@@ -201,6 +208,14 @@ def run_import(batch_id):
                         since_last_flush = 0
                     continue
 
+                # Import-time safety net (import_bypass.importability_problem): re-validate
+                # from the row's own data before anything is created OR deleted — a
+                # refusal must never cost the old question in a "replace".
+                if not attaches_existing_only(row):
+                    problem = importability_problem(row)
+                    if problem:
+                        raise ValueError(problem.reason)
+
                 if row.status == 'duplicate' and row.dedup_action == 'replace' and row.duplicate_of_id:
                     old = Question.objects.filter(pk=row.duplicate_of_id).first()
                     if old and not question_is_referenced(old):
@@ -220,7 +235,10 @@ def run_import(batch_id):
             except Exception as exc:  # noqa: BLE001 - one bad row must never abort the whole batch
                 row.status = 'error'
                 row.errors = (row.errors or []) + [str(exc)]
-                row.save(update_fields=['status', 'errors'])
+                # A failed attempt to import a bypassed Error clears the Skip
+                # decision, so a redelivered task doesn't retry it forever.
+                row.error_skipped = False
+                row.save(update_fields=['status', 'errors', 'error_skipped'])
                 batch.failed_count += 1
 
             since_last_flush += 1

@@ -339,6 +339,9 @@ class ImportBatchCreateQuestionsViewTests(APITestCase):
             uploaded_by=self.staff, file_name='q.xlsx', file_format='xlsx',
             status='ready', total_rows=1, import_mode='question_bank',
             subject=self.subject, chapter=self.chapter, topic=self.topic,
+            # A batch in Preview & Validate has had its duplicate check completed
+            # (Add to Exam now refuses to run before that, like Confirm always did).
+            dedup_status='completed',
         )
         defaults.update(overrides)
         return ImportBatch.objects.create(**defaults)
@@ -1675,11 +1678,11 @@ class ImportBatchTaxonomyDedupTriggerTests(APITestCase):
         )
         ImportRow.objects.create(
             batch=self.batch, row_number=1, status='valid',
-            raw_data={'text_html': 'Row one question text', 'options': [{'text_html': 'A'}, {'text_html': 'B'}]},
+            raw_data={'text_html': 'Row one question text', 'options': [{'text_html': 'A', 'is_correct': True}, {'text_html': 'B'}]},
         )
         ImportRow.objects.create(
             batch=self.batch, row_number=2, status='pending',
-            raw_data={'text_html': 'Row two question text', 'options': [{'text_html': 'C'}, {'text_html': 'D'}]},
+            raw_data={'text_html': 'Row two question text', 'options': [{'text_html': 'C', 'is_correct': True}, {'text_html': 'D'}]},
         )
         self.client.force_authenticate(user=self.staff)
 
@@ -4386,12 +4389,15 @@ class RunImportTests(TestCase):
         self.assertEqual(Question.objects.filter(subject=self.subject).count(), 2)
 
     def test_a_bad_row_does_not_abort_the_rest_of_the_batch(self):
+        """One structurally invalid row is refused by the import-time safety net
+        (no stem, no options) without aborting the others. Before that net
+        existed this row was created as a blank question — create_question_from_row
+        itself has no validation — which is exactly what the net now prevents."""
         from academics.import_engine import run_import
 
         self._add_row(1)
         bad = self._add_row(2)
-        bad.raw_data = {'text_html': ''}  # no options at all — still "succeeds" today (no hard validation
-        # inside create_question_from_row itself), so force a real failure via a taxonomy-less batch instead:
+        bad.raw_data = {'text_html': ''}  # no stem, no options at all
         bad.save()
         self._add_row(3)
 
@@ -4399,7 +4405,11 @@ class RunImportTests(TestCase):
 
         self.batch.refresh_from_db()
         self.assertEqual(self.batch.status, 'completed')
-        self.assertEqual(self.batch.created_count, 3)  # the "bad" row above isn't actually invalid at the DB layer
+        self.assertEqual((self.batch.created_count, self.batch.failed_count), (2, 1))
+        bad.refresh_from_db()
+        self.assertEqual(bad.status, 'error')
+        self.assertIsNone(bad.created_question_id)
+        self.assertTrue(any("can't be imported" in e for e in bad.errors))
 
     def test_resuming_after_a_partial_run_never_reprocesses_a_terminal_row(self):
         """The core resumability guarantee: a row already 'imported' or

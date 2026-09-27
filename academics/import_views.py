@@ -5,7 +5,7 @@ import zipfile
 from courses.models import Course
 from django.conf import settings
 from django.db import transaction
-from django.db.models import Count
+from django.db.models import Count, Q
 from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework import status
@@ -19,10 +19,11 @@ from hamromentor.permissions import HasFeature
 from tests_app.serializers import TestAdminSerializer
 
 from .import_dedup import existing_texts_for_subject, find_duplicate, normalize_option_set, normalize_text
+from .import_bypass import assess_bypass, attaches_existing_only, cannot_bypass_reason, importability_problem
 from .import_dedup_tasks import enqueue_dedup_task
 from .import_engine import create_question_from_row, question_is_referenced, run_import
 from .import_tasks import enqueue_import_task
-from .import_validation import validate_parsed_question
+from .import_validation import collect_validation_issues, validate_parsed_question
 from .importers import PARSERS
 from .models import Chapter, ImportBatch, ImportRow, Question, Subject, Topic
 
@@ -221,6 +222,25 @@ def _resolve_row_image_urls(raw_data):
     }
 
 
+def _row_payload(r):
+    """The one row shape returned by both the rows list and the row PATCH,
+    so they can never drift. For an Error row it also tells the admin UI
+    whether "Skip (import anyway)" is allowed — computed fresh from the row's
+    own raw_data on every response, never trusted from stored state."""
+    payload = {
+        'id': r.id, 'row_number': r.row_number, 'status': r.status,
+        'errors': r.errors, 'warnings': r.warnings, 'duplicate_of_id': r.duplicate_of_id,
+        'dedup_action': r.dedup_action, 'error_skipped': r.error_skipped, 'data': r.raw_data,
+        'image_urls': _resolve_row_image_urls(r.raw_data),
+        'bypass_eligible': None, 'bypass_block_reason': '',
+    }
+    if r.status == 'error':
+        assessment = assess_bypass(r.raw_data)
+        payload['bypass_eligible'] = assessment.eligible
+        payload['bypass_block_reason'] = '' if assessment.eligible else cannot_bypass_reason(assessment)
+    return payload
+
+
 def _batch_summary(batch):
     # Bulk-import taxonomy audit: was one .count() query per status (7
     # separate round trips, every call — this fires after every taxonomy
@@ -235,14 +255,23 @@ def _batch_summary(batch):
     # classification count (unaffected by error_skipped — a skipped error
     # row's `status` never changes, per its own field docstring), so
     # these are additive, clearly-separate figures the frontend uses for
-    # the Import-button eligibility check and the new "Skipped" summary
-    # tile, without changing what row_counts.error/duplicate have always
-    # meant. skipped_projected_count intentionally sums two mutually
-    # exclusive sources (a row is never simultaneously status='error' and
-    # status='duplicate'), so this can never double-count a single row.
+    # the Import-button eligibility check and the summary tiles, without
+    # changing what row_counts.error/duplicate have always meant.
+    #
+    # Skip semantics (see import_bypass.py): an Error the admin skipped is
+    # IMPORTED ANYWAY, not omitted. So:
+    #   unskipped_error_count  = unresolved Errors — these are NOT imported
+    #                            until the admin skips (import anyway) or
+    #                            deletes them;
+    #   skipped_error_count    = bypassed Errors — these ARE imported;
+    #   importable_count       = every row that will become / attach a question.
+    # The two error counts are disjoint and sum to row_counts.error, and a row
+    # is never simultaneously status='error' and status='duplicate', so nothing
+    # can be double-counted.
     unskipped_error_count = batch.rows.filter(status='error', error_skipped=False).count()
     skipped_error_count = counts['error'] - unskipped_error_count
     duplicate_skip_count = batch.rows.filter(status='duplicate', dedup_action='skip').count()
+    importable_count = counts['valid'] + counts['warning'] + counts['duplicate'] + skipped_error_count
 
     return {
         'id': batch.id, 'file_name': batch.file_name, 'file_format': batch.file_format,
@@ -254,8 +283,12 @@ def _batch_summary(batch):
         'row_counts': counts,
         'unskipped_error_count': unskipped_error_count,
         'skipped_error_count': skipped_error_count,
+        'bypassed_error_count': skipped_error_count,   # clearer alias: errors being imported anyway
         'duplicate_skip_count': duplicate_skip_count,
-        'skipped_projected_count': skipped_error_count + duplicate_skip_count,
+        # Rows that will NOT create a brand-new Question (duplicate decided
+        # "skip"). Deliberately excludes skipped Errors — those are imported.
+        'skipped_projected_count': duplicate_skip_count,
+        'importable_count': importable_count,
         'subject_id': batch.subject_id, 'chapter_id': batch.chapter_id, 'topic_id': batch.topic_id,
         'course_ids': list(batch.courses.values_list('id', flat=True)),
         'started_at': batch.started_at, 'completed_at': batch.completed_at, 'created_at': batch.created_at,
@@ -267,8 +300,8 @@ def _batch_summary(batch):
 _DEDUP_STALE_CHECK_EVERY = 5
 
 
-def _run_dedup(batch, is_stale=None):
-    """(Re)computes duplicate flags for every non-error row against the
+def _run_dedup(batch, is_stale=None, only_row_ids=None):
+    """(Re)computes duplicate flags for every importable row (see below) against the
     batch's currently-selected Subject plus the other rows in this same
     file. Triggered only when the taxonomy PATCH actually changes the
     Subject (see ImportBatchTaxonomyView.patch) — a row previously flagged
@@ -288,12 +321,23 @@ def _run_dedup(batch, is_stale=None):
     SIMILARITY_THRESHOLD, the length-ratio filter) is completely
     unaffected; only the row-iteration loop gained this guard. Any caller
     that omits `is_stale` (there are none left after Phase 3, kept for
-    direct/test use) always runs to completion, exactly as before."""
+    direct/test use) always runs to completion, exactly as before.
+
+    Importable rows = every row except an UNRESOLVED error; an Error the
+    admin chose to Skip (import anyway) is included, because it will become a
+    question. `only_row_ids` (targeted mode, used right after rows are
+    skipped — see _dedup_after_skip) limits which rows are evaluated to that
+    set, while still comparing them against every other importable row."""
     if not batch.subject_id:
         return
 
     existing = existing_texts_for_subject(batch.subject)
-    rows = list(batch.rows.exclude(status='error').order_by('row_number'))
+    # Every row that will actually be IMPORTED takes part, both as a candidate
+    # and as something other rows are compared against: valid, warning,
+    # duplicate — and an Error the admin chose to Skip (import anyway), which
+    # is no different from any other row once it will become a question. Only
+    # an UNRESOLVED error stays out (it is not going to be imported).
+    rows = list(_dedup_eligible_rows(batch).order_by('row_number'))
     batch_texts = {
         row.id: {
             'text': normalize_text(row.raw_data.get('text_html')),
@@ -301,8 +345,12 @@ def _run_dedup(batch, is_stale=None):
         }
         for row in rows
     }
+    # Targeted mode (only_row_ids): evaluate just those rows, but still compare
+    # them against every other importable row, so an intra-batch duplicate of a
+    # newly skipped row is still caught.
+    candidates = rows if only_row_ids is None else [r for r in rows if r.id in only_row_ids]
 
-    for i, row in enumerate(rows):
+    for i, row in enumerate(candidates):
         if is_stale is not None and i % _DEDUP_STALE_CHECK_EVERY == 0 and is_stale():
             return
         dup_id, score = find_duplicate(row.raw_data, existing, batch_texts, self_index=row.id)
@@ -312,12 +360,77 @@ def _run_dedup(batch, is_stale=None):
             note = f'{int(score * 100)}% similar to an existing question.'
             if note not in (row.warnings or []):
                 row.warnings = (row.warnings or []) + [note]
-            row.save(update_fields=['status', 'duplicate_of_id', 'warnings'])
+            # A skipped Error that is also a duplicate follows the normal duplicate
+            # workflow (an explicit Skip/Replace/Keep Both decision). Its errors and
+            # its Skip decision are kept untouched on the row.
+            row.save(update_fields=['status', 'duplicate_of', 'warnings'])
         elif row.status == 'duplicate':
-            row.status = 'warning' if row.warnings else 'valid'
-            row.duplicate_of_id = None
-            row.dedup_action = ''
-            row.save(update_fields=['status', 'duplicate_of_id', 'dedup_action'])
+            _restore_after_duplicate_cleared(row)
+
+
+def _dedup_eligible_rows(batch):
+    """Rows that will be imported: everything except an unresolved Error."""
+    return batch.rows.exclude(Q(status='error') & Q(error_skipped=False))
+
+
+def _restore_after_duplicate_cleared(row):
+    """A row stopped being a duplicate: recompute its status from what is still
+    true about it, never assuming it is clean. If it still has a validation
+    error it goes back to an Error — and stays SKIPPED only if the error is one
+    that may be ignored; a valid row goes back to valid/warning exactly as
+    before. So a skipped error never silently turns into 'valid' merely because
+    the duplicate flag disappeared."""
+    issues, _ = collect_validation_issues(row.raw_data or {})
+    fields = ['status', 'duplicate_of', 'dedup_action']
+    if issues:
+        row.status = 'error'
+        row.errors = [i.message for i in issues]
+        fields.append('errors')
+        if row.error_skipped and any(not i.bypassable for i in issues):
+            row.error_skipped = False      # the skip can't apply to an unsafe error
+            fields.append('error_skipped')
+    else:
+        row.status = 'warning' if row.warnings else 'valid'
+    row.duplicate_of_id = None
+    row.dedup_action = ''
+    row.save(update_fields=fields)
+
+
+# Skipping a handful of errors re-checks just those rows, inline. Above this many
+# (a bulk skip) the check is handed to the existing background dedup run instead of
+# holding the request open: it now includes skipped rows, so nothing is missed.
+# Sizing (measured): ~0.16 s of comparison per row against a 2,000-question subject,
+# i.e. ~0.7 s/row at the 8,700-question scale of the original dedup audit, so 10 rows
+# is ~7 s worst case — acceptable inline; 25+ would hold the request too long.
+TARGETED_DEDUP_SYNC_LIMIT = 10
+
+
+def _dedup_after_skip(batch, newly_skipped_ids):
+    """Called after Error rows were newly marked Skip (import anyway). They are
+    about to become importable, so — unlike an unresolved error — they must be
+    checked for duplicates of the question bank / the rest of the file.
+
+    * No Subject chosen yet: nothing to compare against; the full run triggered
+      when a Subject is picked will include them.
+    * Dedup already completed and only a few rows: check just those rows, inline
+      (targeted — never a full re-run).
+    * Otherwise (a large bulk skip, or a run already pending/processing that may
+      have read the rows before they were skipped): re-run the existing
+      background dedup, which now includes skipped rows. Importing stays blocked
+      until it completes (dedup_status != 'completed')."""
+    ids = set(newly_skipped_ids)
+    if not ids or not batch.subject_id:
+        return
+    if batch.dedup_status == 'completed' and len(ids) <= TARGETED_DEDUP_SYNC_LIMIT:
+        _run_dedup(batch, only_row_ids=ids)
+        return
+    batch.dedup_generation += 1
+    batch.dedup_status = 'pending'
+    batch.dedup_claimed_at = None
+    batch.dedup_completed_at = None
+    batch.save(update_fields=['dedup_generation', 'dedup_status', 'dedup_claimed_at', 'dedup_completed_at'])
+    enqueue_dedup_task(batch.id, batch.dedup_generation)
+    batch.refresh_from_db()   # inline (non-async) mode has already completed by now
 
 
 class ImportBatchTaxonomyView(APIView):
@@ -440,15 +553,7 @@ class ImportBatchRowsView(APIView):
         page_rows = rows[start:start + page_size]
         return Response({
             'total': total, 'page': page, 'page_size': page_size,
-            'results': [
-                {
-                    'id': r.id, 'row_number': r.row_number, 'status': r.status,
-                    'errors': r.errors, 'warnings': r.warnings, 'duplicate_of_id': r.duplicate_of_id,
-                    'dedup_action': r.dedup_action, 'error_skipped': r.error_skipped, 'data': r.raw_data,
-                    'image_urls': _resolve_row_image_urls(r.raw_data),
-                }
-                for r in page_rows
-            ],
+            'results': [_row_payload(r) for r in page_rows],
         })
 
 
@@ -478,18 +583,41 @@ class ImportRowDetailView(APIView):
                 # several issues shouldn't silently un-skip it).
                 if row.status != 'error':
                     row.error_skipped = False
+                elif row.error_skipped and not assess_bypass(row.raw_data).eligible:
+                    # The edit left the row an Error that may NOT be ignored
+                    # (e.g. the question text was blanked, or an option was
+                    # removed leaving < 2). An earlier "Skip" decision only
+                    # ever covered errors that were safe to import through,
+                    # so it no longer applies — clear it rather than let the
+                    # row be imported broken.
+                    row.error_skipped = False
         if 'dedup_action' in request.data:
             row.dedup_action = request.data['dedup_action']
         if 'error_skipped' in request.data:
             if row.status != 'error':
                 return Response({'detail': 'Only Error rows can be skipped/unskipped.'}, status=400)
-            row.error_skipped = bool(request.data['error_skipped'])
+            wants_skip = bool(request.data['error_skipped'])
+            newly_skipped = wants_skip and not row.error_skipped
+            if wants_skip:
+                # Server-side authority: never trust the client to know which
+                # errors are safe to ignore (import_bypass.py).
+                assessment = assess_bypass(row.raw_data)
+                if not assessment.eligible:
+                    return Response({
+                        'detail': cannot_bypass_reason(assessment),
+                        'code': 'error_cannot_be_skipped',
+                        'blocking_errors': assessment.blocking_messages,
+                    }, status=400)
+            row.error_skipped = wants_skip
+        else:
+            newly_skipped = False
         row.save()
-        return Response({
-            'id': row.id, 'status': row.status, 'errors': row.errors, 'warnings': row.warnings,
-            'dedup_action': row.dedup_action, 'error_skipped': row.error_skipped, 'data': row.raw_data,
-            'image_urls': _resolve_row_image_urls(row.raw_data),
-        })
+        if newly_skipped:
+            # This row is now going to be imported, so it must be checked for
+            # duplicates like any other importable row (targeted, not a full run).
+            _dedup_after_skip(row.batch, [row.id])
+            row.refresh_from_db()
+        return Response(_row_payload(row))
 
     def delete(self, request, batch_id, row_id):
         """Removes one invalid/unwanted row from the batch before import —
@@ -599,11 +727,28 @@ class ImportRowsBulkSkipErrorView(APIView):
             return Response({'detail': '"row_ids" must be a non-empty list.'}, status=400)
         skipped = bool(request.data.get('skipped', True))
 
-        rows = ImportRow.objects.filter(batch_id=batch_id, id__in=row_ids, status='error')
+        rows = list(ImportRow.objects.filter(batch_id=batch_id, id__in=row_ids, status='error'))
+        rejected = []
+        applicable_ids = []
+        for row in rows:
+            if skipped:
+                assessment = assess_bypass(row.raw_data)
+                if not assessment.eligible:
+                    # Unsafe to import through — leave it as an unresolved
+                    # Error and tell the caller exactly why.
+                    rejected.append({
+                        'row_id': row.id, 'row_number': row.row_number,
+                        'reason': cannot_bypass_reason(assessment),
+                    })
+                    continue
+            applicable_ids.append(row.id)
+        newly_skipped_ids = [r.id for r in rows if skipped and r.id in set(applicable_ids) and not r.error_skipped]
         with transaction.atomic():
-            applied_count = rows.update(error_skipped=skipped)
+            applied_count = ImportRow.objects.filter(id__in=applicable_ids).update(error_skipped=skipped)
+        if newly_skipped_ids:
+            _dedup_after_skip(batch, newly_skipped_ids)
 
-        return Response({'applied_count': applied_count, **_batch_summary(batch)})
+        return Response({'applied_count': applied_count, 'rejected': rejected, **_batch_summary(batch)})
 
 
 class ImportConfirmView(APIView):
@@ -718,9 +863,12 @@ class RowImportError(Exception):
     broke — never swallowed like _run_import does, since Import & Create
     Test must abort (and roll back) the whole attempt on any row failure."""
 
-    def __init__(self, row_number, reason):
+    def __init__(self, row_number, reason, bypass_violation=False):
         self.row_number = row_number
         self.reason = reason
+        # True when the row was marked "Skip (import anyway)" but its error is
+        # one that may not be ignored — the caller clears that stale decision.
+        self.bypass_violation = bypass_violation
         super().__init__(f'Row {row_number}: {reason}')
 
 
@@ -732,12 +880,25 @@ def _create_questions_for_test(batch):
     attempt (no half-created test, no orphaned questions). Returns
     (question_ids_in_order, skipped_count, duplicate_count)."""
     course_list = list(batch.courses.all())
-    rows = list(batch.rows.exclude(status='error').order_by('row_number'))
+    # Unresolved Errors are left out. An Error the admin chose to SKIP (import
+    # anyway — see import_bypass.py) is included; it is re-checked below.
+    rows = list(batch.rows.exclude(Q(status='error') & Q(error_skipped=False)).order_by('row_number'))
     question_ids = []
     skipped_count = 0
     duplicate_count = 0
 
     for row in rows:
+        # Import-time safety net (import_bypass.importability_problem): every
+        # row about to create a Question is re-validated from its own data —
+        # never trusting status or a client-set Skip flag. Refuse loudly
+        # (rolling the whole attempt back) rather than silently dropping the
+        # row or persisting a corrupt question. Checked BEFORE any duplicate
+        # "replace" deletes the old question, so a refusal never costs data.
+        if not attaches_existing_only(row):
+            problem = importability_problem(row)
+            if problem:
+                raise RowImportError(row.row_number, problem.reason, bypass_violation=problem.clear_skip)
+
         if row.status == 'duplicate' and row.dedup_action == 'skip':
             row.status = 'skipped'
             # CRITICAL, per the scalability audit's duplicate-handling
@@ -855,7 +1016,11 @@ class ImportBatchCreateTestView(APIView):
             if row:
                 row.status = 'error'
                 row.errors = (row.errors or []) + [exc.reason]
-                row.save(update_fields=['status', 'errors'])
+                fields = ['status', 'errors']
+                if exc.bypass_violation:
+                    row.error_skipped = False
+                    fields.append('error_skipped')
+                row.save(update_fields=fields)
             batch.status = 'failed'
             batch.save(update_fields=['status'])
             return Response({
@@ -924,6 +1089,14 @@ class ImportBatchCreateQuestionsView(APIView):
             return Response({'detail': f'Batch is currently "{batch.status}" — cannot import questions.'}, status=400)
         if not (batch.subject_id and batch.chapter_id and batch.topic_id):
             return Response({'detail': 'Please select Subject, Chapter and Topic before importing.'}, status=400)
+        # Same server-side re-assertion ImportConfirmView makes: the duplicate flags
+        # on screen are only trustworthy once dedup has completed for the batch's
+        # CURRENT run. A pending/processing run (e.g. right after a bulk Skip, or a
+        # Subject change) means rows may not have been checked yet.
+        if batch.subject_id and batch.dedup_status != 'completed':
+            return Response({
+                'detail': 'Duplicate check is still in progress for the selected Subject — please wait for it to complete.',
+            }, status=400)
         blocked = batch.rows.filter(status='duplicate', dedup_action='').exists()
         if blocked:
             return Response({
@@ -947,7 +1120,11 @@ class ImportBatchCreateQuestionsView(APIView):
             if row:
                 row.status = 'error'
                 row.errors = (row.errors or []) + [exc.reason]
-                row.save(update_fields=['status', 'errors'])
+                fields = ['status', 'errors']
+                if exc.bypass_violation:
+                    row.error_skipped = False
+                    fields.append('error_skipped')
+                row.save(update_fields=fields)
             batch.status = 'failed'
             batch.save(update_fields=['status'])
             return Response({
