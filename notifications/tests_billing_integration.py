@@ -19,7 +19,14 @@ from .models import Notification
 
 
 class PaymentApprovedNotificationTests(BillingTestCase):
-    def test_payment_approved_notification_only_exists_after_commit(self):
+    def test_activation_notification_only_exists_after_commit(self):
+        """RENAMED (subscription-notification-model follow-up): a
+        subscription purchase (BillingTestCase._create_purchase()'s
+        default kind) now fires SUBSCRIPTION_ACTIVATED, not PAYMENT_APPROVED
+        — see test_subscription_activation_fires_subscription_activated_only
+        below for the full "one meaningful event, one notification" proof.
+        This test's own original point (on_commit timing) is unaffected by
+        which specific event type it is."""
         purchase = self._create_purchase()
         self._submit(purchase['id'], reference='TXN-101')
 
@@ -28,11 +35,17 @@ class PaymentApprovedNotificationTests(BillingTestCase):
         with self.captureOnCommitCallbacks(execute=True):
             payment_service.activate(purchase['id'], actor=self.staff)
 
-        n = Notification.objects.get(purchase_id=purchase['id'], event_type='PAYMENT_APPROVED')
+        n = Notification.objects.get(purchase_id=purchase['id'], event_type='SUBSCRIPTION_ACTIVATED')
         self.assertEqual(n.user_id, self.student.id)
         self.assertEqual(n.course_id, self.course.id)  # subscription plan's own course
 
-    def test_subscription_purchase_also_fires_subscription_activated(self):
+    def test_subscription_activation_fires_subscription_activated_only(self):
+        """RENAMED — was 'also fires', proving SUBSCRIPTION_ACTIVATED
+        existed ALONGSIDE PAYMENT_APPROVED. Product decision reversed
+        that: a subscription/combo activation must fire ONLY
+        SUBSCRIPTION_ACTIVATED, never additionally the generic
+        PAYMENT_APPROVED (the student doesn't need two notifications for
+        the same successful activation)."""
         purchase = self._create_purchase()
         self._submit(purchase['id'], reference='TXN-102')
 
@@ -42,6 +55,10 @@ class PaymentApprovedNotificationTests(BillingTestCase):
         self.assertTrue(
             Notification.objects.filter(purchase_id=purchase['id'], event_type='SUBSCRIPTION_ACTIVATED').exists()
         )
+        self.assertFalse(
+            Notification.objects.filter(purchase_id=purchase['id'], event_type='PAYMENT_APPROVED').exists()
+        )
+        self.assertEqual(Notification.objects.filter(purchase_id=purchase['id']).count(), 1)
 
     def test_rolled_back_activation_creates_no_notification(self):
         """P0-TRANSACTION-SAFETY: if activate() raises after the point where
@@ -99,7 +116,9 @@ class PaymentApprovedNotificationTests(BillingTestCase):
 
     def test_calling_activate_via_admin_endpoint_creates_exactly_one_notification(self):
         """Real HTTP call site, not the service function directly —
-        billing/views.py's approve action."""
+        billing/views.py's approve action. SUBSCRIPTION_ACTIVATED, not
+        PAYMENT_APPROVED, for this default subscription purchase — see
+        test_subscription_activation_fires_subscription_activated_only."""
         purchase = self._create_purchase()
         self._submit(purchase['id'], reference='TXN-104')
 
@@ -109,8 +128,9 @@ class PaymentApprovedNotificationTests(BillingTestCase):
         self.assertEqual(resp.status_code, 200, resp.data)
 
         self.assertEqual(
-            Notification.objects.filter(purchase_id=purchase['id'], event_type='PAYMENT_APPROVED').count(), 1,
+            Notification.objects.filter(purchase_id=purchase['id'], event_type='SUBSCRIPTION_ACTIVATED').count(), 1,
         )
+        self.assertEqual(Notification.objects.filter(purchase_id=purchase['id']).count(), 1)
 
     def test_grand_test_purchase_has_no_course_but_still_gets_payment_approved(self):
         from billing.models import GrandTestAccess

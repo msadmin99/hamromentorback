@@ -381,6 +381,8 @@ def submit(purchase_id, *, payment_method, payment_reference, screenshot_file, r
         metadata={'payment_reference': reference},
     )
     send_payment_notification(purchase.user, 'payment_submitted', purchase)
+    from notifications.billing_integration import notify_payment_pending
+    notify_payment_pending(purchase)
     return purchase
 
 
@@ -465,6 +467,8 @@ def reject(purchase_id, reason, *, actor=None, request=None):
 
     record_payment_event(purchase, 'rejected', previous_status, 'rejected', request=request, actor=actor, reason=reason)
     send_payment_notification(purchase.user, 'payment_rejected', purchase)
+    from notifications.billing_integration import notify_payment_rejected
+    notify_payment_rejected(purchase, reason)
     return purchase
 
 
@@ -514,6 +518,8 @@ def cancel(purchase_id, *, actor=None, request=None):
         purchase.save(update_fields=['status'])
 
     record_payment_event(purchase, 'cancelled', previous_status, 'cancelled', request=request, actor=actor)
+    from notifications.billing_integration import notify_purchase_cancelled
+    notify_purchase_cancelled(purchase)
     return purchase
 
 

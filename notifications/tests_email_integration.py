@@ -23,8 +23,12 @@ from .models import Notification, NotificationDelivery
 User = get_user_model()
 
 
-def _make_user(username):
-    return User.objects.create_user(username=username, email=f'{username}@example.com', password='pw12345')
+def _make_user(username, **kw):
+    # email_verified=True by default — see notifications/tests_email_delivery.py's
+    # identical helper for why: this file drives the real event-producer
+    # path end to end, unrelated to (and predating) email verification.
+    kw.setdefault('email_verified', True)
+    return User.objects.create_user(username=username, email=f'{username}@example.com', password='pw12345', **kw)
 
 
 def _make_course(name):
@@ -48,7 +52,14 @@ class AnnouncementEmailIntegrationTests(TestCase):
 
 
 class PaymentApprovedEmailIntegrationTests(BillingTestCase):
-    def test_real_payment_approval_creates_a_sent_email_delivery(self):
+    def test_real_subscription_activation_creates_a_sent_email_delivery(self):
+        """RENAMED (subscription-notification-model follow-up): a
+        subscription purchase's activation fires ONLY SUBSCRIPTION_ACTIVATED
+        now, never also the generic PAYMENT_APPROVED — see notifications/
+        tests_billing_lifecycle.py's PaymentApprovedAndSubscriptionActivatedTests
+        for the full "one meaningful event, one notification" proof.
+        BillingTestCase._create_purchase() defaults to kind='subscription',
+        which is exactly the case this decision applies to."""
         purchase = self._create_purchase()
         self._submit(purchase['id'], reference='TXN-EMAIL-1')
 
@@ -57,9 +68,12 @@ class PaymentApprovedEmailIntegrationTests(BillingTestCase):
             with self.captureOnCommitCallbacks(execute=True):
                 payment_service.activate(purchase['id'], actor=self.staff)
         delivery = NotificationDelivery.objects.get(
-            notification__purchase_id=purchase['id'], notification__event_type='PAYMENT_APPROVED', channel='email',
+            notification__purchase_id=purchase['id'], notification__event_type='SUBSCRIPTION_ACTIVATED', channel='email',
         )
         self.assertEqual(delivery.status, NotificationDelivery.STATUS_SENT)
+        self.assertFalse(
+            NotificationDelivery.objects.filter(notification__purchase_id=purchase['id'], notification__event_type='PAYMENT_APPROVED').exists()
+        )
 
     def test_subscription_activated_also_gets_a_real_email_delivery(self):
         purchase = self._create_purchase()

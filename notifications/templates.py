@@ -53,13 +53,34 @@ TEMPLATES = {
         'Payment verified — {item} is now active',
         'Your payment for {item} has been verified and is now active.',
     ),
+    # Phase 2b — billing lifecycle. {expiry_suffix} is '' (no expiry known/
+    # applicable) or ' until <isoformat date>' — built by the caller
+    # (notifications/billing_integration.py), same "pass the raw isoformat
+    # string, let the caller decide" convention exam_integration.py's own
+    # {start_time}/{time_remaining} placeholders already use.
     'SUBSCRIPTION_ACTIVATED': (
         '{course} subscription activated',
-        'Your {course} subscription is now active.',
+        'Your {course} subscription is now active{expiry_suffix}.',
     ),
     'SUBSCRIPTION_EXPIRING': (
         '{course} access expires soon',
         'Your {course} access expires on {expiry}. Renew to keep uninterrupted access.',
+    ),
+    'SUBSCRIPTION_EXPIRED': (
+        '{course} access expired',
+        'Your {course} access expired on {expiry}. Renew to continue.',
+    ),
+    'PAYMENT_PENDING': (
+        'Payment received — verification pending',
+        'Your payment for {item} has been received and is awaiting verification.',
+    ),
+    'PAYMENT_REJECTED': (
+        'Payment not approved — {item}',
+        'Your payment for {item} was not approved. Reason: {reason}',
+    ),
+    'PURCHASE_CANCELLED': (
+        '{item} order cancelled',
+        'Your order for {item} has been cancelled.',
     ),
     'ANNOUNCEMENT': (
         'Dr. Gutka',

@@ -63,6 +63,11 @@ _EVENT_DEFINITIONS = {
     'PAYMENT_APPROVED': CATEGORY_BILLING,
     'PAYMENT_REJECTED': CATEGORY_BILLING,
     'PAYMENT_FAILED': CATEGORY_BILLING,
+    # Phase 2b (billing lifecycle notifications): the real, existing
+    # Purchase.STATUS_CHOICES value 'cancelled' (billing/models.py) had no
+    # notification-vocabulary name yet — added here for
+    # payment_service.cancel(), not a new business state.
+    'PURCHASE_CANCELLED': CATEGORY_BILLING,
     'SUBSCRIPTION_ACTIVATED': CATEGORY_BILLING,
     'SUBSCRIPTION_EXPIRING': CATEGORY_BILLING,
     'SUBSCRIPTION_EXPIRED': CATEGORY_BILLING,
