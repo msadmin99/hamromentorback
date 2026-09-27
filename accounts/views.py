@@ -7,6 +7,7 @@ from rest_framework.decorators import action
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import AllowAny, IsAdminUser, IsAuthenticated
+from rest_framework.throttling import AnonRateThrottle, UserRateThrottle
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -76,15 +77,14 @@ class LoginView(APIView):
         try:
             user = User.objects.get(Q(email__iexact=identifier) | Q(phone=identifier))
         except User.DoesNotExist:
-            return Response({'detail': 'Invalid credentials.'}, status=status.HTTP_401_UNAUTHORIZED)
+            return error_response(status.HTTP_401_UNAUTHORIZED, 'invalid_credentials', 'Invalid credentials.')
 
         if not user.check_password(data['password']):
-            return Response({'detail': 'Invalid credentials.'}, status=status.HTTP_401_UNAUTHORIZED)
+            return error_response(status.HTTP_401_UNAUTHORIZED, 'invalid_credentials', 'Invalid credentials.')
 
         if not user.is_active:
-            return Response(
-                {'detail': 'This account has been blocked. Contact support.'},
-                status=status.HTTP_403_FORBIDDEN,
+            return error_response(
+                status.HTTP_403_FORBIDDEN, 'account_blocked', 'This account has been blocked. Contact support.',
             )
 
         device_id = data.get('device_id')
@@ -98,9 +98,9 @@ class LoginView(APIView):
                 if device_count >= MAX_DEVICES:
                     user.is_active = False
                     user.save(update_fields=['is_active'])
-                    return Response(
-                        {'detail': 'Login limit of 3 devices reached. Account blocked.'},
-                        status=status.HTTP_403_FORBIDDEN,
+                    return error_response(
+                        status.HTTP_403_FORBIDDEN, 'device_limit_reached',
+                        'Login limit of 3 devices reached. Account blocked.',
                     )
                 Device.objects.create(
                     user=user, device_id=device_id, device_label=data.get('device_label', ''),
@@ -721,7 +721,7 @@ class AccountSettingsView(APIView):
         if payment_channel is not None:
             valid_channels = dict(StudentProfile.PAYMENT_CHANNEL_CHOICES)
             if payment_channel and payment_channel not in valid_channels:
-                return Response({'detail': 'Invalid preferred_payment_channel.'}, status=400)
+                return error_response(400, 'invalid_payment_channel', 'Invalid preferred_payment_channel.')
             profile, _ = StudentProfile.objects.get_or_create(user=request.user)
             profile.preferred_payment_channel = payment_channel
             profile.save(update_fields=['preferred_payment_channel'])
@@ -738,17 +738,146 @@ class ChangePasswordView(APIView):
         confirm = request.data.get('confirm_password', '')
 
         if not request.user.check_password(current):
-            return Response({'detail': 'Current password is incorrect.'}, status=status.HTTP_400_BAD_REQUEST)
+            return error_response(
+                status.HTTP_400_BAD_REQUEST, 'current_password_incorrect', 'Current password is incorrect.',
+            )
         if new != confirm:
-            return Response({'detail': 'New passwords do not match.'}, status=status.HTTP_400_BAD_REQUEST)
+            return error_response(status.HTTP_400_BAD_REQUEST, 'password_mismatch', 'New passwords do not match.')
         try:
             validate_password(new, user=request.user)
         except Exception as exc:
-            return Response({'detail': ' '.join(exc.messages)}, status=status.HTTP_400_BAD_REQUEST)
+            return error_response(status.HTTP_400_BAD_REQUEST, 'invalid_password', ' '.join(exc.messages))
 
         request.user.set_password(new)
         request.user.save()
         return Response({'detail': 'Password changed.'})
+
+
+class VerifyEmailThrottle(AnonRateThrottle):
+    # Unauthenticated (the request comes straight off an email link) — an
+    # IP-keyed defense-in-depth backstop. The token itself is 256 bits of
+    # CSPRNG entropy (accounts/email_verification.py), so this is not the
+    # real security boundary against guessing; it only bounds how hard any
+    # single IP can hammer the endpoint/database.
+    scope = 'verify_email'
+
+    def get_rate(self):
+        return '20/hour'
+
+
+class VerifyEmailView(APIView):
+    """POST /auth/verify-email/<token>/ — the link in the verification
+    email. POST-only (not GET) so an email client's/security scanner's
+    automatic link-prefetching can never silently consume a one-time
+    token before the user actually clicks it — the frontend page at
+    /verify-email/<token> reads the token from the URL and issues this
+    POST itself, exactly once, on explicit user action."""
+    permission_classes = [AllowAny]
+    throttle_classes = [VerifyEmailThrottle]
+
+    ERROR_MESSAGES = {
+        'invalid_token': 'This verification link is invalid.',
+        'expired_token': 'This verification link has expired. Please request a new one.',
+        'already_used': 'This verification link has already been used.',
+    }
+
+    def post(self, request, token):
+        from .email_verification import consume_token_and_verify_email
+
+        result = consume_token_and_verify_email(token)
+        if not result.success:
+            return error_response(
+                status.HTTP_400_BAD_REQUEST, result.error_code,
+                self.ERROR_MESSAGES.get(result.error_code, 'This verification link is invalid.'),
+            )
+        return Response({'detail': 'Email verified.', 'email_verified': True})
+
+
+class ResendVerificationEmailThrottle(UserRateThrottle):
+    scope = 'resend_verification_email'
+
+    def get_rate(self):
+        return '3/hour'
+
+
+class ResendVerificationEmailView(APIView):
+    """POST /auth/resend-verification-email/ — authenticated, operates only
+    on request.user (never accepts an email address), so there is
+    structurally nothing to enumerate: a caller can only ever learn the
+    verification state of the account they are already logged into."""
+    permission_classes = [IsAuthenticated]
+    throttle_classes = [ResendVerificationEmailThrottle]
+
+    def post(self, request):
+        from .email_verification import issue_and_send
+
+        if request.user.email_verified:
+            return Response({'detail': 'Your email is already verified.', 'email_verified': True})
+
+        issue_and_send(request.user)
+        return Response({'detail': 'Verification email sent. Please check your inbox.', 'email_verified': False})
+
+
+class ChangeEmailThrottle(UserRateThrottle):
+    scope = 'change_email'
+
+    def get_rate(self):
+        return '5/hour'
+
+
+class ChangeEmailView(APIView):
+    """POST /auth/change-email/ — lets a logged-in student correct a
+    mistyped registration address (the audit's explicit "wrong email
+    address" scenario). Requires the current password, the same
+    ownership proof ChangePasswordView already requires, since this
+    changes the account's login identity (USERNAME_FIELD='email').
+
+    Always resets email_verified to False and issues a fresh verification
+    token for the new address — a verified status is never carried over
+    to an address that hasn't itself been confirmed, and the old
+    address's tokens are invalidated as part of issuing the new one
+    (email_verification.issue_token invalidates every previously issued,
+    still-usable token for this user first, regardless of which address
+    it was for)."""
+    permission_classes = [IsAuthenticated]
+    throttle_classes = [ChangeEmailThrottle]
+
+    def post(self, request):
+        from django.core.exceptions import ValidationError as DjangoValidationError
+        from django.core.validators import validate_email
+
+        from .email_verification import issue_and_send
+
+        if not request.user.check_password(request.data.get('current_password', '')):
+            return error_response(
+                status.HTTP_400_BAD_REQUEST, 'current_password_incorrect', 'Current password is incorrect.',
+            )
+
+        new_email = (request.data.get('email') or '').strip().lower()
+        if not new_email:
+            return error_response(status.HTTP_400_BAD_REQUEST, 'email_required', 'A new email address is required.')
+        try:
+            validate_email(new_email)
+        except DjangoValidationError:
+            return error_response(status.HTTP_400_BAD_REQUEST, 'invalid_email', 'Enter a valid email address.')
+
+        if new_email == request.user.email.lower():
+            return error_response(
+                status.HTTP_400_BAD_REQUEST, 'email_unchanged', 'This is already your current email address.',
+            )
+        if User.objects.filter(email__iexact=new_email).exclude(pk=request.user.pk).exists():
+            return error_response(
+                status.HTTP_400_BAD_REQUEST, 'email_taken', 'An account with this email already exists.',
+            )
+
+        request.user.email = new_email
+        request.user.email_verified = False
+        request.user.email_verified_at = None
+        request.user.save(update_fields=['email', 'email_verified', 'email_verified_at'])
+
+        issue_and_send(request.user)
+
+        return Response(UserSerializer(request.user).data)
 
 
 class ProfilePhotoUploadView(APIView):
@@ -767,11 +896,11 @@ class ProfilePhotoUploadView(APIView):
     def post(self, request):
         file_obj = request.FILES.get('photo')
         if not file_obj:
-            return Response({'detail': 'No photo uploaded.'}, status=status.HTTP_400_BAD_REQUEST)
+            return error_response(status.HTTP_400_BAD_REQUEST, 'no_photo_uploaded', 'No photo uploaded.')
         try:
             verification_storage.validate_photo(file_obj)
         except verification_storage.InvalidUpload as exc:
-            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+            return error_response(status.HTTP_400_BAD_REQUEST, 'photo_upload_failed', str(exc))
 
         profile, _ = StudentProfile.objects.get_or_create(user=request.user)
         old_photo = profile.photo if profile.photo else None
@@ -811,17 +940,19 @@ class MyVerificationView(APIView):
         document_type = request.data.get('document_type')
         valid_types = dict(VerificationDocument.DOCUMENT_TYPE_CHOICES)
         if document_type not in valid_types:
-            return Response({'detail': f'Unknown document_type "{document_type}".'}, status=status.HTTP_400_BAD_REQUEST)
+            return error_response(
+                status.HTTP_400_BAD_REQUEST, 'unknown_document_type', f'Unknown document_type "{document_type}".',
+            )
         file_obj = request.FILES.get('file')
         if not file_obj:
-            return Response({'detail': 'No file uploaded.'}, status=status.HTTP_400_BAD_REQUEST)
+            return error_response(status.HTTP_400_BAD_REQUEST, 'no_file_uploaded', 'No file uploaded.')
 
         try:
             bucket, key, content_type, size = verification_storage.store_verification_document(
                 file_obj, request.user.id, document_type,
             )
         except verification_storage.InvalidUpload as exc:
-            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+            return error_response(status.HTTP_400_BAD_REQUEST, 'verification_upload_failed', str(exc))
 
         document = VerificationDocument.objects.create(
             user=request.user, document_type=document_type, storage_bucket=bucket, storage_key=key,

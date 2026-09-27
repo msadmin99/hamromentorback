@@ -26,8 +26,12 @@ from .webpush_adapter import PushSendResult
 User = get_user_model()
 
 
-def _make_user(username):
-    return User.objects.create_user(username=username, email=f'{username}@example.com', password='pw12345')
+def _make_user(username, **kw):
+    # email_verified=True by default — see notifications/tests_email_delivery.py's
+    # identical helper: this file is about PUSH fan-out, unrelated to
+    # email verification.
+    kw.setdefault('email_verified', True)
+    return User.objects.create_user(username=username, email=f'{username}@example.com', password='pw12345', **kw)
 
 
 def _make_course(name):

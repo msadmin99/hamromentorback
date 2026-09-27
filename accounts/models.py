@@ -51,6 +51,32 @@ class User(AbstractUser):
         help_text='Reward credit earned from referrals. Accumulates only — not yet redeemable at checkout.',
     )
 
+    # Email verification (separate from StudentProfile.verification_status,
+    # which is an unrelated identity/KYC document review — see that field's
+    # own help_text). This is the ONLY "is this communication address real"
+    # flag on the platform; no other field means the same thing, so nothing
+    # here duplicates or shadows an existing mechanism.
+    #
+    # Deliberately NEVER read by: courses.access, tests_app.access,
+    # entitlements.services, billing.access, or notifications.eligibility
+    # (the course-registration exam-reminder AUDIENCE rule) — this flag
+    # gates exactly one thing, the EMAIL channel in
+    # notifications.services._resolve_channels, and nothing else. A
+    # student with email_verified=False keeps full login, course
+    # enrollment, exam entitlement, in-app notifications, and Web Push
+    # exactly as before this field existed.
+    email_verified = models.BooleanField(
+        default=False,
+        help_text='Whether the address in `email` has been confirmed as reachable by its owner via a '
+                   'verification link (accounts.EmailVerificationToken). Gates ONLY the notification EMAIL '
+                   'channel — never login, course enrollment, exam entitlement, in-app, or Web Push.',
+    )
+    email_verified_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text='When `email_verified` last became True. Cleared back to null whenever email_verified is '
+                   'reset to False (registration, or a future email-change flow re-verifying a new address).',
+    )
+
     USERNAME_FIELD = 'email'
     REQUIRED_FIELDS = ['username']
 
@@ -82,6 +108,13 @@ ALL_FEATURES = [
     'dashboard', 'courses', 'question_bank', 'question_entry', 'video_lectures', 'daily_practice', 'students',
     'test_series', 'self_mock_test', 'enrollment_requests', 'question_reports', 'daily_live_exam', 'mock_test',
     'website_settings', 'advanced', 'billing', 'teacher_applications', 'marketplace_courses',
+    # Phase 7B — Admin Notification Dashboard (read-only). Deliberately
+    # NOT added to EDITOR_ALLOWED_FEATURES below: the dashboard's own
+    # backend endpoints are gated IsAdminRoleOrAbove (notifications/views.py),
+    # which excludes Editor-role accounts outright — this feature key just
+    # keeps the frontend nav/route gate consistent with that, the same
+    # dual-layer pattern 'billing' already uses for Payments/Analytics.
+    'notifications',
     *EXAM_MANAGEMENT_FEATURES,
 ]
 
@@ -174,6 +207,53 @@ class StudentProfile(models.Model):
 
     def __str__(self):
         return f'Profile<{self.user.email}>'
+
+
+class EmailVerificationToken(models.Model):
+    """One issued email-verification credential. A row is created for:
+    registration, "resend verification", and (a future) email-change flow.
+
+    Security shape (per the governing audit's explicit requirements):
+      - The RAW token is never stored anywhere, including here — only its
+        SHA-256 hex digest (`token_hash`), so a database read/backup/leak
+        never yields a usable token. `generate()` below is the only place
+        that ever sees the raw value, and it exists only long enough to be
+        put in the outgoing email and returned to the caller.
+      - `secrets.token_urlsafe(32)` — 256 bits of CSPRNG entropy, not
+        guessable/brute-forceable.
+      - `email` snapshots the address this token verifies at issue time.
+        Binds the token to a specific address, not just a user, so a stale
+        token from before an email change can never verify the new
+        address (and vice versa) even though both rows share `user_id`.
+      - One-time use (`used_at`) and independently invalidatable
+        (`invalidated_at`, set when superseded by a resend or an email
+        change) — `is_valid` treats either as terminal, plus expiry.
+    """
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='email_verification_tokens')
+    email = models.EmailField(help_text='The address this token verifies — snapshotted at issue time.')
+    token_hash = models.CharField(max_length=64, unique=True, db_index=True, help_text='sha256(raw_token).hexdigest() — the raw token itself is never stored.')
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+    used_at = models.DateTimeField(null=True, blank=True)
+    invalidated_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text='Set when a newer token supersedes this one (resend, or an email change) before it was ever used.',
+    )
+    # Delivery visibility only (never fails the request that created this
+    # row — see accounts.email_verification's own docstring). Not shown to
+    # the end user; lets an admin/engineer see *why* an email never
+    # arrived without needing Postmark dashboard access.
+    send_attempted_at = models.DateTimeField(null=True, blank=True)
+    send_error_code = models.CharField(max_length=100, blank=True)
+
+    class Meta:
+        indexes = [models.Index(fields=['user', 'invalidated_at', 'used_at'])]
+
+    def __str__(self):
+        return f'EmailVerificationToken<user={self.user_id} email={self.email}>'
+
+    def is_valid(self, now):
+        return self.used_at is None and self.invalidated_at is None and self.expires_at > now
 
 
 class Device(models.Model):

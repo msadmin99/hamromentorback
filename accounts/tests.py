@@ -561,7 +561,7 @@ class AdminStudentEditTests(APITestCase):
 
     def test_registration_and_login_unaffected(self):
         reg_resp = self.client.post('/api/auth/register/', {
-            'name': 'New Student', 'email': 'newreg@example.com', 'phone': '9811112222',
+            'name': 'New Student', 'email': 'newreg@example.com', 'confirm_email': 'newreg@example.com', 'phone': '9811112222',
             'password': 'StrongPass123!', 'program': 'CEE-PG', 'course': 'CEEPG',
         }, format='json')
         self.assertEqual(reg_resp.status_code, status.HTTP_201_CREATED)

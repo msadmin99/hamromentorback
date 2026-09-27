@@ -141,13 +141,25 @@ def _resolve_channels(user, category):
     on an edge-case blank value, e.g. an unsaved test User). Preference
     enforcement, exactly like push, stays entirely in is_channel_enabled
     below — this function only ever decides whether email is even a
-    candidate, never whether it is allowed."""
+    candidate, never whether it is allowed.
+
+    EMAIL VERIFICATION FIX: also requires `user.email_verified` — an
+    unconfirmed address must never receive mail (the audit's core
+    requirement: "Email accepted by provider" != "email address
+    verified", and a mistyped address must not silently eat exam
+    reminders forever). This is a CHANNEL gate only, added here and
+    nowhere else: it never touches CHANNEL_IN_APP or CHANNEL_PUSH above,
+    and it never touches which students are candidates at all — that is
+    _eligible_students_for_test's/eligibility.py's job (course
+    registration, unrelated to and unaffected by this flag). A student
+    with course access but an unverified email still gets in-app + push
+    (if subscribed); they simply lose EMAIL until they verify."""
     from . import push_service
 
     channels = [CHANNEL_IN_APP]
     if push_service.has_active_subscription(user):
         channels.append(CHANNEL_PUSH)
-    if user.email:
+    if user.email and user.email_verified:
         channels.append(CHANNEL_EMAIL)
     return tuple(channels)
 

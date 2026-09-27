@@ -48,6 +48,10 @@ class RegistrationCreatesEnrollmentTests(APITestCase):
             'program': '', 'course': self.course.prefix, 'referral_code': '', 'college': '',
         }
         data.update(overrides)
+        # A caller overriding email= without confirm_email= means "same
+        # address, different scenario," not "test a mismatch" — keep them
+        # in sync unless confirm_email was itself explicitly passed.
+        data['confirm_email'] = overrides.get('confirm_email', data['email'])
         serializer = RegisterSerializer(data=data)
         serializer.is_valid(raise_exception=True)
         return serializer.save()

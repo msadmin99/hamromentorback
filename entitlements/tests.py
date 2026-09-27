@@ -83,8 +83,8 @@ class FreeStarterProvisioningTests(APITestCase):
         FreeStarterPolicy.objects.create(resource_type='qbank', quantity=100, is_active=True)
 
         resp = self.client.post('/api/auth/register/', {
-            'name': 'New Student', 'email': 'newstudent@example.com', 'phone': '9800000000',
-            'password': 'ComplexPass123!',
+            'name': 'New Student', 'email': 'newstudent@example.com', 'confirm_email': 'newstudent@example.com',
+            'phone': '9800000000', 'password': 'ComplexPass123!',
         })
 
         self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
@@ -99,8 +99,8 @@ class FreeStarterProvisioningTests(APITestCase):
         no-op case), confirming registration doesn't depend on any policy
         existing."""
         resp = self.client.post('/api/auth/register/', {
-            'name': 'Another Student', 'email': 'another@example.com', 'phone': '9811111111',
-            'password': 'ComplexPass123!',
+            'name': 'Another Student', 'email': 'another@example.com', 'confirm_email': 'another@example.com',
+            'phone': '9811111111', 'password': 'ComplexPass123!',
         })
         self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
 

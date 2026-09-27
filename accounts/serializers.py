@@ -51,8 +51,9 @@ class UserSerializer(serializers.ModelSerializer):
             'id', 'first_name', 'last_name', 'email', 'phone',
             'program', 'course', 'profile', 'teacher_profile', 'is_staff', 'is_superuser', 'admin_role', 'permissions',
             'active_course', 'active_course_detail', 'referral_code', 'wallet_balance',
+            'email_verified', 'email_verified_at',
         ]
-        read_only_fields = ['referral_code', 'wallet_balance']
+        read_only_fields = ['referral_code', 'wallet_balance', 'email_verified', 'email_verified_at']
 
     def get_teacher_profile(self, obj):
         from marketplace.serializers import TeacherProfileSummarySerializer
@@ -77,15 +78,38 @@ class RegisterSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, validators=[validate_password])
     referral_code = serializers.CharField(write_only=True, required=False, allow_blank=True)
     college = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    # Email-registration finalization (audit): "Confirm Email" — a typo
+    # guard only, never ownership proof (that's still exclusively
+    # accounts.email_verification's token flow; this field's own presence
+    # or a match here never sets/implies email_verified). A real
+    # EmailField, not CharField, so an invalid CONFIRM address is rejected
+    # by the same Django/DRF email-format validator `email` itself already
+    # uses — never a second, looser check.
+    confirm_email = serializers.EmailField(write_only=True)
 
     class Meta:
         model = User
-        fields = ['name', 'email', 'phone', 'password', 'program', 'course', 'referral_code', 'college']
+        fields = ['name', 'email', 'confirm_email', 'phone', 'password', 'program', 'course', 'referral_code', 'college']
 
     def validate_email(self, value):
+        value = (value or '').strip()
         if User.objects.filter(email__iexact=value).exists():
             raise serializers.ValidationError('An account with this email already exists.')
         return value
+
+    def validate_confirm_email(self, value):
+        return (value or '').strip()
+
+    def validate(self, attrs):
+        # Object-level (needs both fields at once) — matches after
+        # normalization (whitespace-trimmed, case-insensitive), the exact
+        # same equivalence `email__iexact` already uses everywhere else in
+        # this serializer/model for "is this the same address."
+        confirm_email = attrs.pop('confirm_email', '')
+        email = attrs.get('email', '')
+        if email.strip().lower() != confirm_email.lower():
+            raise serializers.ValidationError({'confirm_email': 'Email and Confirm Email must match.'})
+        return attrs
 
     def create(self, validated_data):
         name = validated_data.pop('name')
@@ -169,6 +193,25 @@ class RegisterSerializer(serializers.ModelSerializer):
         except Exception:
             pass
 
+        # Email verification (see accounts/email_verification.py's own
+        # docstring for the full security shape). Best-effort for the
+        # identical reason as the two blocks above — and explicitly
+        # required by the audit: "Do not make registration fail solely
+        # because the email provider temporarily fails." The user is
+        # created with email_verified=False (the model default) either
+        # way; a failure here just means no verification email went out
+        # yet, recoverable via the resend endpoint.
+        try:
+            from .email_verification import issue_and_send
+
+            issue_and_send(user)
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).exception(
+                'Failed to issue/send the registration email-verification token for user id=%s', user.id,
+            )
+
         return user
 
 
@@ -181,8 +224,9 @@ class AdminUserSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'first_name', 'last_name', 'email', 'phone', 'program', 'course',
             'is_active', 'is_staff', 'date_joined', 'profile', 'device_count',
+            'email_verified', 'email_verified_at',
         ]
-        read_only_fields = ['email', 'date_joined']
+        read_only_fields = ['email', 'date_joined', 'email_verified', 'email_verified_at']
 
     def get_device_count(self, obj):
         return obj.devices.count()
@@ -331,7 +375,7 @@ class AdminUserDetailSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'username', 'first_name', 'last_name', 'email', 'phone',
             'program', 'course', 'active_course', 'active_course_detail',
-            'is_active', 'is_staff', 'date_joined',
+            'is_active', 'is_staff', 'date_joined', 'email_verified', 'email_verified_at',
             'referral_code', 'wallet_balance', 'referred_by',
             'profile', 'enrollments', 'enrollment_requests', 'purchases',
             'devices', 'device_count', 'activity_summary', 'verification_documents',

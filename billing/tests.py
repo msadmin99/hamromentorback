@@ -30,11 +30,13 @@ def _valid_screenshot(name='proof.png'):
     return SimpleUploadedFile(name, _png_bytes(), content_type='image/png')
 
 
-@override_settings(MEDIA_GCS_PRIVATE_BUCKET='test-private-bucket')
+@override_settings(MEDIA_GCS_PRIVATE_BUCKET='test-private-bucket', AWS_S3_PRIVATE_BUCKET='test-private-bucket')
 class BillingTestCase(APITestCase):
     """Shared fixtures for every test below — a staff verifier, a student,
-    a paid subscription plan, and an active payment method. GCS calls
-    (upload_bytes/signed_url) are mocked per-test where needed — this override
+    a paid subscription plan, and an active payment method. S3 calls
+    (upload_bytes/signed_url, via billing/screenshot_storage.py's own
+    s3_storage-backed import as of the AWS migration) are mocked per-test
+    where needed — this override
     only ensures a non-empty bucket name is stored, matching production."""
 
     def setUp(self):
@@ -42,7 +44,15 @@ class BillingTestCase(APITestCase):
         self.staff = User.objects.create_user(
             username='staff1', email='staff1@example.com', password='pw12345', is_staff=True, admin_role='admin',
         )
-        self.student = User.objects.create_user(username='student1', email='student1@example.com', password='pw12345')
+        # email_verified=True: this shared fixture predates email
+        # verification and is used by billing tests, not email-channel
+        # tests — a verified student here means notifications/
+        # tests_email_integration.py's payment-email assertions keep
+        # testing what they actually mean to (payment -> email fan-out),
+        # not an incidental unverified-email side effect of this fixture.
+        self.student = User.objects.create_user(
+            username='student1', email='student1@example.com', password='pw12345', email_verified=True,
+        )
         self.course = Course.objects.create(name='CEE-MD Ayurveda', prefix='AYU')
         self.plan = self._make_plan()
         self.method = PaymentMethod.objects.create(name='Fonepay', provider_type='fonepay')
