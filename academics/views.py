@@ -25,6 +25,8 @@ from .models import (
 from .serializers import (
     AnswerSubmitSerializer,
     ChapterSerializer,
+    PublicDailyMCQResultSerializer,
+    PublicDailyMCQSerializer,
     QuestionAdminSerializer,
     QuestionReportAdminSerializer,
     QuestionReportSerializer,
@@ -1613,13 +1615,54 @@ class QuestionReportViewSet(viewsets.ModelViewSet):
         serializer.save(**extra)
 
 
+def _kathmandu_today():
+    """Product spec §10: "Use Asia/Kathmandu for the daily boundary" —
+    deliberately NOT timezone.localdate() (that follows
+    settings.TIME_ZONE, which is UTC here). A UTC boundary would flip the
+    day ~5:45 hours before/after midnight in Nepal, which is where this
+    feature's "every visitor sees the same 5 questions today" promise
+    actually needs to hold. Shared by DailyMCQSetView's GET and POST so
+    both always agree on "today"."""
+    from zoneinfo import ZoneInfo
+
+    return timezone.now().astimezone(ZoneInfo('Asia/Kathmandu')).date()
+
+
+def _daily_mcq_question_ids(course, today):
+    """Deterministic (date, course) -> up to 5 question ids, one per
+    subject. Single source of truth for DailyMCQSetView's GET (what gets
+    displayed) AND POST (what a submission is graded against) — a
+    visitor's answers are only ever checked against this same
+    server-recomputed set, never against ids the client supplied, so
+    there's nothing to gain by tampering with the request."""
+    import random
+
+    scoped = _question_scoped_to_single_course(Question.objects.all(), course.id)
+    subject_ids = list(scoped.values_list('subject_id', flat=True).distinct())
+
+    # Seeded by (date, course prefix) only — same inputs always produce
+    # the same subject order and the same picked question, for every
+    # student, until the date rolls over. Never a per-request/per-user
+    # random.Random() (that would reshuffle on every page load, not just
+    # once a day).
+    rng = random.Random(f'{today.isoformat()}:{course.prefix}')
+    rng.shuffle(subject_ids)
+
+    question_ids = []
+    for subject_id in subject_ids[:5]:
+        ids = list(scoped.filter(subject_id=subject_id).order_by('id').values_list('id', flat=True))
+        if ids:
+            question_ids.append(ids[rng.randrange(len(ids))])
+    return question_ids
+
+
 class DailyMCQSetView(APIView):
-    """GET /api/mcq-of-the-day-set/?course=<prefix> — 5
-    auto-rotating MCQs for one course/program, picked automatically every
-    day with no admin curation needed. Same 5 questions for every student
-    globally on a given calendar day (deterministic, seeded by
-    date + course), so "these questions change automatically" without
-    needing per-user randomness.
+    """GET/POST /api/mcq-of-the-day-set/?course=<prefix> — 5 auto-rotating
+    MCQs for one course/program, picked automatically every day with no
+    admin curation needed. Same 5 questions for every student globally on
+    a given calendar day (deterministic, seeded by date + course), so
+    "these questions change automatically" without needing per-user
+    randomness.
 
     Deliberately a SEPARATE feature from core.MCQOfTheDay (the existing
     hand-picked single-question model shown on the home dashboard) — that
@@ -1636,43 +1679,43 @@ class DailyMCQSetView(APIView):
     Spans up to 5 DIFFERENT subjects within the course (one question per
     subject) so a student sees breadth across topics, not five questions
     from the same chapter. Deliberately not gated by QBank subscription/
-    Free Starter quota — same as the existing single-question MCQ of the
-    Day — a free daily preview hook for every logged-in student regardless
-    of what they've purchased."""
-    permission_classes = [IsAuthenticated]
+    Free Starter quota, and deliberately PUBLIC (AllowAny, no JWT) — this
+    is a free, unauthenticated marketing/discovery feature (see product
+    spec: "MCQ of the Day is a FREE, PUBLIC practice feature. A visitor
+    must NOT register or log in to use it."). A logged-in visitor gets the
+    exact same response as an anonymous one; this view never branches on
+    request.user.
 
-    def get(self, request):
-        prefix = (request.query_params.get('course') or '').strip()
+    GET returns ONLY what's needed to display and answer the 5 questions
+    (PublicDailyMCQSerializer) — no is_correct, no explanation, no
+    solution data. A visitor must submit their answers via POST before
+    ever seeing the answer key: POST re-derives the exact same 5-question
+    id set from (course, today) — never trusting any question/option id
+    the client supplies beyond checking it against that authoritative
+    set — grades locally, and returns the full reveal
+    (PublicDailyMCQResultSerializer) only in that response. Nothing is
+    persisted either way: no anonymous account, no QuestionAttempt, no
+    private record of any kind."""
+    permission_classes = [AllowAny]
+
+    def _get_course_or_400_404(self, prefix):
         if not prefix:
-            return error_response(status.HTTP_400_BAD_REQUEST, 'course_required', 'A course is required.')
-
+            return None, error_response(status.HTTP_400_BAD_REQUEST, 'course_required', 'A course is required.')
         from courses.models import Course
 
         course = Course.objects.filter(prefix=prefix).first()
         if not course:
-            return error_response(status.HTTP_404_NOT_FOUND, 'course_not_found', 'That course does not exist.')
+            return None, error_response(status.HTTP_404_NOT_FOUND, 'course_not_found', 'That course does not exist.')
+        return course, None
 
-        import random
+    def get(self, request):
+        prefix = (request.query_params.get('course') or '').strip()
+        course, err = self._get_course_or_400_404(prefix)
+        if err:
+            return err
 
-        today = timezone.localdate()
-        scoped = _question_scoped_to_single_course(Question.objects.all(), course.id)
-        subject_ids = list(scoped.values_list('subject_id', flat=True).distinct())
-
-        # Seeded by (date, course prefix) only — same inputs always produce
-        # the same subject order and the same picked question, for every
-        # student, until the date rolls over. Never a per-request/per-user
-        # random.Random() (that would reshuffle on every page load, not
-        # just once a day).
-        rng = random.Random(f'{today.isoformat()}:{course.prefix}')
-        rng.shuffle(subject_ids)
-
-        question_ids = []
-        for subject_id in subject_ids[:5]:
-            ids = list(
-                scoped.filter(subject_id=subject_id).order_by('id').values_list('id', flat=True)
-            )
-            if ids:
-                question_ids.append(ids[rng.randrange(len(ids))])
+        today = _kathmandu_today()
+        question_ids = _daily_mcq_question_ids(course, today)
 
         questions_by_id = {
             q.id: q
@@ -1683,5 +1726,99 @@ class DailyMCQSetView(APIView):
         return Response({
             'course': {'prefix': course.prefix, 'name': course.name, 'program_group': course.program_group},
             'date': today.isoformat(),
-            'questions': QuestionSerializer(ordered_questions, many=True, context={'request': request}).data,
+            'questions': PublicDailyMCQSerializer(ordered_questions, many=True, context={'request': request}).data,
+        })
+
+    def post(self, request):
+        prefix = (request.data.get('course') or '').strip() if isinstance(request.data.get('course'), str) else ''
+        course, err = self._get_course_or_400_404(prefix)
+        if err:
+            return err
+
+        answers = request.data.get('answers')
+        if not isinstance(answers, list):
+            return error_response(status.HTTP_400_BAD_REQUEST, 'answers_required', 'answers must be a list.')
+        # Reject outright rather than silently truncate — a submission
+        # bigger than a daily set can ever be is not a legitimate client
+        # sending extra unanswered rows, it's an attempt to probe the
+        # endpoint (spec: "Reject: more than five questions").
+        if len(answers) > 5:
+            return error_response(status.HTTP_400_BAD_REQUEST, 'too_many_answers', 'A daily set has at most 5 questions.')
+
+        today = _kathmandu_today()
+        authoritative_ids = _daily_mcq_question_ids(course, today)
+        authoritative_id_set = set(authoritative_ids)
+
+        # Parse + validate every submitted row against the server's own
+        # authoritative set BEFORE grading anything — one bad row fails
+        # the whole request rather than silently dropping it, so there's
+        # no ambiguity about what was actually graded.
+        selected_by_question_id = {}
+        seen_question_ids = set()
+        for entry in answers:
+            if not isinstance(entry, dict) or 'question_id' not in entry:
+                return error_response(status.HTTP_400_BAD_REQUEST, 'invalid_answer_entry', 'Each answer needs a question_id.')
+            try:
+                question_id = int(entry['question_id'])
+            except (TypeError, ValueError):
+                return error_response(status.HTTP_400_BAD_REQUEST, 'invalid_answer_entry', 'question_id must be an integer.')
+            if question_id in seen_question_ids:
+                return error_response(status.HTTP_400_BAD_REQUEST, 'duplicate_question', 'Each question can only be answered once.')
+            seen_question_ids.add(question_id)
+            if question_id not in authoritative_id_set:
+                # Covers arbitrary ids, cross-course ids, and ids from a
+                # different day's set — all rejected the same way.
+                return error_response(
+                    status.HTTP_400_BAD_REQUEST, 'question_not_in_daily_set',
+                    "That question is not part of today's set for this course.",
+                )
+            option_id = entry.get('option_id')
+            if option_id is not None:
+                try:
+                    option_id = int(option_id)
+                except (TypeError, ValueError):
+                    return error_response(status.HTTP_400_BAD_REQUEST, 'invalid_answer_entry', 'option_id must be an integer or null.')
+            selected_by_question_id[question_id] = option_id
+
+        questions_by_id = {
+            q.id: q
+            for q in Question.objects.filter(id__in=authoritative_ids)
+            .select_related('subject', 'chapter', 'topic')
+            .prefetch_related('options')
+        }
+        ordered_questions = [questions_by_id[i] for i in authoritative_ids if i in questions_by_id]
+
+        correct_count = incorrect_count = unanswered_count = 0
+        for question in ordered_questions:
+            option_id = selected_by_question_id.get(question.id)
+            if option_id is None:
+                question.selected_option_id_for_result = None
+                question.is_correct_for_result = False
+                unanswered_count += 1
+                continue
+            options_by_id = {o.id: o for o in question.options.all()}
+            selected_option = options_by_id.get(option_id)
+            if selected_option is None:
+                # The option id doesn't belong to this question at all —
+                # never trust a client-supplied correctness/ownership
+                # claim (spec: "Arbitrary option IDs are rejected").
+                return error_response(
+                    status.HTTP_400_BAD_REQUEST, 'invalid_option', 'That option does not belong to this question.',
+                )
+            question.selected_option_id_for_result = option_id
+            question.is_correct_for_result = bool(selected_option.is_correct)
+            if selected_option.is_correct:
+                correct_count += 1
+            else:
+                incorrect_count += 1
+
+        return Response({
+            'course': {'prefix': course.prefix, 'name': course.name, 'program_group': course.program_group},
+            'date': today.isoformat(),
+            'total': len(ordered_questions),
+            'score': correct_count,
+            'correct_count': correct_count,
+            'incorrect_count': incorrect_count,
+            'unanswered_count': unanswered_count,
+            'questions': PublicDailyMCQResultSerializer(ordered_questions, many=True, context={'request': request}).data,
         })

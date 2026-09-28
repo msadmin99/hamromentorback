@@ -266,6 +266,121 @@ class ReferenceBookSerializer(serializers.ModelSerializer):
         fields = ['id', 'name', 'author']
 
 
+class PublicOptionSerializer(serializers.ModelSerializer):
+    """MCQ of the Day GET /mcq-of-the-day-set/ (pre-submission) only.
+    Deliberately mirrors the private OptionSerializer's own rule — hide
+    is_correct/explanation until the student has actually answered — for
+    exactly the same reason: revealing the correct option before the
+    visitor picks one would defeat the quiz. Unlike OptionSerializer,
+    there's no per-question POST .../answer/ for a single question;
+    instead the whole 5-question set is graded together by
+    DailyMCQSetView.post() once the visitor submits, and THAT response
+    uses PublicOptionResultSerializer below, which does reveal them.
+    Never exposes pick_count/pick_percentage either — real peer-response
+    analytics that don't exist for an anonymous daily quiz."""
+    image_data = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Option
+        fields = ['id', 'text', 'image', 'image_data', 'latex', 'order']
+
+    def get_image_data(self, obj):
+        return resolve_image_data(obj.image_asset, obj.image)
+
+
+class PublicDailyMCQSerializer(serializers.ModelSerializer):
+    """MCQ of the Day GET /mcq-of-the-day-set/ (pre-submission) — a
+    deliberately separate, lean serializer, not a trimmed
+    QuestionSerializer/QuestionAdminSerializer. Meta.fields below is the
+    complete, explicit allow-list of everything needed to DISPLAY and
+    ANSWER the 5 questions, and nothing that would reveal the answer: no
+    is_correct, explanation, key_takeaway, reference data, or any of
+    QuestionSerializer's per-student/staff fields (is_bookmarked,
+    mastery_status, attempts_count, confidence, revision_due_at, tags,
+    created_by, ...). See PublicDailyMCQResultSerializer below for the
+    POST /submit response, which is the ONLY place this answer/
+    explanation data is ever returned to an anonymous visitor."""
+    options = PublicOptionSerializer(many=True, read_only=True)
+    subject_name = serializers.CharField(source='subject.name', read_only=True)
+    chapter_name = serializers.CharField(source='chapter.name', read_only=True)
+    topic_name = serializers.CharField(source='topic.name', read_only=True)
+    image_data = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Question
+        fields = [
+            'id', 'public_id', 'text', 'image', 'image_data', 'latex', 'question_type',
+            'subject_name', 'chapter_name', 'topic_name', 'options',
+        ]
+
+    def get_image_data(self, obj):
+        return resolve_image_data(obj.image_asset, obj.image)
+
+
+class PublicOptionResultSerializer(serializers.ModelSerializer):
+    """MCQ of the Day POST /mcq-of-the-day-set/ (submit/result) only —
+    the anonymous equivalent of OptionAdminSerializer's post-submission
+    reveal (is_correct + explanation), returned ONLY from
+    DailyMCQSetView.post(), never from its GET. A visitor never sees this
+    shape until after they've submitted their 5 answers."""
+    image_data = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Option
+        fields = ['id', 'text', 'image', 'image_data', 'latex', 'order', 'is_correct', 'explanation']
+
+    def get_image_data(self, obj):
+        return resolve_image_data(obj.image_asset, obj.image)
+
+
+class PublicDailyMCQResultSerializer(serializers.ModelSerializer):
+    """MCQ of the Day POST /mcq-of-the-day-set/ (submit/result) response
+    — the full reveal: options carry is_correct/explanation, plus this
+    question's own explanation/reference/key-takeaway fields, plus three
+    extra per-visitor fields (selected_option_id, is_correct, is_answered)
+    that DailyMCQSetView.post() attaches onto each Question instance as
+    plain attributes before serializing — the same pattern
+    QuestionSerializer already uses for mastery_status_for_user elsewhere
+    in this file, not a second grading mechanism."""
+    options = PublicOptionResultSerializer(many=True, read_only=True)
+    subject_name = serializers.CharField(source='subject.name', read_only=True)
+    chapter_name = serializers.CharField(source='chapter.name', read_only=True)
+    topic_name = serializers.CharField(source='topic.name', read_only=True)
+    image_data = serializers.SerializerMethodField()
+    explanation_image_data = serializers.SerializerMethodField()
+    reference_book_name = serializers.CharField(source='reference_book.name', read_only=True, default='')
+    selected_option_id = serializers.SerializerMethodField()
+    is_correct = serializers.SerializerMethodField()
+    is_answered = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Question
+        fields = [
+            'id', 'public_id', 'text', 'image', 'image_data', 'latex', 'question_type',
+            'subject_name', 'chapter_name', 'topic_name', 'options',
+            'explanation', 'explanation_latex', 'explanation_image', 'explanation_image_data',
+            'explanation_video_url', 'key_takeaway',
+            'reference_book_name', 'reference_edition', 'reference_chapter', 'reference_page',
+            'reference_url', 'references',
+            'selected_option_id', 'is_correct', 'is_answered',
+        ]
+
+    def get_image_data(self, obj):
+        return resolve_image_data(obj.image_asset, obj.image)
+
+    def get_explanation_image_data(self, obj):
+        return resolve_image_data(obj.explanation_image_asset, obj.explanation_image)
+
+    def get_selected_option_id(self, obj):
+        return getattr(obj, 'selected_option_id_for_result', None)
+
+    def get_is_correct(self, obj):
+        return bool(getattr(obj, 'is_correct_for_result', False))
+
+    def get_is_answered(self, obj):
+        return getattr(obj, 'selected_option_id_for_result', None) is not None
+
+
 class QuestionAdminSerializer(serializers.ModelSerializer):
     options = OptionAdminSerializer(many=True)
     created_by_name = serializers.SerializerMethodField()
