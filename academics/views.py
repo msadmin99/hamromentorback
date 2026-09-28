@@ -10,10 +10,12 @@ from rest_framework.permissions import AllowAny, IsAdminUser, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from hamromentor.errors import error_response
 from hamromentor.permissions import IsStaffOrReadOnly, IsStaffOrReadOnlyExcludingTeacherWrites
 
 from .access import locked_subject_ids as _locked_subject_ids
 from .access import question_course_scoped as _question_course_scoped
+from .access import question_scoped_to_single_course as _question_scoped_to_single_course
 from .excel import import_workbook, template_response
 from .random_sample import random_sample
 from .models import (
@@ -1609,3 +1611,77 @@ class QuestionReportViewSet(viewsets.ModelViewSet):
         if new_status in ('reviewed', 'dismissed'):
             extra = {'reviewed_by': self.request.user, 'reviewed_at': timezone.now()}
         serializer.save(**extra)
+
+
+class DailyMCQSetView(APIView):
+    """GET /api/mcq-of-the-day-set/?course=<prefix> — 5
+    auto-rotating MCQs for one course/program, picked automatically every
+    day with no admin curation needed. Same 5 questions for every student
+    globally on a given calendar day (deterministic, seeded by
+    date + course), so "these questions change automatically" without
+    needing per-user randomness.
+
+    Deliberately a SEPARATE feature from core.MCQOfTheDay (the existing
+    hand-picked single-question model shown on the home dashboard) — that
+    admin-curated system is untouched; this is what the "MCQ of the Day"
+    tab's new choose-a-program flow calls instead.
+
+    Course-scoped via academics.access.question_scoped_to_single_course —
+    NOT a naive Question.courses filter, which that module's own audit
+    found is unpopulated on virtually every real question. This is the
+    exact reason a program like MBBS must never see a Pathology (or any
+    other course's) question here: scoping goes through each question's
+    Subject.courses, the actually-populated signal.
+
+    Spans up to 5 DIFFERENT subjects within the course (one question per
+    subject) so a student sees breadth across topics, not five questions
+    from the same chapter. Deliberately not gated by QBank subscription/
+    Free Starter quota — same as the existing single-question MCQ of the
+    Day — a free daily preview hook for every logged-in student regardless
+    of what they've purchased."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        prefix = (request.query_params.get('course') or '').strip()
+        if not prefix:
+            return error_response(status.HTTP_400_BAD_REQUEST, 'course_required', 'A course is required.')
+
+        from courses.models import Course
+
+        course = Course.objects.filter(prefix=prefix).first()
+        if not course:
+            return error_response(status.HTTP_404_NOT_FOUND, 'course_not_found', 'That course does not exist.')
+
+        import random
+
+        today = timezone.localdate()
+        scoped = _question_scoped_to_single_course(Question.objects.all(), course.id)
+        subject_ids = list(scoped.values_list('subject_id', flat=True).distinct())
+
+        # Seeded by (date, course prefix) only — same inputs always produce
+        # the same subject order and the same picked question, for every
+        # student, until the date rolls over. Never a per-request/per-user
+        # random.Random() (that would reshuffle on every page load, not
+        # just once a day).
+        rng = random.Random(f'{today.isoformat()}:{course.prefix}')
+        rng.shuffle(subject_ids)
+
+        question_ids = []
+        for subject_id in subject_ids[:5]:
+            ids = list(
+                scoped.filter(subject_id=subject_id).order_by('id').values_list('id', flat=True)
+            )
+            if ids:
+                question_ids.append(ids[rng.randrange(len(ids))])
+
+        questions_by_id = {
+            q.id: q
+            for q in Question.objects.filter(id__in=question_ids).select_related('subject', 'chapter', 'topic')
+        }
+        ordered_questions = [questions_by_id[i] for i in question_ids if i in questions_by_id]
+
+        return Response({
+            'course': {'prefix': course.prefix, 'name': course.name, 'program_group': course.program_group},
+            'date': today.isoformat(),
+            'questions': QuestionSerializer(ordered_questions, many=True, context={'request': request}).data,
+        })

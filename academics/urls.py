@@ -20,6 +20,7 @@ from .import_views import (
 )
 from .views import (
     ChapterViewSet,
+    DailyMCQSetView,
     QuestionExcelImportView,
     QuestionExcelTemplateView,
     QuestionReportViewSet,
@@ -38,6 +39,7 @@ router.register('reference-books', ReferenceBookViewSet, basename='reference-boo
 router.register('question-reports', QuestionReportViewSet, basename='question-report')
 
 urlpatterns = [
+    path('mcq-of-the-day-set/', DailyMCQSetView.as_view(), name='mcq-of-the-day-set'),
     path('questions-excel/template/', QuestionExcelTemplateView.as_view(), name='question-excel-template'),
     path('questions-excel/import/', QuestionExcelImportView.as_view(), name='question-excel-import'),
 

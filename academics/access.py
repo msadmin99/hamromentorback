@@ -57,7 +57,14 @@ def question_course_scoped(qs, user):
     if user and user.is_authenticated and user.is_staff:
         return qs
     course_ids = eligible_course_ids(user)
+    return _question_scoped_to_course_ids(qs, course_ids)
 
+
+def _question_scoped_to_course_ids(qs, course_ids):
+    """The actual eligibility predicate factored out of question_course_scoped
+    so it can be reused with an explicit course id set instead of a user's
+    own eligible courses — see question_scoped_to_single_course below.
+    No logic change from what question_course_scoped always did."""
     from .models import Question, Subject
 
     question_courses = Question.courses.through
@@ -78,6 +85,21 @@ def question_course_scoped(qs, user):
         | (~has_any_question_course & has_eligible_subject_course)
         | (~has_any_question_course & ~has_any_subject_course)
     )
+
+
+def question_scoped_to_single_course(qs, course_id):
+    """Same eligibility rule as question_course_scoped above (a question
+    with no explicit Question.courses tag inherits its Subject's course
+    scope; untagged-everywhere content is treated as global), but
+    parameterized by one explicit course id instead of a user's own
+    eligible-course set. For a feature where a student deliberately
+    previews a DIFFERENT program's questions on purpose — e.g. the
+    automatic daily 5-MCQ practice set (core "MCQ of the Day" tab) — not
+    their own enrollment. Never grants Pro/subscription access on its
+    own; a caller that also needs to respect QBank subscription gating
+    still applies locked_subject_ids separately, exactly like every other
+    caller of question_course_scoped already does."""
+    return _question_scoped_to_course_ids(qs, [course_id])
 
 
 def locked_subject_ids(user):
