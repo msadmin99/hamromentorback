@@ -33,6 +33,23 @@ class TestListSerializer(serializers.ModelSerializer):
     exam_template_id = serializers.IntegerField(source='exam_template.id', read_only=True, default=None)
     exam_code = serializers.CharField(source='exam_template.exam_code', read_only=True, default=None)
 
+    # Grand Test schedule display fix — these used to live only on
+    # TestDetailSerializer, so the student-facing LISTING endpoint
+    # (GET /tests/?exam_type=grand, what ExamCard.js on /grand-test
+    # actually renders) only ever saw the raw scheduled_start/end fields
+    # below, never the session-resolved, authoritative schedule. A Grand
+    # Test scheduled via a real ExamSession (the "Reschedule" flow) could
+    # therefore show a stale or entirely disconnected date on its card
+    # even though access control (resolve_card_access, via
+    # grand_test_participation_status) was already correctly enforcing
+    # the real session window — the access decision and the displayed
+    # date were computed from two different sources. Promoted here (not
+    # duplicated) so both the list/card and detail endpoints share one
+    # definition; TestDetailSerializer still declares/exposes them
+    # (inherited, not redeclared) for backward field-order compatibility.
+    grand_test_status = serializers.SerializerMethodField()
+    grand_test_schedule = serializers.SerializerMethodField()
+
     class Meta:
         model = Test
         fields = [
@@ -42,6 +59,7 @@ class TestListSerializer(serializers.ModelSerializer):
             'courses_detail', 'card_status', 'attempts_used', 'created_by_name', 'created_at',
             'is_draft', 'exam_template_id', 'exam_code', 'version_number', 'in_progress_answered_count',
             'latest_attempt_id', 'solutions_visibility', 'solutions_released_at',
+            'grand_test_status', 'grand_test_schedule',
             'access',
         ]
 
@@ -204,6 +222,36 @@ class TestListSerializer(serializers.ModelSerializer):
             return 'missed'
         return 'available'
 
+    def get_grand_test_status(self, obj):
+        if obj.exam_type != 'grand':
+            return None
+        request = self.context.get('request')
+        user = request.user if request else None
+        if not user or not user.is_authenticated:
+            return None
+        from .lifecycle import grand_test_participation_status
+
+        return grand_test_participation_status(obj, user)
+
+    def get_grand_test_schedule(self, obj):
+        """The actually-authoritative start/end for this Grand Test's
+        schedule — a real ExamSession's own dates when one exists (which
+        may differ from Test.scheduled_start/end: that pair is only ever
+        BACKFILLED once, at first reschedule, and a session can be edited
+        independently afterward), else Test.scheduled_start/end directly.
+        Null (both keys) for an unscheduled Grand Test or any other exam
+        type — nothing here changes existing behavior for Daily/Mock/PYQ."""
+        if obj.exam_type != 'grand':
+            return None
+        from .lifecycle import resolve_test_schedule_session
+
+        session = resolve_test_schedule_session(obj)
+        if session is not None:
+            return {'start': session.start_datetime, 'end': session.end_datetime}
+        if obj.scheduled_start and obj.scheduled_end:
+            return {'start': obj.scheduled_start, 'end': obj.scheduled_end}
+        return None
+
 
 class QuestionForAttemptSerializer(serializers.ModelSerializer):
     from academics.serializers import OptionSerializer as _OptionSerializer
@@ -235,52 +283,12 @@ class TestDetailSerializer(TestListSerializer):
     # `is_pro && !has_access && free_preview_questions > 0 && type !== grand`,
     # a fourth place answering a question the backend already answers.
     preview_only = serializers.SerializerMethodField()
-    # GT3-2: the derived (never stored) MISSED/UPCOMING/LIVE/etc. state —
-    # only ever meaningful for a Grand Test; null for every other exam
-    # type, so a Frontend consuming this never has to special-case
-    # "field present but meaningless." See
-    # tests_app.lifecycle.grand_test_participation_status's own docstring
-    # for exactly what each value means and where it comes from (a real
-    # ExamSession if one exists, else Test.scheduled_start/end).
-    grand_test_status = serializers.SerializerMethodField()
-    grand_test_schedule = serializers.SerializerMethodField()
 
     class Meta(TestListSerializer.Meta):
         fields = TestListSerializer.Meta.fields + [
             'shuffle_questions', 'shuffle_options', 'negative_marking', 'max_attempts',
             'free_preview_questions', 'has_access', 'requires_password', 'preview_only',
-            'grand_test_status', 'grand_test_schedule',
         ]
-
-    def get_grand_test_status(self, obj):
-        if obj.exam_type != 'grand':
-            return None
-        request = self.context.get('request')
-        user = request.user if request else None
-        if not user or not user.is_authenticated:
-            return None
-        from .lifecycle import grand_test_participation_status
-
-        return grand_test_participation_status(obj, user)
-
-    def get_grand_test_schedule(self, obj):
-        """The actually-authoritative start/end for this Grand Test's
-        schedule — a real ExamSession's own dates when one exists (which
-        may differ from Test.scheduled_start/end: that pair is only ever
-        BACKFILLED once, at first reschedule, and a session can be edited
-        independently afterward), else Test.scheduled_start/end directly.
-        Null (both keys) for an unscheduled Grand Test or any other exam
-        type — nothing here changes existing behavior for Daily/Mock/PYQ."""
-        if obj.exam_type != 'grand':
-            return None
-        from .lifecycle import resolve_test_schedule_session
-
-        session = resolve_test_schedule_session(obj)
-        if session is not None:
-            return {'start': session.start_datetime, 'end': session.end_datetime}
-        if obj.scheduled_start and obj.scheduled_end:
-            return {'start': obj.scheduled_start, 'end': obj.scheduled_end}
-        return None
 
     def get_preview_only(self, obj):
         from billing.access import is_preview_only
@@ -350,6 +358,22 @@ class TestAdminSerializer(serializers.ModelSerializer):
     # a dangerous field on an exam that already has real attempts.
     attempt_count = serializers.SerializerMethodField()
     dangerous_edit_warning = serializers.SerializerMethodField()
+    # Grand Test schedule fix, round 2 — the real bug: a Test with a real
+    # ExamSession governing it has its schedule edited via that session
+    # (the Admin's "Edit Schedule" button on the exam detail page, PATCH
+    # /exam-sessions/{id}/ — see ExamSessionSerializer.validate's own
+    # docstring) — NOT via this serializer's own scheduled_start/
+    # scheduled_end, which resolve_test_schedule_session (the one
+    # function every reader — student display, student access control,
+    # and now this admin write-gate — goes through) ignores whenever a
+    # session exists. Before this field existed, the exam-management
+    # edit form let an admin "successfully" save scheduled_start/end on
+    # such a Test with zero visible effect: the write landed in the
+    # database, but no reader ever looks at it. This id lets the Admin
+    # UI disable those two fields and point at the one place that
+    # actually works, instead of offering a save button that silently
+    # does nothing.
+    active_session_id = serializers.SerializerMethodField()
 
     class Meta:
         model = Test
@@ -358,12 +382,21 @@ class TestAdminSerializer(serializers.ModelSerializer):
             'assigned_batches', 'needs_course_review', 'duration_minutes', 'questions_per_page',
             'negative_marking', 'shuffle_questions', 'shuffle_options', 'max_attempts', 'solutions_visibility',
             'is_pro', 'is_new', 'price', 'access_password', 'free_preview_questions', 'academic_year', 'university',
-            'scheduled_start', 'scheduled_end', 'is_draft', 'question_ids', 'questions', 'question_count', 'total_marks',
+            'scheduled_start', 'scheduled_end', 'active_session_id', 'is_draft', 'question_ids', 'questions',
+            'question_count', 'total_marks',
             'created_by_name', 'exam_template', 'exam_code', 'version_number',
             'solutions_released_at', 'solutions_released_by_name', 'review_duration_days',
             'attempt_count', 'dangerous_edit_warning',
         ]
         read_only_fields = ['exam_template', 'version_number', 'solutions_released_at']
+
+    def get_active_session_id(self, obj):
+        if not obj.pk or obj.exam_type not in ('grand', 'daily'):
+            return None
+        from .lifecycle import resolve_test_schedule_session
+
+        session = resolve_test_schedule_session(obj)
+        return session.id if session else None
 
     def get_solutions_released_by_name(self, obj):
         return _staff_name(obj.solutions_released_by)
@@ -380,6 +413,33 @@ class TestAdminSerializer(serializers.ModelSerializer):
             'attempted it — their own scored results stay based on what the exam looked like when they took '
             'it (see the exam’s historical review), but new attempts will use whatever you save now.'
         )
+
+    def validate(self, attrs):
+        """Grand Test schedule fix §12 — the simpler Test.scheduled_start/
+        scheduled_end pair (the Admin exam builder's own "Scheduled start
+        (optional)" / "Scheduled end (optional)" fields) had no validation
+        at all, unlike the richer ExamSession path (exam_versioning.
+        validate_session_window already enforces this same rule for a
+        Reschedule session). Mirrors that rule exactly: end must be after
+        start when both are given; either may be omitted (both remain
+        fully optional, matching the model's own null=True/blank=True).
+
+        Only runs when the request actually touches one of these two
+        fields — round 2 of this fix made the Admin UI stop sending them
+        at all for a Test with an active_session_id (its schedule is
+        edited via the session instead; see that field's own docstring),
+        so this must never fall back to re-validating the instance's
+        existing, possibly-stale values against each other on an
+        unrelated save (e.g. editing just the title) that doesn't touch
+        the schedule at all — that would turn ANY old, already-stale pair
+        into a hard block on every future unrelated edit."""
+        if 'scheduled_start' not in attrs and 'scheduled_end' not in attrs:
+            return attrs
+        start = attrs.get('scheduled_start', getattr(self.instance, 'scheduled_start', None))
+        end = attrs.get('scheduled_end', getattr(self.instance, 'scheduled_end', None))
+        if start and end and end <= start:
+            raise serializers.ValidationError({'scheduled_end': 'Scheduled end must be after the scheduled start.'})
+        return attrs
 
     def get_total_marks(self, obj):
         return float(obj.total_marks)
@@ -508,6 +568,21 @@ class ExamSessionSerializer(serializers.ModelSerializer):
             'solutions_released_at', 'solutions_released_by_name',
         ]
         read_only_fields = ['exam_template', 'exam_version', 'status', 'solutions_released_at']
+
+    def validate(self, attrs):
+        """Grand Test schedule fix, round 2 — this serializer's own update
+        path (ExamSessionViewSet.perform_update, exercised by the Admin's
+        'Edit Schedule' button/EditSessionModal — the actual, correct way
+        to change a session-governed Test's schedule once a session
+        exists) had no end-after-start validation at all, unlike
+        exam_versioning.validate_session_window (only used when a session
+        is first CREATED via Reschedule) and TestAdminSerializer's own
+        equivalent check. Mirrors both exactly."""
+        start = attrs.get('start_datetime', getattr(self.instance, 'start_datetime', None))
+        end = attrs.get('end_datetime', getattr(self.instance, 'end_datetime', None))
+        if start and end and end <= start:
+            raise serializers.ValidationError({'end_datetime': 'End must be after the start.'})
+        return attrs
 
     def get_total_marks(self, obj):
         return float(obj.exam_version.total_marks)
