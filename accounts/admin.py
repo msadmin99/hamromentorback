@@ -1,7 +1,7 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin
 
-from .models import Device, RolePermission, StudentProfile, User
+from .models import Device, EmailVerificationToken, RolePermission, StudentProfile, User
 
 
 @admin.register(User)
@@ -74,3 +74,27 @@ class StudentProfileAdmin(admin.ModelAdmin):
 @admin.register(Device)
 class DeviceAdmin(admin.ModelAdmin):
     list_display = ('user', 'device_id', 'device_label', 'last_seen')
+
+
+@admin.register(EmailVerificationToken)
+class EmailVerificationTokenAdmin(admin.ModelAdmin):
+    """Read-only. Lets an admin see *why* a verification email never
+    arrived (send_error_code) without server/database access — this is
+    exactly what the model's own fields were added for (see
+    accounts/models.py's EmailVerificationToken docstring), but the
+    model was never actually registered here, so that diagnostic was
+    unreachable in practice. Never editable: all writes go through
+    accounts/email_verification.py's own issue/consume functions."""
+    list_display = ('user', 'email', 'created_at', 'send_attempted_at', 'send_error_code', 'used_at', 'expires_at', 'invalidated_at')
+    list_filter = ('send_error_code',)
+    search_fields = ('user__email', 'email')
+    ordering = ('-created_at',)
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False

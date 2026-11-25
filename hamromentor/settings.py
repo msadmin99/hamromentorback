@@ -69,7 +69,17 @@ POSTMARK_SERVER_TOKEN = os.environ.get('POSTMARK_SERVER_TOKEN', '')
 POSTMARK_API_URL = os.environ.get('POSTMARK_API_URL', 'https://api.postmarkapp.com/email')
 POSTMARK_MESSAGE_STREAM = os.environ.get('POSTMARK_MESSAGE_STREAM', 'outbound')
 EMAIL_TIMEOUT = int(os.environ.get('EMAIL_TIMEOUT', 10))
-DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'Dr. Gutka <no-reply@hamromentor.com>')
+# The fallback domain here must match the product's real domain
+# (drgutka.com — see VAPID_CLAIM_EMAIL below and FRONTEND_URL in
+# production) and, in practice, a domain that is actually verified as a
+# Sender Signature in the Postmark account DEFAULT_FROM_EMAIL's
+# production value sends from. "hamromentor.com" (the old internal
+# project/codebase name, not the live product) was fixed here by
+# mistake and would make every outbound email fail at the provider
+# (an unverified sending domain is rejected before it ever reaches a
+# recipient's inbox or spam folder) if the DEFAULT_FROM_EMAIL
+# environment variable were ever left unset in production.
+DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'Dr. Gutka <no-reply@drgutka.com>')
 
 # Student-facing Frontend base URL — used to build links inside outbound emails
 # (e.g. "view your invoice"). Not the API URL.
