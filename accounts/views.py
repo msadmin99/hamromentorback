@@ -19,11 +19,13 @@ from hamromentor.permissions import IsAdminRoleOrAbove, IsSuperAdmin
 from tests_app.models import TestAttempt
 
 from . import verification_storage
+from . import security
 from .models import Device, RolePermission, StudentProfile, VerificationDocument
 from .serializers import (
     AdminAccountSerializer,
     AdminUserDetailSerializer,
     AdminUserSerializer,
+    DeviceSerializer,
     LoginSerializer,
     RegisterSerializer,
     RolePermissionSerializer,
@@ -173,6 +175,8 @@ class AdminUserViewSet(viewsets.ModelViewSet):
         return Response({'detail': 'Method "POST" not allowed.'}, status=status.HTTP_405_METHOD_NOT_ALLOWED)
 
     def get_permissions(self):
+        if self.action in ('restore_device_access', 'block_account', 'admin_revoke_device', 'admin_list_devices', 'device_access_lookup'):
+            return [IsAuthenticated()]
         # Permanent delete is materially more dangerous than list/edit/
         # block — same reasoning AdminAccountViewSet.destroy already
         # applies to staff accounts, mirrored here: Super-Admin only, not
@@ -557,6 +561,88 @@ class AdminUserViewSet(viewsets.ModelViewSet):
             'exam_target': profile.exam_target, 'batch': profile.batch,
             'changed_fields': list(changed.keys()),
         })
+
+    # Admin account-security console: block/restore an account, view and
+    # revoke a student's registered devices. Deliberately separate from
+    # the broader login/session-token rewrite this same module contains —
+    # these methods only ever read/write via accounts.security's own
+    # audited, row-locked functions and never touch how a student actually
+    # logs in, registers, or refreshes a token, so adding them changes
+    # nothing about those already-live flows.
+    def _security_target(self, request, pk):
+        from rest_framework.exceptions import NotFound
+        if not str(pk).isdigit() or not 0 < int(pk) < 2**63:
+            raise NotFound()
+        target = User.objects.filter(pk=pk).first()
+        if target is None or not any(security.can_manage(request.user, op, target) for op in ('restore', 'block', 'revoke')):
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied('Account is unavailable or outside your security permissions.')
+        return target
+
+    @action(detail=False, methods=['get'], url_path='device-access-lookup')
+    def device_access_lookup(self, request):
+        from rest_framework.exceptions import PermissionDenied
+        if not any(security.can_manage(request.user, op) for op in ('restore', 'block', 'revoke')):
+            raise PermissionDenied()
+        q = (request.query_params.get('q') or '').strip()
+        if not q:
+            return Response([])
+        qs = User.objects.all()
+        if not security.is_security_superadmin(request.user):
+            qs = qs.filter(is_staff=False, is_superuser=False).filter(Q(admin_role__isnull=True) | Q(admin_role=''))
+        qs = qs.filter(pk=int(q)) if q.isdigit() else qs.filter(email__iexact=q)
+        return Response([dict(id=u.pk, email=u.email, is_active=u.is_active, is_staff=u.is_staff,
+                              is_superuser=u.is_superuser, admin_role=u.admin_role,
+                              security_revision=u.security_revision, block_reason=u.block_reason,
+                              block_source=u.block_source or ('unknown' if not u.is_active else ''),
+                              active_device_count=u.devices.filter(revoked_at__isnull=True).count())
+                         for u in qs.order_by('pk')[:10]])
+
+    @action(detail=True, methods=['get'], url_path='devices')
+    def admin_list_devices(self, request, pk=None):
+        target = self._security_target(request, pk)
+        from core.models import AdminEditAuditLog
+        return Response({
+            'user': {'id': target.pk, 'email': target.email, 'is_active': target.is_active,
+                     'is_staff': target.is_staff, 'security_revision': target.security_revision,
+                     'block_reason': target.block_reason,
+                     'block_source': target.block_source or ('unknown' if not target.is_active else '')},
+            'devices': DeviceSerializer(target.devices.order_by('-last_seen'), many=True).data,
+            'active_device_count': target.devices.filter(revoked_at__isnull=True).count(),
+            'allowed_actions': [op for op in ('restore', 'block', 'revoke') if security.can_manage(request.user, op, target)],
+            'history': list(AdminEditAuditLog.objects.filter(resource_type='AccountSecurity', resource_id=str(target.pk))
+                            .values('action', 'reason', 'outcome', 'created_at', 'actor_id')[:20]),
+        })
+
+    def _security_action(self, request, pk, operation, device_id=None):
+        from rest_framework.exceptions import APIException, NotFound
+        if not str(pk).isdigit() or not 0 < int(pk) < 2**63:
+            raise NotFound()
+        try:
+            target = security.manage_account(request.user, int(pk), operation, request.data, device_id)
+        except APIException:
+            # Record refusal outside the failed mutation transaction, without raw input/errors.
+            reason = request.data.get('reason')
+            reason = reason.strip() if isinstance(reason, str) and 0 < len(reason.strip()) <= 500 else 'Invalid or missing reason.'
+            security.audit(request.user, User.objects.filter(pk=pk).first(), operation,
+                           reason, {}, {},
+                           outcome='denied', target_id=pk)
+            raise
+        return Response({'id': target.pk, 'is_active': target.is_active,
+                         'security_revision': target.security_revision,
+                         'outcome': getattr(target, 'security_outcome', 'success')})
+
+    @action(detail=True, methods=['post'], url_path='restore-device-access')
+    def restore_device_access(self, request, pk=None):
+        return self._security_action(request, pk, 'restore')
+
+    @action(detail=True, methods=['post'], url_path='block-account')
+    def block_account(self, request, pk=None):
+        return self._security_action(request, pk, 'block')
+
+    @action(detail=True, methods=['post'], url_path='devices/(?P<device_pk>[^/.]+)/revoke')
+    def admin_revoke_device(self, request, pk=None, device_pk=None):
+        return self._security_action(request, pk, 'revoke', device_pk)
 
     @action(detail=True, methods=['post'], url_path='verification/approve')
     def verify_profile(self, request, pk=None):

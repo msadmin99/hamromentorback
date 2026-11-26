@@ -29,6 +29,13 @@ class User(AbstractUser):
     program = models.CharField(max_length=50, blank=True, help_text='e.g. CEE-PG, CEE-UG, NHPC — matches a Course.program_group value.')
     course = models.CharField(max_length=50, blank=True, help_text="Matches a courses.Course.prefix value the student registered under.")
     admin_role = models.CharField(max_length=20, choices=ADMIN_ROLE_CHOICES, blank=True, null=True)
+    auth_version = models.PositiveBigIntegerField(default=0, editable=False)
+    security_revision = models.PositiveBigIntegerField(default=0, editable=False)
+    block_reason = models.CharField(max_length=500, blank=True, editable=False)
+    block_source = models.CharField(max_length=40, blank=True, editable=False)
+    blocked_at = models.DateTimeField(null=True, blank=True, editable=False)
+    blocked_by = models.ForeignKey('self', null=True, blank=True, on_delete=models.SET_NULL,
+                                   related_name='+', editable=False)
     can_manage_all_content = models.BooleanField(
         default=False,
         help_text="Teacher-role only: if set, this account can see/manage every Test and Question, not just their own.",
@@ -108,6 +115,8 @@ ALL_FEATURES = [
     'dashboard', 'courses', 'question_bank', 'question_entry', 'video_lectures', 'daily_practice', 'students',
     'test_series', 'self_mock_test', 'enrollment_requests', 'question_reports', 'daily_live_exam', 'mock_test',
     'website_settings', 'advanced', 'billing', 'teacher_applications', 'marketplace_courses',
+    'notifications',
+    'restore_student_access', 'block_student_account', 'revoke_student_device',
     *EXAM_MANAGEMENT_FEATURES,
 ]
 
@@ -159,7 +168,11 @@ def user_feature_list(user):
             # how it was written (API, admin site, a future bug in the save UI).
             return [f for f in role_permission.features if f in EDITOR_ALLOWED_FEATURES]
         return role_permission.features
-    return ALL_FEATURES if user.admin_role == 'admin' else EDITOR_ALLOWED_FEATURES
+    if user.admin_role == 'admin':
+        # New account-security powers always require explicit RolePermission grants.
+        return [f for f in ALL_FEATURES if f not in {
+            'restore_student_access', 'block_student_account', 'revoke_student_device'}]
+    return EDITOR_ALLOWED_FEATURES
 
 
 class StudentProfile(models.Model):
@@ -250,14 +263,41 @@ class EmailVerificationToken(models.Model):
 
 
 class Device(models.Model):
-    """Tracks devices a student has logged in from (max 3 active devices)."""
+    """Tracks devices a student has logged in from (max 3 ACTIVE devices).
+
+    `revoked_at`: lets a device be explicitly removed WITHOUT deleting its
+    row (preserving the audit trail). A revoked device_id logging in again
+    is treated as a brand-new registration, never silently reactivated.
+    """
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='devices')
     device_id = models.CharField(max_length=255)
     device_label = models.CharField(max_length=255, blank=True)
+    platform = models.CharField(max_length=20, blank=True, help_text='e.g. "web", "android" — informational only.')
+    created_at = models.DateTimeField(auto_now_add=True, null=True)
     last_seen = models.DateTimeField(auto_now=True)
+    revoked_at = models.DateTimeField(null=True, blank=True)
+    revoked_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True, related_name='+',
+        help_text='Who revoked this device — the user themself, or an admin via the recovery console. Null for a still-active device.',
+    )
 
     class Meta:
-        unique_together = ('user', 'device_id')
+        # A revoked device_id must remain distinguishable from a live one,
+        # so uniqueness is enforced in application logic, not at the DB
+        # level — the same (user, device_id) pair legitimately needs a
+        # second row once the first has been revoked and the device logs
+        # in again.
+        indexes = [models.Index(fields=['user', 'device_id', 'revoked_at'])]
+
+
+class CredentialPolicy(models.Model):
+    """Singleton revocation authority. Strict cutoff is never enabled by migration."""
+    id = models.PositiveSmallIntegerField(primary_key=True, default=1, editable=False)
+    generation = models.PositiveBigIntegerField(default=1, editable=False)
+    strict_enforcement = models.BooleanField(default=False, editable=False)
+    activated_at = models.DateTimeField(null=True, blank=True, editable=False)
+    activated_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL,
+                                    related_name='+', editable=False)
 
 
 class VerificationDocument(models.Model):

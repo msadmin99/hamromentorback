@@ -468,9 +468,17 @@ class LoginSerializer(serializers.Serializer):
 
 
 class DeviceSerializer(serializers.ModelSerializer):
+    # Additive fields for the new device-management surfaces (the admin
+    # recovery console). `is_active` is computed, never trusts a stored
+    # boolean, so it can never drift from `revoked_at`'s own meaning.
+    is_active = serializers.SerializerMethodField()
+
     class Meta:
         model = Device
-        fields = ['id', 'device_id', 'device_label', 'last_seen']
+        fields = ['id', 'device_id', 'device_label', 'platform', 'created_at', 'last_seen', 'revoked_at', 'is_active']
+
+    def get_is_active(self, obj):
+        return obj.revoked_at is None
 
 
 class AdminAccountSerializer(serializers.ModelSerializer):

@@ -58,6 +58,9 @@ class AdminEditAuditLog(models.Model):
     a rejected/failed request, and changed_fields can never contain a
     password/token/secret because the editing serializer's field allowlist
     has no way to touch those in the first place."""
+    action = models.CharField(max_length=50, default='legacy_edit')
+    reason = models.CharField(max_length=500, blank=True)
+    outcome = models.CharField(max_length=20, default='success')
     actor = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='+',
     )
