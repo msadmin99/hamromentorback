@@ -90,9 +90,28 @@ class SubjectListSerializer(serializers.ModelSerializer):
         return val if val is not None else obj.videos.count()
 
     def get_has_access(self, obj):
-        from billing.access import has_qbank_access
+        # QBank access audit fix: this used to call billing.access.has_qbank_access
+        # directly, which has no Free Starter fallback — so a student with
+        # remaining free-trial quota on a Pro subject saw it as fully locked
+        # (routed to /plans) even though answering a question in it would
+        # actually succeed via Free Starter. academics.access.locked_subject_ids
+        # is the function the codebase's own docstring says is specifically kept
+        # in sync with the real per-question gate (entitlements.services.
+        # can_view_qbank), so reusing it here makes "what the catalog shows" and
+        # "what answering actually allows" agree. Precomputed once per request by
+        # SubjectViewSet.get_queryset() (see locked_subject_ids context key) to
+        # avoid re-running it once per subject row; the branch below is only a
+        # fallback for a serializer instantiated outside that view.
+        if obj.is_free:
+            return True
+        locked_ids = self.context.get('locked_subject_ids')
+        if locked_ids is not None:
+            return obj.id not in locked_ids
         request = self.context.get('request')
-        return has_qbank_access(request.user if request else None, obj)
+        if not request or not request.user.is_authenticated:
+            return False
+        from .access import locked_subject_ids
+        return obj.id not in locked_subject_ids(request.user)
 
     def get_courses_detail(self, obj):
         return [

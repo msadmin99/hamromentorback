@@ -112,6 +112,11 @@ class SubjectViewSet(viewsets.ModelViewSet):
         # 100,000+ MCQ target) trades one extra grouped query for
         # eliminating what used to be two more queries PER SUBJECT ROW.
         user = self.request.user
+        # QBank access audit fix: same precompute-once-per-request pattern as
+        # the two dicts below — see SubjectListSerializer.get_has_access for
+        # why this specific function (not billing.access.has_qbank_access) is
+        # the correct check to reuse.
+        self._locked_subject_ids = set(_locked_subject_ids(user))
         self._attempted_count_by_subject = {}
         self._solved_modules_by_subject = {}
         if user.is_authenticated:
@@ -130,6 +135,7 @@ class SubjectViewSet(viewsets.ModelViewSet):
 
     def get_serializer_context(self):
         context = super().get_serializer_context()
+        context['locked_subject_ids'] = getattr(self, '_locked_subject_ids', None)
         context['attempted_count_by_subject'] = getattr(self, '_attempted_count_by_subject', None)
         context['solved_modules_by_subject'] = getattr(self, '_solved_modules_by_subject', None)
         return context
@@ -1488,6 +1494,25 @@ class QuestionViewSet(viewsets.ModelViewSet):
             qs = qs.filter(Q_(courses__id=course_id) | Q_(courses__isnull=True, subject__courses__id=course_id))
         if data.get('subject'):
             subject_val = data['subject']
+            # QBank access audit fix: a student explicitly choosing one Pro
+            # subject they can't access used to just fall through to the
+            # `.exclude(subject_id__in=locked)` above and come back as a
+            # plain empty list — indistinguishable, on the frontend, from
+            # "this chapter happens to have no questions yet." Resolve the
+            # subject up front so a genuinely locked choice gets the same
+            # explicit 402 the per-question answer() gate already returns,
+            # instead of a silent empty result. Any other filter combination
+            # (no subject, a free subject, an accessible subject) is
+            # unaffected — this only short-circuits the one case that was
+            # actually misleading.
+            subject_obj = Subject.objects.filter(
+                **({'id': subject_val} if str(subject_val).isdigit() else {'slug': subject_val})
+            ).first()
+            if subject_obj and subject_obj.id in locked:
+                return error_response(
+                    status.HTTP_402_PAYMENT_REQUIRED, 'purchase_required', 'This subject requires a subscription.',
+                    access_denied={'reason': 'subject_locked', 'upgrade_available': True},
+                )
             qs = qs.filter(subject_id=subject_val) if str(subject_val).isdigit() else qs.filter(subject__slug=subject_val)
         if data.get('chapter'):
             qs = qs.filter(chapter_id=data['chapter'])
